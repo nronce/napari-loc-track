@@ -1,0 +1,9 @@
+name: napari-loc-track
+contributions:
+  commands:
+    - id: napari-loc-track.make_widget
+      title: Localization Tracking
+      python_name: napari_loc_track.widget:LocalizationTrackingWidget
+  widgets:
+    - command: napari-loc-track.make_widget
+      display_name: Localization Tracking

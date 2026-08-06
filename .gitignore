@@ -1,0 +1,25 @@
+# This working directory also holds unrelated experiment data (images,
+# CSVs, notebooks). Deny everything by default and explicitly allow only
+# the plugin package, tests, and top-level project files, so none of that
+# data can ever end up committed by accident.
+*
+
+!/.gitignore
+!/README.md
+!/LICENSE
+!/setup.py
+!/pyproject.toml
+!/tests/
+!/tests/**
+!/napari_loc_track/
+!/napari_loc_track/**
+
+# Re-exclude build/cache artifacts even within the allowed package tree.
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+build/
+dist/
+*.egg
+.pytest_cache/
