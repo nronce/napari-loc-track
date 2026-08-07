@@ -46,6 +46,12 @@ from ._localize2d import (
     concatenate_localizations,
     is_gpufit_available,
 )
+from ._sbr_analysis import (
+    analyze_sbr_localizations,
+    discover_tiff_files,
+    load_tiff_projection,
+    sum_projection_camera_offset,
+)
 
 TRACK_PALETTE = [
     "#1f77b4", "#ff7f0e", "#2ca02c", "#d62728", "#9467bd",
@@ -58,6 +64,7 @@ DEFAULT_HIST_HEIGHT = 190
 HIST_HEIGHT_STEP = 50
 MIN_HIST_HEIGHT = 110
 MAX_HIST_HEIGHT = 600
+MAX_CAMERA_OFFSET_ADU = 1e9
 
 FILTER_HIST_BG = "#20242b"
 FILTER_HIST_BAR = "#2fbfae"
@@ -66,13 +73,17 @@ FILTER_HIST_LINE = "#ffb454"
 
 # Columns matched to these column_map keys get shown first, in this order;
 # everything else follows in its original column order.
-FILTER_PRIORITY_KEYS = ["sigma", "intensity", "offset", "bkgstd", "uncertainty"]
+FILTER_PRIORITY_KEYS = ["sigma", "amplitude", "intensity", "offset", "bkgstd", "uncertainty"]
 
 POINTS_LAYER_NAME = "localizations"
 TRACKS_LAYER_NAME = "tracks"
 ALL_TRACKS_LAYER_NAME = "tracks_all"
 ROI_LAYER_NAME = "xy_filter_roi"
 LOC2D_CANDIDATES_LAYER_NAME = "loc2d_candidates"
+SBR_PROJECTIONS_LAYER_NAME = "sbr_sum_projections"
+SBR_ROI_LAYER_NAME = "sbr_selection_roi"
+SBR_REFERENCE_LAYER_NAME = "sbr_reference_beads"
+SBR_MATCHED_LAYER_NAME = "sbr_matched_beads"
 
 # Filenames checked next to a loaded CSV/image when auto-detecting companion
 # files - "{stem}" is substituted with the source file's stem.
@@ -121,6 +132,7 @@ def infer_column_map(columns):
         "x": pick(["x [nm]", "x (nm)", "x_nm", "x", "X"]),
         "y": pick(["y [nm]", "y (nm)", "y_nm", "y", "Y"]),
         "sigma": pick(["sigma [nm]", "sigma", "sigma_nm"]),
+        "amplitude": pick(["amplitude [photon/px]", "amplitude", "amp"]),
         "intensity": pick(["intensity [photon]", "intensity", "intensity [counts]"]),
         "offset": pick(["offset [photon]", "offset"]),
         "bkgstd": pick(["bkgstd [photon]", "bkgstd"]),
@@ -219,6 +231,86 @@ def _fit_worker(stack, candidates, box, backend, offset, gain):
 
 
 @thread_worker
+def _load_sbr_folder_worker(folder):
+    files = discover_tiff_files(folder)
+    projections = []
+    layer_counts = []
+    expected_shape = None
+    for index, path in enumerate(files):
+        projection, layer_count = load_tiff_projection(path)
+        if expected_shape is None:
+            expected_shape = projection.shape
+        elif projection.shape != expected_shape:
+            raise ValueError(
+                f"Projected TIFF shapes differ: expected {expected_shape}, "
+                f"got {projection.shape} for {path.name}"
+            )
+        projections.append(projection)
+        layer_counts.append(layer_count)
+        yield (index + 1) / len(files)
+    return (
+        np.stack(projections),
+        files,
+        np.asarray(layer_counts, dtype=np.int32),
+    )
+
+
+@thread_worker
+def _sbr_analysis_worker(
+    projections,
+    file_paths,
+    layer_counts,
+    box,
+    minimum_ng,
+    backend,
+    camera_offset_adu,
+    camera_gain_adu_per_photon,
+    tolerance_px,
+    roi_polygons,
+    default_bead_count,
+):
+    localizations_by_file = []
+    detection_counts = []
+    for file_index, (projection, layer_count) in enumerate(
+        zip(projections, layer_counts)
+    ):
+        y, x, net_gradient = identify_in_frame(projection, minimum_ng, box)
+        localizations = localize_frame(
+            projection,
+            y,
+            x,
+            box,
+            frame_number=file_index,
+            net_gradient=net_gradient,
+            fit_backend=backend,
+            # Every raw Z layer contributes one camera baseline to the sum.
+            camera_offset_adu=sum_projection_camera_offset(
+                camera_offset_adu, layer_count
+            ),
+            camera_gain_adu_per_photon=camera_gain_adu_per_photon,
+        )
+        localizations_by_file.append(localizations)
+        detection_counts.append(int(len(localizations["x"])))
+        yield (file_index + 1) / len(projections)
+
+    results, selected_indices, selection_mode = analyze_sbr_localizations(
+        localizations_by_file,
+        file_paths,
+        layer_counts,
+        tolerance_px=tolerance_px,
+        roi_polygons=roi_polygons,
+        default_bead_count=default_bead_count,
+    )
+    return {
+        "results": results,
+        "selected_indices": selected_indices,
+        "selection_mode": selection_mode,
+        "localizations": localizations_by_file,
+        "detection_counts": detection_counts,
+    }
+
+
+@thread_worker
 def _compute_d_worker(tracks_df, max_lagtime, fps, mpp):
     im = tp.imsd(tracks_df, mpp=mpp, fps=fps, max_lagtime=max_lagtime, pos_columns=["x", "y"])
     d_map = {}
@@ -310,6 +402,16 @@ class LocalizationTrackingWidget(QWidget):
         self._loc2d_counts = np.zeros(0, dtype=int)
         self._loc2d_detect_worker_ref = None
         self._loc2d_fit_worker_ref = None
+        self._sbr_projections = None
+        self._sbr_files = []
+        self._sbr_layer_counts = np.zeros(0, dtype=np.int32)
+        self._sbr_results = None
+        self._sbr_localizations = []
+        self._sbr_detection_counts = []
+        self._sbr_run_config = None
+        self._sbr_pending_config = None
+        self._sbr_load_worker_ref = None
+        self._sbr_analysis_worker_ref = None
         self._compute_d_worker_ref = None
         self._metrics_worker_ref = None
         self.setup_ui()
@@ -327,6 +429,7 @@ class LocalizationTrackingWidget(QWidget):
 
         self._build_load_tab()
         self._build_localize_tab()
+        self._build_sbr_tab()
         self._build_filter_tab()
         self._build_link_tab()
         self._build_trajectory_analysis_tab()
@@ -468,7 +571,7 @@ class LocalizationTrackingWidget(QWidget):
         self.loc_gain_box.setValue(1.0)
         cam_layout.addRow("Gain (ADU/photon)", self.loc_gain_box)
         self.loc_offset_box = QDoubleSpinBox()
-        self.loc_offset_box.setRange(0.0, 20000.0)
+        self.loc_offset_box.setRange(0.0, MAX_CAMERA_OFFSET_ADU)
         self.loc_offset_box.setValue(100.0)
         cam_layout.addRow("Offset (ADU)", self.loc_offset_box)
         layout.addWidget(cam_group)
@@ -534,6 +637,145 @@ class LocalizationTrackingWidget(QWidget):
         layout.addStretch(1)
 
         self.loc_box_size.valueChanged.connect(self._on_loc2d_box_changed)
+
+    def _build_sbr_tab(self):
+        tab = QWidget()
+        self.tabs.addTab(tab, "Batch SBR")
+        outer_layout = QVBoxLayout(tab)
+        outer_layout.setContentsMargins(0, 0, 0, 0)
+        scroll = QScrollArea(tab)
+        scroll.setWidgetResizable(True)
+        content = QWidget()
+        layout = QVBoxLayout(content)
+        scroll.setWidget(content)
+        outer_layout.addWidget(scroll)
+
+        note = QLabel(
+            "Load a folder of aligned grayscale TIFF Z-stacks. Each TIFF is "
+            "sum-projected to one image; the naturally sorted first TIFF is "
+            "the reference. SBR is (Gaussian peak amplitude + fitted mean "
+            "background) / fitted mean background."
+        )
+        note.setWordWrap(True)
+        layout.addWidget(note)
+
+        folder_group = QGroupBox("1. TIFF folder and sum projection")
+        folder_layout = QFormLayout(folder_group)
+        self.sbr_folder_edit = QLineEdit()
+        self.sbr_folder_button = QPushButton("Browse folder")
+        self.sbr_folder_button.clicked.connect(self.browse_sbr_folder)
+        folder_row = QHBoxLayout()
+        folder_row.addWidget(self.sbr_folder_edit)
+        folder_row.addWidget(self.sbr_folder_button)
+        folder_layout.addRow("Folder", folder_row)
+        self.sbr_load_button = QPushButton("Load and sum-project TIFFs")
+        self.sbr_load_button.clicked.connect(self.load_sbr_folder)
+        folder_layout.addRow("", self.sbr_load_button)
+        self.sbr_load_progress = QProgressBar()
+        self.sbr_load_progress.setRange(0, 100)
+        self.sbr_load_progress.setVisible(False)
+        folder_layout.addRow("", self.sbr_load_progress)
+        self.sbr_projection_status = QLabel("No TIFF folder loaded")
+        self.sbr_projection_status.setWordWrap(True)
+        folder_layout.addRow("", self.sbr_projection_status)
+        layout.addWidget(folder_group)
+
+        roi_group = QGroupBox("2. Reference-bead selection")
+        roi_layout = QFormLayout(roi_group)
+        self.sbr_roi_shape_box = QComboBox()
+        self.sbr_roi_shape_box.addItems(["rectangle", "polygon"])
+        roi_layout.addRow("ROI shape", self.sbr_roi_shape_box)
+        roi_buttons = QHBoxLayout()
+        self.sbr_draw_roi_button = QPushButton("Draw ROI on reference")
+        self.sbr_draw_roi_button.clicked.connect(self.start_sbr_roi)
+        self.sbr_draw_roi_button.setEnabled(False)
+        self.sbr_clear_roi_button = QPushButton("Clear ROI (use automatic selection)")
+        self.sbr_clear_roi_button.clicked.connect(self.clear_sbr_roi)
+        self.sbr_clear_roi_button.setEnabled(False)
+        roi_buttons.addWidget(self.sbr_draw_roi_button)
+        roi_buttons.addWidget(self.sbr_clear_roi_button)
+        roi_layout.addRow("", roi_buttons)
+        self.sbr_default_count_box = QSpinBox()
+        self.sbr_default_count_box.setRange(1, 1000)
+        self.sbr_default_count_box.setValue(10)
+        roi_layout.addRow("Automatic brightest beads", self.sbr_default_count_box)
+        roi_note = QLabel(
+            "One or more ROIs select every reference bead inside their union. "
+            "With no ROI, the brightest reference beads that match across all "
+            "TIFFs are selected automatically."
+        )
+        roi_note.setWordWrap(True)
+        roi_layout.addRow("", roi_note)
+        layout.addWidget(roi_group)
+
+        analysis_group = QGroupBox("3. Localization, matching, and SBR")
+        analysis_layout = QFormLayout(analysis_group)
+        self.sbr_gain_box = QDoubleSpinBox()
+        self.sbr_gain_box.setRange(0.01, 1000.0)
+        self.sbr_gain_box.setDecimals(3)
+        self.sbr_gain_box.setValue(1.0)
+        analysis_layout.addRow("Gain (ADU/photon)", self.sbr_gain_box)
+        self.sbr_offset_box = QDoubleSpinBox()
+        self.sbr_offset_box.setRange(0.0, MAX_CAMERA_OFFSET_ADU)
+        self.sbr_offset_box.setValue(100.0)
+        analysis_layout.addRow("Camera offset per Z layer (ADU)", self.sbr_offset_box)
+        self.sbr_box_size = QSpinBox()
+        self.sbr_box_size.setRange(3, 51)
+        self.sbr_box_size.setSingleStep(2)
+        self.sbr_box_size.setValue(7)
+        self.sbr_box_size.valueChanged.connect(self._on_sbr_box_changed)
+        analysis_layout.addRow("Fitting box size (px, odd)", self.sbr_box_size)
+        self.sbr_min_ng_box = QDoubleSpinBox()
+        self.sbr_min_ng_box.setRange(0.0, 1e9)
+        self.sbr_min_ng_box.setDecimals(1)
+        self.sbr_min_ng_box.setValue(800.0)
+        analysis_layout.addRow("Min net gradient", self.sbr_min_ng_box)
+        self.sbr_backend_box = QComboBox()
+        self.sbr_backend_box.addItems(["auto", "mle", "fast", "gpu"])
+        analysis_layout.addRow("Fit backend", self.sbr_backend_box)
+        self.sbr_tolerance_box = QDoubleSpinBox()
+        self.sbr_tolerance_box.setRange(0.0, 1000.0)
+        self.sbr_tolerance_box.setDecimals(2)
+        self.sbr_tolerance_box.setSingleStep(0.25)
+        self.sbr_tolerance_box.setValue(2.0)
+        analysis_layout.addRow("Matching tolerance (px)", self.sbr_tolerance_box)
+        offset_note = QLabel(
+            "The camera offset is subtracted once per Z layer, so an N-layer "
+            "sum projection uses N × offset during fitting. Matching is "
+            "one-to-one and always relative to the first TIFF."
+        )
+        offset_note.setWordWrap(True)
+        analysis_layout.addRow("", offset_note)
+        self.sbr_analyze_button = QPushButton("Localize all projections and analyze SBR")
+        self.sbr_analyze_button.clicked.connect(self.run_sbr_analysis)
+        self.sbr_analyze_button.setEnabled(False)
+        analysis_layout.addRow("", self.sbr_analyze_button)
+        self.sbr_analysis_progress = QProgressBar()
+        self.sbr_analysis_progress.setRange(0, 100)
+        self.sbr_analysis_progress.setVisible(False)
+        analysis_layout.addRow("", self.sbr_analysis_progress)
+        self.sbr_analysis_status = QLabel("No SBR analysis run")
+        self.sbr_analysis_status.setWordWrap(True)
+        analysis_layout.addRow("", self.sbr_analysis_status)
+        layout.addWidget(analysis_group)
+
+        results_group = QGroupBox("SBR comparison")
+        results_layout = QVBoxLayout(results_group)
+        self.sbr_figure = Figure(figsize=(6, 3.2))
+        self.sbr_canvas = FigureCanvas(self.sbr_figure)
+        self.sbr_canvas.setMinimumHeight(280)
+        results_layout.addWidget(self.sbr_canvas)
+        self.sbr_table_model = PandasTableModel()
+        self.sbr_table_view = QTableView()
+        self.sbr_table_view.setModel(self.sbr_table_model)
+        self.sbr_table_view.setMinimumHeight(240)
+        results_layout.addWidget(self.sbr_table_view)
+        self.sbr_export_button = QPushButton("Export SBR CSV, pivot table, plot, and metadata")
+        self.sbr_export_button.clicked.connect(self.export_sbr_analysis)
+        self.sbr_export_button.setEnabled(False)
+        results_layout.addWidget(self.sbr_export_button)
+        layout.addWidget(results_group)
+        layout.addStretch(1)
 
     def _build_filter_tab(self):
         tab = QWidget()
@@ -1193,6 +1435,7 @@ class LocalizationTrackingWidget(QWidget):
                 "sigma [nm]": 0.5 * (locs["sx"].astype(float) + locs["sy"].astype(float)) * pixel_size,
                 "sigma_x [nm]": locs["sx"].astype(float) * pixel_size,
                 "sigma_y [nm]": locs["sy"].astype(float) * pixel_size,
+                "amplitude [photon/px]": locs["amp"].astype(float),
                 "intensity [photon]": locs["photons"].astype(float),
                 "offset [photon]": locs["bg"].astype(float),
                 "bkgstd [photon]": locs["bkgstd"].astype(float),
@@ -1206,6 +1449,441 @@ class LocalizationTrackingWidget(QWidget):
             f"Fitted {n} localizations from the loaded image stack (in-app 2D localization)",
             frame_is_zero_indexed=True,
         )
+
+    # ------------------------------------------------------------------
+    # Batch TIFF sum-projection and SBR analysis
+    # ------------------------------------------------------------------
+    def browse_sbr_folder(self):
+        path = QFileDialog.getExistingDirectory(self, "Select folder containing TIFF stacks")
+        if path:
+            self.sbr_folder_edit.setText(path)
+
+    def _on_sbr_box_changed(self, value):
+        if value % 2 == 0:
+            self.sbr_box_size.blockSignals(True)
+            self.sbr_box_size.setValue(value + 1)
+            self.sbr_box_size.blockSignals(False)
+
+    def load_sbr_folder(self):
+        folder = self.sbr_folder_edit.text().strip()
+        if not folder or not Path(folder).is_dir():
+            self.log("Choose a valid TIFF folder for batch SBR analysis")
+            return
+
+        self._sbr_projections = None
+        self._sbr_files = []
+        self._sbr_layer_counts = np.zeros(0, dtype=np.int32)
+        self._sbr_results = None
+        self._sbr_localizations = []
+        self._sbr_detection_counts = []
+        self._sbr_run_config = None
+        self._sbr_pending_config = None
+        for layer_name in (
+            SBR_PROJECTIONS_LAYER_NAME,
+            SBR_ROI_LAYER_NAME,
+            SBR_REFERENCE_LAYER_NAME,
+            SBR_MATCHED_LAYER_NAME,
+        ):
+            self._remove_layer(layer_name)
+        self.sbr_table_model.set_dataframe(pd.DataFrame())
+        self.sbr_figure.clear()
+        self.sbr_canvas.draw_idle()
+
+        self.sbr_load_button.setEnabled(False)
+        self.sbr_folder_button.setEnabled(False)
+        self.sbr_folder_edit.setEnabled(False)
+        self.sbr_draw_roi_button.setEnabled(False)
+        self.sbr_clear_roi_button.setEnabled(False)
+        self.sbr_analyze_button.setEnabled(False)
+        self.sbr_export_button.setEnabled(False)
+        self.sbr_load_progress.setVisible(True)
+        self.sbr_load_progress.setValue(0)
+        self.sbr_projection_status.setText("Reading and sum-projecting TIFFs...")
+        self.log(f"Loading and sum-projecting TIFFs from {folder}...")
+
+        worker = _load_sbr_folder_worker(folder)
+        worker.yielded.connect(
+            lambda frac: self.sbr_load_progress.setValue(int(float(frac) * 100))
+        )
+        worker.returned.connect(self._on_sbr_folder_loaded)
+        worker.errored.connect(self._on_sbr_folder_error)
+        worker.finished.connect(self._on_sbr_load_worker_finished)
+        self._sbr_load_worker_ref = worker
+        worker.start()
+
+    def _on_sbr_load_worker_finished(self):
+        self.sbr_load_button.setEnabled(True)
+        self.sbr_folder_button.setEnabled(True)
+        self.sbr_folder_edit.setEnabled(True)
+        has_projections = self._sbr_projections is not None
+        self.sbr_draw_roi_button.setEnabled(has_projections)
+        self.sbr_clear_roi_button.setEnabled(has_projections)
+        self.sbr_analyze_button.setEnabled(has_projections)
+        self.sbr_load_progress.setVisible(False)
+        self._sbr_load_worker_ref = None
+
+    def _on_sbr_folder_error(self, exc):
+        self.sbr_projection_status.setText(f"Failed to load TIFF folder: {exc}")
+        self.log(f"Batch SBR TIFF loading failed: {exc}")
+
+    def _on_sbr_folder_loaded(self, result):
+        projections, files, layer_counts = result
+        self._sbr_projections = projections
+        self._sbr_files = list(files)
+        self._sbr_layer_counts = np.asarray(layer_counts, dtype=np.int32)
+        self._sbr_results = None
+        self._sbr_localizations = []
+        self._sbr_detection_counts = []
+        self._sbr_run_config = None
+        self._sbr_pending_config = None
+
+        for layer_name in (
+            SBR_PROJECTIONS_LAYER_NAME,
+            SBR_ROI_LAYER_NAME,
+            SBR_REFERENCE_LAYER_NAME,
+            SBR_MATCHED_LAYER_NAME,
+        ):
+            self._remove_layer(layer_name)
+        self.viewer.add_image(
+            projections,
+            name=SBR_PROJECTIONS_LAYER_NAME,
+            colormap="gray",
+            metadata={
+                "file_names": [path.name for path in files],
+                "file_paths": [str(path) for path in files],
+                "z_layers": self._sbr_layer_counts.tolist(),
+                "reference_file": files[0].name,
+                "projection": "sum",
+            },
+        )
+        self._show_sbr_reference_projection()
+
+        self.sbr_projection_status.setText(
+            f"Loaded {len(files)} projections of shape {tuple(projections.shape[1:])}. "
+            f"Reference: {files[0].name} ({int(layer_counts[0])} Z layer(s))."
+        )
+        self.sbr_analysis_status.setText(
+            "Draw an optional ROI on the reference image, then run SBR analysis."
+        )
+        self.sbr_export_button.setEnabled(False)
+        self.sbr_table_model.set_dataframe(pd.DataFrame())
+        self.sbr_figure.clear()
+        self.sbr_canvas.draw_idle()
+        self.log(
+            f"Sum-projected {len(files)} TIFFs; first natural-sort reference is {files[0].name}"
+        )
+
+    def _show_sbr_reference_projection(self):
+        if SBR_PROJECTIONS_LAYER_NAME not in self.viewer.layers:
+            return
+        layer = self.viewer.layers[SBR_PROJECTIONS_LAYER_NAME]
+        # Lower-dimensional napari layers align with the trailing global
+        # axes. If another 4D+ layer exists, the TIFF/file axis is therefore
+        # not necessarily global axis zero.
+        file_axis = max(0, int(self.viewer.dims.ndim) - int(layer.ndim))
+        try:
+            self.viewer.dims.set_current_step(file_axis, 0)
+        except Exception:
+            pass
+
+    def start_sbr_roi(self):
+        if self._sbr_projections is None:
+            self.log("Load the TIFF projections before drawing an SBR ROI")
+            return
+        # ROI selection is always defined on the first/reference TIFF.
+        self._show_sbr_reference_projection()
+        if SBR_ROI_LAYER_NAME in self.viewer.layers:
+            layer = self.viewer.layers[SBR_ROI_LAYER_NAME]
+        else:
+            layer = self.viewer.add_shapes(
+                name=SBR_ROI_LAYER_NAME,
+                ndim=2,
+                edge_color="magenta",
+                face_color="transparent",
+                edge_width=2,
+            )
+        shape_name = self.sbr_roi_shape_box.currentText()
+        layer.mode = "add_rectangle" if shape_name == "rectangle" else "add_polygon"
+        try:
+            self.viewer.layers.selection.active = layer
+        except Exception:
+            pass
+        self.log(
+            f"Draw one or more {shape_name} SBR ROIs on the reference projection; "
+            "multiple ROIs are combined."
+        )
+
+    def clear_sbr_roi(self):
+        self._remove_layer(SBR_ROI_LAYER_NAME)
+        self.log("Cleared SBR ROI; automatic brightest-bead selection will be used")
+
+    def _sbr_roi_polygons(self):
+        if SBR_ROI_LAYER_NAME not in self.viewer.layers:
+            return None
+        layer = self.viewer.layers[SBR_ROI_LAYER_NAME]
+        polygons = []
+        for shape in layer.data:
+            vertices = np.asarray(shape, dtype=np.float64)
+            if vertices.ndim == 2 and vertices.shape[0] >= 3 and vertices.shape[1] >= 2:
+                polygons.append(vertices[:, -2:].copy())
+        return polygons or None
+
+    def run_sbr_analysis(self):
+        if self._sbr_projections is None or not self._sbr_files:
+            self.log("Load a TIFF folder before running SBR analysis")
+            return
+
+        backend = self.sbr_backend_box.currentText()
+        if backend == "auto":
+            backend = "gpu" if is_gpufit_available() else "fast"
+            self.log(f"Batch SBR auto backend selected: {backend}")
+
+        roi_polygons = self._sbr_roi_polygons()
+        selection_text = (
+            f"{len(roi_polygons)} ROI(s)"
+            if roi_polygons
+            else f"automatic top {self.sbr_default_count_box.value()} brightest matchable beads"
+        )
+        self.sbr_analyze_button.setEnabled(False)
+        self.sbr_load_button.setEnabled(False)
+        self.sbr_folder_button.setEnabled(False)
+        self.sbr_folder_edit.setEnabled(False)
+        self.sbr_draw_roi_button.setEnabled(False)
+        self.sbr_clear_roi_button.setEnabled(False)
+        self.sbr_export_button.setEnabled(False)
+        self.sbr_analysis_progress.setVisible(True)
+        self.sbr_analysis_progress.setValue(0)
+        self.sbr_analysis_status.setText(
+            f"Localizing {len(self._sbr_files)} projections using {selection_text}..."
+        )
+        self.log(
+            f"Running batch SBR localization on {len(self._sbr_files)} projections "
+            f"(backend={backend}, tolerance={self.sbr_tolerance_box.value():.2f} px)..."
+        )
+
+        self._sbr_results = None
+        self._sbr_localizations = []
+        self._sbr_detection_counts = []
+        self._sbr_run_config = None
+        self._sbr_pending_config = {
+            "requested_backend": self.sbr_backend_box.currentText(),
+            "resolved_backend": backend,
+            "gain_adu_per_photon": float(self.sbr_gain_box.value()),
+            "camera_offset_adu_per_z_layer": float(self.sbr_offset_box.value()),
+            "box_size_px": int(self.sbr_box_size.value()),
+            "min_net_gradient": float(self.sbr_min_ng_box.value()),
+            "matching_tolerance_px": float(self.sbr_tolerance_box.value()),
+            "automatic_bead_count": int(self.sbr_default_count_box.value()),
+            "roi_vertices_yx": [polygon.copy() for polygon in (roi_polygons or [])],
+        }
+        self.sbr_table_model.set_dataframe(pd.DataFrame())
+        self.sbr_figure.clear()
+        self.sbr_canvas.draw_idle()
+        self._remove_layer(SBR_REFERENCE_LAYER_NAME)
+        self._remove_layer(SBR_MATCHED_LAYER_NAME)
+
+        worker = _sbr_analysis_worker(
+            self._sbr_projections,
+            self._sbr_files,
+            self._sbr_layer_counts,
+            int(self.sbr_box_size.value()),
+            float(self.sbr_min_ng_box.value()),
+            backend,
+            float(self.sbr_offset_box.value()),
+            float(self.sbr_gain_box.value()),
+            float(self.sbr_tolerance_box.value()),
+            roi_polygons,
+            int(self.sbr_default_count_box.value()),
+        )
+        worker.yielded.connect(
+            lambda frac: self.sbr_analysis_progress.setValue(int(float(frac) * 100))
+        )
+        worker.returned.connect(self._on_sbr_analysis_finished)
+        worker.errored.connect(self._on_sbr_analysis_error)
+        worker.finished.connect(self._on_sbr_analysis_worker_finished)
+        self._sbr_analysis_worker_ref = worker
+        worker.start()
+
+    def _on_sbr_analysis_worker_finished(self):
+        self.sbr_load_button.setEnabled(True)
+        self.sbr_folder_button.setEnabled(True)
+        self.sbr_folder_edit.setEnabled(True)
+        self.sbr_draw_roi_button.setEnabled(self._sbr_projections is not None)
+        self.sbr_clear_roi_button.setEnabled(self._sbr_projections is not None)
+        self.sbr_analyze_button.setEnabled(self._sbr_projections is not None)
+        self.sbr_analysis_progress.setVisible(False)
+        self._sbr_analysis_worker_ref = None
+
+    def _on_sbr_analysis_error(self, exc):
+        self._sbr_pending_config = None
+        self.sbr_analysis_status.setText(f"SBR analysis failed: {exc}")
+        self.log(f"Batch SBR analysis failed: {exc}")
+
+    def _on_sbr_analysis_finished(self, result):
+        self._sbr_results = result["results"]
+        self._sbr_localizations = result["localizations"]
+        self._sbr_detection_counts = result["detection_counts"]
+        self._sbr_run_config = dict(self._sbr_pending_config or {})
+        self._sbr_run_config["selection_mode"] = result["selection_mode"]
+        self._sbr_pending_config = None
+        self.sbr_table_model.set_dataframe(self._sbr_results)
+        self._draw_sbr_plot()
+        self._sync_sbr_result_layers()
+
+        bead_count = int(self._sbr_results["bead_id"].nunique())
+        total = len(self._sbr_results)
+        matched = int(self._sbr_results["matched"].sum())
+        missing = total - matched
+        selection = "ROI" if result["selection_mode"] == "roi" else "automatic brightest"
+        self.sbr_analysis_status.setText(
+            f"Compared {bead_count} {selection}-selected bead(s) across "
+            f"{len(self._sbr_files)} TIFFs: {matched}/{total} matches, {missing} missing."
+        )
+        self.sbr_export_button.setEnabled(True)
+        self.log(
+            f"Batch SBR complete: {bead_count} beads, {matched}/{total} matched rows; "
+            f"detections per TIFF={self._sbr_detection_counts}"
+        )
+
+    def _draw_sbr_plot(self):
+        figure = self.sbr_figure
+        figure.clear()
+        if self._sbr_results is None or self._sbr_results.empty:
+            self.sbr_canvas.draw_idle()
+            return
+        ax = figure.add_subplot(111)
+        bead_count = int(self._sbr_results["bead_id"].nunique())
+        show_legend = bead_count <= 12
+        for bead_id, group in self._sbr_results.groupby("bead_id", sort=True):
+            group = group.sort_values("file_index")
+            ax.plot(
+                group["file_index"],
+                group["sbr"],
+                "o-",
+                linewidth=1.0,
+                markersize=3,
+                alpha=0.7,
+                label=f"Bead {bead_id}" if show_legend else None,
+            )
+        mean_sbr = self._sbr_results.groupby("file_index")["sbr"].mean()
+        ax.plot(
+            mean_sbr.index,
+            mean_sbr.values,
+            "o-",
+            color="black",
+            linewidth=2.2,
+            markersize=4,
+            label="Mean",
+            zorder=10,
+        )
+        file_indices = np.sort(self._sbr_results["file_index"].unique())
+        ax.set_xticks(file_indices)
+        ax.set_xticklabels(file_indices)
+        ax.set_xlabel("File index (0 = reference TIFF)")
+        ax.set_ylabel("SBR = (A + b) / b")
+        ax.set_title("Per-bead SBR across sum-projected TIFFs")
+        ax.grid(alpha=0.3)
+        if show_legend:
+            ax.legend(fontsize=7, ncol=2)
+        else:
+            ax.legend(handles=[ax.lines[-1]], labels=["Mean"], fontsize=7)
+        figure.tight_layout()
+        self.sbr_canvas.draw_idle()
+
+    def _sync_sbr_result_layers(self):
+        self._remove_layer(SBR_REFERENCE_LAYER_NAME)
+        self._remove_layer(SBR_MATCHED_LAYER_NAME)
+        if self._sbr_results is None or self._sbr_results.empty:
+            return
+
+        reference = self._sbr_results[
+            (self._sbr_results["file_index"] == 0) & self._sbr_results["matched"]
+        ].sort_values("bead_id")
+        if not reference.empty:
+            self.viewer.add_points(
+                reference[["reference_y_px", "reference_x_px"]].to_numpy(float),
+                name=SBR_REFERENCE_LAYER_NAME,
+                features=reference[["bead_id", "sbr"]].reset_index(drop=True),
+                face_color="transparent",
+                border_color="yellow",
+                border_width=0.18,
+                border_width_is_relative=True,
+                size=11,
+                symbol="o",
+            )
+
+        matched = self._sbr_results[
+            (self._sbr_results["file_index"] > 0) & self._sbr_results["matched"]
+        ].copy()
+        if not matched.empty:
+            coords = matched[["file_index", "y_px", "x_px"]].to_numpy(float)
+            self.viewer.add_points(
+                coords,
+                name=SBR_MATCHED_LAYER_NAME,
+                features=matched[["bead_id", "sbr", "match_distance_px"]].reset_index(drop=True),
+                face_color="transparent",
+                border_color="cyan",
+                border_width=0.15,
+                border_width_is_relative=True,
+                size=9,
+                symbol="o",
+            )
+        self.viewer.tooltip.visible = True
+
+    def export_sbr_analysis(self):
+        if self._sbr_results is None or self._sbr_results.empty or not self._sbr_files:
+            self.log("Run SBR analysis before exporting")
+            return
+        base_dir = self._sbr_files[0].parent
+        folder = base_dir / "sbr_analysis"
+        suffix = 2
+        while folder.exists():
+            folder = base_dir / f"sbr_analysis_{suffix}"
+            suffix += 1
+        try:
+            folder.mkdir(parents=True, exist_ok=False)
+            self._sbr_results.to_csv(folder / "sbr_results.csv", index=False)
+            pivot = self._sbr_results.pivot(
+                index="bead_id", columns="file_name", values="sbr"
+            )
+            pivot.to_csv(folder / "sbr_by_bead_and_tiff.csv")
+            if self.sbr_figure.axes:
+                self.sbr_figure.savefig(folder / "sbr_vs_tiff.png", dpi=200)
+            config = self._sbr_run_config or {}
+            metadata = {
+                "exported_at": datetime.now().isoformat(timespec="seconds"),
+                "source_folder": str(base_dir),
+                "reference_file": self._sbr_files[0].name,
+                "files": [
+                    {"file": path.name, "path": str(path), "z_layers": int(layer_count)}
+                    for path, layer_count in zip(self._sbr_files, self._sbr_layer_counts)
+                ],
+                "projection": "sum",
+                "sbr_formula": "(amplitude + background) / background",
+                "gain_adu_per_photon": config.get("gain_adu_per_photon"),
+                "camera_offset_adu_per_z_layer": config.get(
+                    "camera_offset_adu_per_z_layer"
+                ),
+                "box_size_px": config.get("box_size_px"),
+                "min_net_gradient": config.get("min_net_gradient"),
+                "fit_backend_requested": config.get("requested_backend"),
+                "fit_backend_resolved": config.get("resolved_backend"),
+                "matching_tolerance_px": config.get("matching_tolerance_px"),
+                "automatic_bead_count": config.get("automatic_bead_count"),
+                "selection_mode": config.get("selection_mode"),
+                "roi_vertices_yx": [
+                    polygon.tolist() for polygon in config.get("roi_vertices_yx", [])
+                ],
+                "detection_counts": self._sbr_detection_counts,
+                "n_selected_beads": int(self._sbr_results["bead_id"].nunique()),
+                "n_matched_rows": int(self._sbr_results["matched"].sum()),
+                "n_total_rows": int(len(self._sbr_results)),
+            }
+            with open(folder / "metadata.json", "w", encoding="utf-8") as handle:
+                json.dump(metadata, handle, indent=2, default=str)
+            self.log(f"Exported batch SBR analysis to {folder}")
+        except Exception as exc:
+            self.log(f"SBR export failed: {exc}")
 
     # ------------------------------------------------------------------
     # Filtering (+ per-column histograms)

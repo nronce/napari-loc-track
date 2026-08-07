@@ -17,6 +17,13 @@ software required for the localization step.
 - **Filter localizations** - per-column histograms with draggable filter
   bounds, adjustable bin count and view range, plus a draggable box on the
   image itself for x/y filtering.
+- **Batch SBR** - load a folder of aligned grayscale TIFF Z-stacks, create a
+  sum projection for every TIFF, localize the same reference beads across
+  all projections, and compare per-bead signal-to-background ratio
+  `(amplitude + background) / background`. Select beads with rectangle or
+  polygon ROIs, or automatically use the 10 brightest beads that match every
+  image. Results include a plot, long CSV, bead-by-TIFF pivot table, and
+  reproducibility metadata.
 - **Link** - trajectory linking via [trackpy](http://soft-matter.github.io/trackpy/),
   background-threaded with progress.
 - **Trajectory analysis** - diffusion coefficient (D) extraction from a
@@ -94,9 +101,13 @@ conda install -n napari-loc-track -c conda-forge "blas=*=openblas" --force-reins
    and fit them directly from the loaded image.
 3. **Filter localizations** to remove bad fits (sigma, intensity, uncertainty,
    etc., plus a draggable box on the image for spatial filtering).
-4. Optionally **Link** trajectories and run **Trajectory analysis** (D,
+4. For multi-TIFF bead comparisons, open **Batch SBR**, select a TIFF folder,
+   load the sum projections, optionally draw an ROI on the first TIFF, and
+   run the analysis. TIFFs must be spatially aligned; matching is performed
+   directly against the naturally sorted first filename.
+5. Optionally **Link** trajectories and run **Trajectory analysis** (D,
    distance, duration).
-5. **Export** whenever you're ready - from either the Filter or Trajectory
+6. **Export** whenever you're ready - from either the Filter or Trajectory
    analysis tab, exports whatever you currently have.
 
 ## Development

@@ -297,7 +297,8 @@ def fit_gaussian_2d(patch, *, max_iter=12, tol=1e-3, damping=1e-2):
     lpx = float(max(sx / np.sqrt(max(photons, 1.0)), 0.05))
     lpy = float(max(sy / np.sqrt(max(photons, 1.0)), 0.05))
     return {
-        "x_patch": float(x0), "y_patch": float(y0), "photons": photons,
+        "x_patch": float(x0), "y_patch": float(y0), "amp": float(amp),
+        "photons": photons,
         "sx": float(sx), "sy": float(sy), "bg": float(bg), "bkgstd": bkgstd,
         "lpx": lpx, "lpy": lpy,
     }
@@ -363,7 +364,8 @@ def fit_gaussian_2d_mle(patch, *, max_iter=20, tol=5e-4, damping=5e-2):
     lpx = float(max(sx / np.sqrt(max(photons, 1.0)), 0.02))
     lpy = float(max(sy / np.sqrt(max(photons, 1.0)), 0.02))
     return {
-        "x_patch": float(x0), "y_patch": float(y0), "photons": photons,
+        "x_patch": float(x0), "y_patch": float(y0), "amp": float(amp),
+        "photons": photons,
         "sx": float(sx), "sy": float(sy), "bg": float(bg), "bkgstd": bkgstd,
         "lpx": lpx, "lpy": lpy,
     }
@@ -401,7 +403,7 @@ def fit_gaussian_2d_gpu(patch):
             converged_state = getattr(_GPUFIT.State, "CONVERGED", 0)
             if int(states[0]) != int(converged_state):
                 return None
-        amp = float(params[0, 0])
+        amp = max(float(params[0, 0]), 1e-3)
         x_patch = float(params[0, 1])
         y_patch = float(params[0, 2])
         sigma = max(float(params[0, 3]), 0.25)
@@ -415,7 +417,8 @@ def fit_gaussian_2d_gpu(patch):
     )
     lpx = float(max(sigma / np.sqrt(max(photons, 1.0)), 0.02))
     return {
-        "x_patch": x_patch, "y_patch": y_patch, "photons": photons,
+        "x_patch": x_patch, "y_patch": y_patch, "amp": amp,
+        "photons": photons,
         "sx": sigma, "sy": sigma, "bg": bg, "bkgstd": bkgstd,
         "lpx": lpx, "lpy": lpx,
     }
@@ -426,7 +429,8 @@ def _empty_locs():
         key: np.empty((0,), dtype=dtype)
         for key, dtype in [
             ("frame", np.int32), ("x", np.float32), ("y", np.float32),
-            ("photons", np.float32), ("sx", np.float32), ("sy", np.float32),
+            ("amp", np.float32), ("photons", np.float32),
+            ("sx", np.float32), ("sy", np.float32),
             ("bg", np.float32), ("bkgstd", np.float32),
             ("lpx", np.float32), ("lpy", np.float32),
             ("net_gradient", np.float32),
@@ -441,6 +445,7 @@ def _to_numpy_locs(locs):
         "frame": np.asarray(locs["frame"], dtype=np.int32),
         "x": np.asarray(locs["x"], dtype=np.float32),
         "y": np.asarray(locs["y"], dtype=np.float32),
+        "amp": np.asarray(locs["amp"], dtype=np.float32),
         "photons": np.asarray(locs["photons"], dtype=np.float32),
         "sx": np.asarray(locs["sx"], dtype=np.float32),
         "sy": np.asarray(locs["sy"], dtype=np.float32),
@@ -500,6 +505,7 @@ def localize_frame(
         out["frame"].append(int(frame_number))
         out["x"].append(float(x0 + fit["x_patch"]))
         out["y"].append(float(y0 + fit["y_patch"]))
+        out["amp"].append(float(fit["amp"]))
         out["photons"].append(float(fit["photons"]))
         out["sx"].append(float(fit["sx"]))
         out["sy"].append(float(fit["sy"]))

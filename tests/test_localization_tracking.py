@@ -15,6 +15,7 @@ def test_infer_column_map_matches_expected_columns():
             "x [nm]": [100.0, 200.0, 300.0],
             "y [nm]": [100.0, 200.0, 300.0],
             "sigma [nm]": [150.0, 160.0, 170.0],
+            "amplitude [photon/px]": [100.0, 120.0, 90.0],
             "intensity [photon]": [1000.0, 1200.0, 900.0],
             "bkgstd [photon]": [8.0, 9.0, 7.0],
         }
@@ -25,6 +26,7 @@ def test_infer_column_map_matches_expected_columns():
     assert mapping["y"] == "y [nm]"
     assert mapping["frame"] == "frame"
     assert mapping["sigma"] == "sigma [nm]"
+    assert mapping["amplitude"] == "amplitude [photon/px]"
     assert mapping["intensity"] == "intensity [photon]"
     assert mapping["bkgstd"] == "bkgstd [photon]"
 
@@ -86,5 +88,7 @@ def test_localize_frame_returns_a_background_std_for_each_bead():
         )
 
         assert locs["bkgstd"].shape == (2,)
+        assert locs["amp"].shape == (2,)
+        assert np.all(locs["amp"] > 0.0)
         assert np.all(np.isfinite(locs["bkgstd"]))
         assert locs["bkgstd"][1] > 3.0 * locs["bkgstd"][0]
