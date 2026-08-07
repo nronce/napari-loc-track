@@ -11,7 +11,9 @@ software required for the localization step.
 - **Localize (2D)** - spot detection (local maxima + net gradient, numba-accelerated)
   and sub-pixel Gaussian fitting (least-squares, Poisson-MLE, or GPU via
   Gpufit if installed) directly on a loaded image stack. Live detection
-  preview overlay, background-threaded detect/fit with progress bars.
+  preview overlay, per-localization background level and background-noise
+  standard deviation (`offset [photon]` and `bkgstd [photon]`), and
+  background-threaded detect/fit with progress bars.
 - **Filter localizations** - per-column histograms with draggable filter
   bounds, adjustable bin count and view range, plus a draggable box on the
   image itself for x/y filtering.

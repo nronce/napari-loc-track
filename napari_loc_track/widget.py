@@ -66,7 +66,7 @@ FILTER_HIST_LINE = "#ffb454"
 
 # Columns matched to these column_map keys get shown first, in this order;
 # everything else follows in its original column order.
-FILTER_PRIORITY_KEYS = ["sigma", "intensity", "uncertainty", "offset"]
+FILTER_PRIORITY_KEYS = ["sigma", "intensity", "offset", "bkgstd", "uncertainty"]
 
 POINTS_LAYER_NAME = "localizations"
 TRACKS_LAYER_NAME = "tracks"
@@ -515,6 +515,13 @@ class LocalizationTrackingWidget(QWidget):
         gpu_note = QLabel("\"gpu\" needs Gpufit installed; falls back to CPU MLE automatically otherwise.")
         gpu_note.setWordWrap(True)
         fit_layout.addRow("", gpu_note)
+        background_note = QLabel(
+            "Each fitted localization reports offset [photon] (mean background) "
+            "and bkgstd [photon] (background-noise standard deviation) in the "
+            "Filter tab, full table, and exported CSV."
+        )
+        background_note.setWordWrap(True)
+        fit_layout.addRow("", background_note)
         self.loc_fit_button = QPushButton("Fit all detected frames")
         self.loc_fit_button.clicked.connect(self.loc2d_fit_all)
         self.loc_fit_button.setEnabled(False)
@@ -1188,6 +1195,7 @@ class LocalizationTrackingWidget(QWidget):
                 "sigma_y [nm]": locs["sy"].astype(float) * pixel_size,
                 "intensity [photon]": locs["photons"].astype(float),
                 "offset [photon]": locs["bg"].astype(float),
+                "bkgstd [photon]": locs["bkgstd"].astype(float),
                 "uncertainty [nm]": 0.5 * (locs["lpx"].astype(float) + locs["lpy"].astype(float)) * pixel_size,
                 "net_gradient": locs["net_gradient"].astype(float),
             }
