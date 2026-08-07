@@ -218,6 +218,27 @@ def _photons_bg_subtracted_from_patch(patch, bg):
     return float(signal.sum())
 
 
+def _background_std_from_fit(patch, xx, yy, params):
+    """Population standard deviation of the fitted-model residuals.
+
+    This follows ThunderSTORM's ``bkgstd`` definition: the standard
+    deviation of all pixels in the fitting ROI after subtracting the fitted
+    Gaussian plus its constant offset.  ``patch`` and ``params`` are already
+    in photon units here.
+    """
+    amp, bg, x0, y0, sx, sy = [float(value) for value in params]
+    sx2 = max(sx * sx, 0.25)
+    sy2 = max(sy * sy, 0.25)
+    exp_term = np.exp(
+        -(
+            ((xx - x0) ** 2) / (2.0 * sx2)
+            + ((yy - y0) ** 2) / (2.0 * sy2)
+        )
+    )
+    model = bg + amp * exp_term
+    return float(np.std(patch.astype(np.float64, copy=False) - model, ddof=0))
+
+
 def fit_gaussian_2d(patch, *, max_iter=12, tol=1e-3, damping=1e-2):
     """Least-squares Gauss-Newton fit. Model: bg + amp * exp(-((x-x0)^2/2sx^2 + (y-y0)^2/2sy^2))."""
     if patch.ndim != 2 or patch.shape[0] != patch.shape[1]:
@@ -272,11 +293,13 @@ def fit_gaussian_2d(patch, *, max_iter=12, tol=1e-3, damping=1e-2):
 
     amp, bg, x0, y0, sx, sy = params
     photons = _photons_bg_subtracted_from_patch(data, bg)
+    bkgstd = _background_std_from_fit(data, xx, yy, params)
     lpx = float(max(sx / np.sqrt(max(photons, 1.0)), 0.05))
     lpy = float(max(sy / np.sqrt(max(photons, 1.0)), 0.05))
     return {
-        "x_patch": float(x0), "y_patch": float(y0), "photons": photons,
-        "sx": float(sx), "sy": float(sy), "bg": float(bg),
+        "x_patch": float(x0), "y_patch": float(y0), "amp": float(amp),
+        "photons": photons,
+        "sx": float(sx), "sy": float(sy), "bg": float(bg), "bkgstd": bkgstd,
         "lpx": lpx, "lpy": lpy,
     }
 
@@ -337,11 +360,13 @@ def fit_gaussian_2d_mle(patch, *, max_iter=20, tol=5e-4, damping=5e-2):
 
     amp, bg, x0, y0, sx, sy = params
     photons = _photons_bg_subtracted_from_patch(data, bg)
+    bkgstd = _background_std_from_fit(data, xx, yy, params)
     lpx = float(max(sx / np.sqrt(max(photons, 1.0)), 0.02))
     lpy = float(max(sy / np.sqrt(max(photons, 1.0)), 0.02))
     return {
-        "x_patch": float(x0), "y_patch": float(y0), "photons": photons,
-        "sx": float(sx), "sy": float(sy), "bg": float(bg),
+        "x_patch": float(x0), "y_patch": float(y0), "amp": float(amp),
+        "photons": photons,
+        "sx": float(sx), "sy": float(sy), "bg": float(bg), "bkgstd": bkgstd,
         "lpx": lpx, "lpy": lpy,
     }
 
@@ -378,7 +403,7 @@ def fit_gaussian_2d_gpu(patch):
             converged_state = getattr(_GPUFIT.State, "CONVERGED", 0)
             if int(states[0]) != int(converged_state):
                 return None
-        amp = float(params[0, 0])
+        amp = max(float(params[0, 0]), 1e-3)
         x_patch = float(params[0, 1])
         y_patch = float(params[0, 2])
         sigma = max(float(params[0, 3]), 0.25)
@@ -387,10 +412,15 @@ def fit_gaussian_2d_gpu(patch):
         return None
 
     photons = _photons_bg_subtracted_from_patch(patch, bg)
+    bkgstd = _background_std_from_fit(
+        patch, xx, yy, (amp, bg, x_patch, y_patch, sigma, sigma)
+    )
     lpx = float(max(sigma / np.sqrt(max(photons, 1.0)), 0.02))
     return {
-        "x_patch": x_patch, "y_patch": y_patch, "photons": photons,
-        "sx": sigma, "sy": sigma, "bg": bg, "lpx": lpx, "lpy": lpx,
+        "x_patch": x_patch, "y_patch": y_patch, "amp": amp,
+        "photons": photons,
+        "sx": sigma, "sy": sigma, "bg": bg, "bkgstd": bkgstd,
+        "lpx": lpx, "lpy": lpx,
     }
 
 
@@ -399,8 +429,10 @@ def _empty_locs():
         key: np.empty((0,), dtype=dtype)
         for key, dtype in [
             ("frame", np.int32), ("x", np.float32), ("y", np.float32),
-            ("photons", np.float32), ("sx", np.float32), ("sy", np.float32),
-            ("bg", np.float32), ("lpx", np.float32), ("lpy", np.float32),
+            ("amp", np.float32), ("photons", np.float32),
+            ("sx", np.float32), ("sy", np.float32),
+            ("bg", np.float32), ("bkgstd", np.float32),
+            ("lpx", np.float32), ("lpy", np.float32),
             ("net_gradient", np.float32),
         ]
     }
@@ -413,10 +445,12 @@ def _to_numpy_locs(locs):
         "frame": np.asarray(locs["frame"], dtype=np.int32),
         "x": np.asarray(locs["x"], dtype=np.float32),
         "y": np.asarray(locs["y"], dtype=np.float32),
+        "amp": np.asarray(locs["amp"], dtype=np.float32),
         "photons": np.asarray(locs["photons"], dtype=np.float32),
         "sx": np.asarray(locs["sx"], dtype=np.float32),
         "sy": np.asarray(locs["sy"], dtype=np.float32),
         "bg": np.asarray(locs["bg"], dtype=np.float32),
+        "bkgstd": np.asarray(locs["bkgstd"], dtype=np.float32),
         "lpx": np.asarray(locs["lpx"], dtype=np.float32),
         "lpy": np.asarray(locs["lpy"], dtype=np.float32),
         "net_gradient": np.asarray(locs["net_gradient"], dtype=np.float32),
@@ -471,10 +505,12 @@ def localize_frame(
         out["frame"].append(int(frame_number))
         out["x"].append(float(x0 + fit["x_patch"]))
         out["y"].append(float(y0 + fit["y_patch"]))
+        out["amp"].append(float(fit["amp"]))
         out["photons"].append(float(fit["photons"]))
         out["sx"].append(float(fit["sx"]))
         out["sy"].append(float(fit["sy"]))
         out["bg"].append(float(fit["bg"]))
+        out["bkgstd"].append(float(fit["bkgstd"]))
         out["lpx"].append(float(fit["lpx"]))
         out["lpy"].append(float(fit["lpy"]))
         out["net_gradient"].append(float(net_gradient[i]) if net_gradient is not None and i < len(net_gradient) else 0.0)
