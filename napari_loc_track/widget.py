@@ -1,5 +1,8 @@
 import json
 import os
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
 
@@ -8,6 +11,7 @@ import pandas as pd
 import napari
 from napari.qt.threading import thread_worker
 from qtpy.QtCore import Qt, QAbstractTableModel, QModelIndex, QTimer
+from qtpy.QtGui import QFont
 from qtpy.QtWidgets import (
     QWidget,
     QVBoxLayout,
@@ -24,11 +28,13 @@ from qtpy.QtWidgets import (
     QPlainTextEdit,
     QScrollArea,
     QDoubleSpinBox,
+    QAbstractSpinBox,
     QSpinBox,
     QTableView,
     QTabWidget,
     QToolButton,
     QProgressBar,
+    QDialog,
 )
 
 import matplotlib
@@ -40,13 +46,50 @@ from matplotlib.colors import LogNorm, Normalize
 from napari.utils.colormaps import Colormap as NapariColormap
 import trackpy as tp
 
+from ._acqmeta import read_acquisition_metadata
+from ._imageio import open_image_stack
+from ._tracks import (
+    DEFAULT_LINKING_ERROR_RATE,
+    filter_tracks_by_length,
+    iter_particle_batches,
+    max_linkable_diffusion,
+    rms_step,
+)
 from ._localize2d import (
     identify_in_frame,
     localize_frame,
     concatenate_localizations,
     is_gpufit_available,
+    is_numba_available,
+    warmup_fit_kernels,
 )
+from . import _render as smlm_render
 
+# --- palette ---------------------------------------------------------------
+# One set of colours for the whole plugin: the Qt stylesheet, every matplotlib
+# figure and the track overlays all read from here, so nothing can drift out of
+# step the way the figures had (some dark-themed, some on matplotlib's white
+# default, which showed as white boxes inside a dark napari).
+ACCENT = "#20b2aa"          # lightseagreen - the primary action on each tab
+ACCENT_HOVER = "#2ac9c0"
+ACCENT_PRESSED = "#178f88"
+LAVENDER = "#b7a9e3"        # the secondary accent: selections, ranges, links
+LAVENDER_HOVER = "#c8bdea"
+LAVENDER_PRESSED = "#9a88d6"
+AMBER = "#e8a33d"           # reserved for "this stops something" and warnings
+PANEL_BG = "#20242b"        # matches napari's dark theme panels
+# Plots are screenshotted straight into talks, where anything short of pure
+# black shows up as a grey rectangle on a black slide. The panel around them
+# keeps napari's own shade; only the figures go fully black.
+PLOT_BG = "#000000"
+PANEL_LINE = "#39414d"
+INK = "#d7dbe0"             # body text on a dark panel
+INK_DIM = "#8d97a5"
+INK_ON_ACCENT = "#0e1116"   # dark text, for sitting on top of the accent
+
+# Deliberately NOT from the palette above: these colour trajectories drawn on
+# the image, where the job is telling neighbouring tracks apart, not matching
+# the interface.
 TRACK_PALETTE = [
     "#1f77b4", "#ff7f0e", "#2ca02c", "#d62728", "#9467bd",
     "#8c564b", "#e377c2", "#7f7f7f", "#bcbd22", "#17becf",
@@ -59,20 +102,62 @@ HIST_HEIGHT_STEP = 50
 MIN_HIST_HEIGHT = 110
 MAX_HIST_HEIGHT = 600
 
-FILTER_HIST_BG = "#20242b"
-FILTER_HIST_BAR = "#2fbfae"
-FILTER_HIST_FG = "#d7dbe0"
-FILTER_HIST_LINE = "#ffb454"
+FILTER_HIST_BG = PANEL_BG
+FILTER_HIST_BAR = ACCENT
+FILTER_HIST_FG = INK
+FILTER_HIST_LINE = LAVENDER
 
 # Columns matched to these column_map keys get shown first, in this order;
 # everything else follows in its original column order.
 FILTER_PRIORITY_KEYS = ["sigma", "intensity", "uncertainty", "offset"]
+# PSF widths for a typical single-molecule image sit around 100-200 nm, and a fit
+# that ran away can report the whole fitting box. Defaulting the sigma filters and
+# their histogram axes to this range keeps the useful part of the distribution
+# readable instead of squashing it against a long tail.
+SIGMA_DEFAULT_BOUNDS_NM = (0.0, 500.0)
 
 POINTS_LAYER_NAME = "localizations"
 TRACKS_LAYER_NAME = "tracks"
 ALL_TRACKS_LAYER_NAME = "tracks_all"
 ROI_LAYER_NAME = "xy_filter_roi"
 LOC2D_CANDIDATES_LAYER_NAME = "loc2d_candidates"
+RENDER_LAYER_NAME = "smlm_render"
+RENDER_MOVIE_LAYER_NAME = "smlm_render_movie"
+RENDER_CROP_LAYER_NAME = "smlm_render_crop"
+
+# Layers this plugin produces itself. They are Image layers like the raw stack,
+# so without this list a render would be offered as the thing to localize in, or
+# as the field of view for the next render.
+DERIVED_IMAGE_LAYERS = (RENDER_LAYER_NAME, RENDER_MOVIE_LAYER_NAME)
+
+# napari draws its own scale bar from world coordinates, so the world has to be a
+# physical space rather than a grid of camera pixels: every layer carries the
+# pixel size as its scale and nanometres as its unit. This is a *display*
+# transform only - layer data stays in camera pixels, which is what detection,
+# linking and the render grid all work in - so nothing in the analysis sees it.
+VIEWER_SPATIAL_UNIT = "nm"
+# The leading axis of a stack is a frame index, not a length, and saying so keeps
+# napari from labelling the dims slider in nanometres.
+VIEWER_FRAME_UNIT = "pixel"
+# These place themselves relative to the layer beneath them, through
+# `layer_transform`, so they are already in world units and must not be rescaled
+# from scratch - only carried along when the world itself changes.
+DERIVED_SCALE_LAYERS = (RENDER_LAYER_NAME, RENDER_MOVIE_LAYER_NAME)
+
+RENDER_COLORMAPS = ["magma", "inferno", "viridis", "hot", "gray", "twilight"]
+# What a saved render holds. Keys are stable identifiers stored in metadata.
+RENDER_SAVE_FORMATS = {
+    "data": "Data - float32, the render's own values",
+    "display": "Display - 8-bit, contrast-stretched",
+    "composite": "Composite - 8-bit RGB, layers blended",
+}
+# Refuse a render bigger than this rather than letting numpy raise MemoryError
+# with a mountain of Qt state half-updated behind it. 8 GB is roughly a
+# 45000x45000 single frame, or a 200-frame movie of 3300x3300.
+RENDER_MAX_BYTES = 8 * 1024 ** 3
+# Sliding windows re-render the localizations they share with their neighbours;
+# past this overlap factor the render is mostly repeated work and says so.
+RENDER_OVERLAP_WARN = 8
 
 # Filenames checked next to a loaded CSV/image when auto-detecting companion
 # files - "{stem}" is substituted with the source file's stem.
@@ -85,14 +170,153 @@ TRAJ_ANALYSIS_SUBPATH = "data/trajectories.csv"
 
 METRIC_LABELS = {
     "D": "Diffusion coefficient D (µm²/s)",
-    "distance": "Distance travelled (nm)",
+    "distance": "Distance travelled (µm)",
+    "net": "End-to-end displacement (µm)",
+    "straightness": "Straightness (end-to-end / path)",
     "duration": "Trajectory duration (s)",
+    # Colouring only: time needs no computing and has no bounds to filter on, so
+    # it is absent from METRIC_CACHE_ATTR and from the histogram/bounds machinery.
+    "time": "Frame first seen",
 }
 METRIC_CACHE_ATTR = {
     "D": "_track_diffusion_cache",
     "distance": "_track_distance_cache",
+    "net": "_track_net_cache",
+    "straightness": "_track_straightness_cache",
     "duration": "_track_duration_cache",
 }
+# Every metric that is computed per trajectory and can be histogrammed, coloured
+# by and bounded. "time" is deliberately absent: it colours but has nothing to
+# compute and nothing to filter on.
+COMPUTED_METRICS = ("D", "distance", "net", "straightness", "duration")
+# The metric view boxes mirror the bound boxes when "follow filter" is on, so
+# they need at least the precision of the finest of those (D, at six) or a small
+# bound is silently rounded to zero on the way across.
+METRIC_VIEW_DECIMALS = 6
+# Filter columns carry whatever units the data came in - photons, nanometres,
+# micrometres - so the bounds need room for the small ones too.
+FILTER_BOUND_DECIMALS = 6
+
+# Only the pieces that need to differ from napari's own theme: the plugin sits
+# inside napari's dock, so inheriting its background and text keeps it looking
+# native, and the accent is spent on the few things worth pointing at.
+STYLESHEET = f"""
+QGroupBox {{
+    border: 1px solid {PANEL_LINE};
+    border-radius: 6px;
+    margin-top: 10px;
+    padding: 10px 6px 6px 6px;
+}}
+QGroupBox::title {{
+    subcontrol-origin: margin;
+    left: 10px;
+    padding: 0 4px;
+    color: {ACCENT};
+    font-weight: 600;
+}}
+QPushButton[primary="true"] {{
+    background-color: {ACCENT};
+    color: {INK_ON_ACCENT};
+    border: none;
+    border-radius: 4px;
+    padding: 5px 14px;
+    font-weight: 600;
+}}
+QPushButton[primary="true"]:hover {{ background-color: {ACCENT_HOVER}; }}
+QPushButton[primary="true"]:pressed {{ background-color: {ACCENT_PRESSED}; }}
+QPushButton[secondary="true"] {{
+    background-color: transparent;
+    color: {LAVENDER};
+    border: 1px solid {LAVENDER_PRESSED};
+    border-radius: 4px;
+    padding: 5px 12px;
+}}
+QPushButton[secondary="true"]:hover {{
+    background-color: {LAVENDER_PRESSED};
+    color: {INK_ON_ACCENT};
+}}
+QPushButton[stop="true"] {{
+    background-color: transparent;
+    color: {AMBER};
+    border: 1px solid {AMBER};
+    border-radius: 4px;
+    padding: 4px 10px;
+}}
+QPushButton[stop="true"]:disabled {{ color: {INK_DIM}; border-color: {PANEL_LINE}; }}
+QPushButton[stop="true"]:hover:enabled {{ background-color: {AMBER}; color: {INK_ON_ACCENT}; }}
+QPushButton:disabled[primary="true"] {{ background-color: {PANEL_LINE}; color: {INK_DIM}; }}
+QProgressBar {{
+    border: 1px solid {PANEL_LINE};
+    border-radius: 4px;
+    text-align: center;
+    height: 14px;
+}}
+QProgressBar::chunk {{ background-color: {ACCENT}; border-radius: 3px; }}
+QTabBar::tab:selected {{ color: {ACCENT}; border-bottom: 2px solid {ACCENT}; }}
+QLabel[role="heading"] {{ color: {ACCENT}; font-weight: 600; }}
+QLabel[role="note"] {{ color: {INK_DIM}; }}
+QCheckBox::indicator:checked {{ background-color: {ACCENT}; border-radius: 3px; }}
+"""
+
+
+def adaptive_steps(*boxes):
+    """Make spin boxes step by a sensible fraction of their own value.
+
+    A range control holding six decimals with Qt's default step of 1.0 is
+    unusable on a value like 4e-5: one notch of the wheel moves it twenty
+    thousand times its own size, and the digit that actually matters is
+    unreachable. Qt's adaptive step chooses a power of ten from the current
+    value instead - 1e-6 near 4e-5, 0.1 near 3, 100 near 1500 - so the wheel
+    always moves the digit being looked at, whatever the scale of the number.
+
+    These are exactly the controls that span decades: diffusion coefficients,
+    distances, and any filter bound over a column whose units nobody chose.
+    """
+    for box in boxes:
+        try:
+            box.setStepType(QAbstractSpinBox.StepType.AdaptiveDecimalStepType)
+        except Exception:
+            pass  # a Qt too old for adaptive steps keeps its fixed one
+    return boxes[0] if len(boxes) == 1 else boxes
+
+
+def style_axes(figure, axes, *, title=None):
+    """Give every plot in the plugin the same dark, low-contrast look.
+
+    Called from all four figure families; before this the filter histograms were
+    themed and the detection-count and MSD plots were not, so half the plots
+    showed as white rectangles inside a dark napari.
+    """
+    figure.patch.set_facecolor(PLOT_BG)
+    # A colorbar brings an Axes of its own that the caller never sees, so it is
+    # picked up from the figure rather than waited for: styling only what was
+    # passed in leaves the colorbar's tick labels in matplotlib's near-black
+    # default, invisible against a black background.
+    passed = list(np.atleast_1d(axes).ravel())
+    extra = [ax for ax in figure.axes if ax not in passed]
+    for ax in extra:
+        ax.tick_params(labelsize=7, colors=INK)
+        for spine in ax.spines.values():
+            spine.set_color(PANEL_LINE)
+        for label in (ax.xaxis.label, ax.yaxis.label):
+            label.set_color(INK)
+            label.set_fontsize(8)
+
+    for ax in np.atleast_1d(axes).ravel():
+        ax.set_facecolor(PLOT_BG)
+        # Light enough to read off a projected slide, where the dimmed grey that
+        # suits a screen at arm's length disappears entirely.
+        ax.tick_params(labelsize=7, colors=INK)
+        ax.grid(color=PANEL_LINE, linestyle="-", linewidth=0.5, alpha=0.6)
+        ax.set_axisbelow(True)
+        for spine in ax.spines.values():
+            spine.set_color(PANEL_LINE)
+        for label in (ax.xaxis.label, ax.yaxis.label):
+            label.set_color(INK)
+            label.set_fontsize(8)
+        if title is not None:
+            ax.set_title(title, fontsize=9, color=INK)
+
 
 _napari_colormap_cache = {}
 
@@ -129,7 +353,302 @@ def infer_column_map(columns):
     }
 
 
+# Which entries of a metadata.json are settings that can be restored, and which
+# widget each one belongs to. Everything not listed here - counts, timestamps,
+# software versions, source paths - describes what a past run *produced* and is
+# deliberately never applied.
+SETTINGS_SPEC = (
+    (("pixel_size_nm_per_px",), "pixel_size_box"),
+    (("localization_2d", "gain_adu_per_photon"), "loc_gain_box"),
+    (("localization_2d", "offset_adu"), "loc_offset_box"),
+    (("localization_2d", "box_size_px"), "loc_box_size"),
+    (("localization_2d", "min_net_gradient"), "loc_min_ng_box"),
+    (("localization_2d", "fit_backend"), "loc_backend_box"),
+    (("smlm_rendering", "oversampling"), "render_oversampling_box"),
+    (("smlm_rendering", "mode"), "render_mode_box"),
+    (("smlm_rendering", "global_sigma_nm"), "render_sigma_box"),
+    (("smlm_rendering", "sigma_column"), "render_sigma_column_box"),
+    (("smlm_rendering", "sigma_clamp_min_nm"), "render_sigma_min_box"),
+    (("smlm_rendering", "sigma_clamp_max_nm"), "render_sigma_max_box"),
+    (("smlm_rendering", "weight_by_photons"), "render_photons_box"),
+    (("smlm_rendering", "colormap"), "render_colormap_box"),
+    (("smlm_rendering", "use_gpu"), "render_gpu_box"),
+    (("smlm_rendering", "frames_per_group"), "render_frames_per_box"),
+    (("smlm_rendering", "grouping"), "render_grouping_box"),
+    (("smlm_rendering", "window_step_frames"), "render_step_box"),
+    (("smlm_rendering", "add_layer_to_viewer"), "render_add_layer_box"),
+    (("smlm_rendering", "write_png_snapshot"), "render_png_box"),
+    (("smlm_rendering", "image_save_format"), "render_image_format_box"),
+    (("smlm_rendering", "movie_save_format"), "render_movie_format_box"),
+    (("smlm_rendering", "composite", "reconstruction"), "render_composite_base_box"),
+    (("smlm_rendering", "composite", "localizations"), "render_composite_locs_box"),
+    (("smlm_rendering", "composite", "localization_color"), "render_locs_color_box"),
+    (("smlm_rendering", "composite", "localization_size_nm"), "render_locs_size_box"),
+    (("smlm_rendering", "composite", "trajectories"), "render_composite_tracks_box"),
+    (("smlm_rendering", "composite", "trajectory_color"), "render_tracks_color_box"),
+    (("smlm_rendering", "composite", "trajectory_width_nm"), "render_tracks_width_box"),
+    (("smlm_rendering", "composite", "every_visible_layer"), "render_composite_all_box"),
+    (("smlm_rendering", "timestamp", "enabled"), "render_timestamp_box"),
+    (("smlm_rendering", "timestamp", "height_px"), "render_timestamp_size_box"),
+    (("smlm_rendering", "timestamp", "color"), "render_timestamp_color_box"),
+    (("smlm_rendering", "timestamp", "position"), "render_timestamp_position_box"),
+    (("smlm_rendering", "scale_bar", "enabled"), "render_scalebar_box"),
+    (("smlm_rendering", "scale_bar", "automatic"), "render_scalebar_auto_box"),
+    (("smlm_rendering", "scale_bar", "length_nm"), "render_scalebar_length_box"),
+    (("smlm_rendering", "scale_bar", "color"), "render_scalebar_color_box"),
+    (("smlm_rendering", "scale_bar", "position"), "render_scalebar_position_box"),
+    (("linking", "search_range_nm"), "search_box"),
+    (("linking", "memory"), "memory_box"),
+    (("linking", "min_track_length"), "min_traj_box"),
+    (("diffusion", "max_lagtime_frames"), "max_lagtime_box"),
+    (("diffusion", "min_track_length_for_d"), "d_min_length_box"),
+    (("diffusion", "d_min"), "d_min_box"),
+    (("diffusion", "d_max"), "d_max_box"),
+    (("diffusion", "msd_validation_sample_count"), "msd_sample_box"),
+    (("distance_bounds_um", "min"), "dist_min_box"),
+    (("distance_bounds_um", "max"), "dist_max_box"),
+    (("net_displacement_bounds_um", "min"), "net_min_box"),
+    (("net_displacement_bounds_um", "max"), "net_max_box"),
+    (("straightness_bounds", "min"), "straight_min_box"),
+    (("straightness_bounds", "max"), "straight_max_box"),
+    (("duration_bounds_s", "min"), "dur_min_box"),
+    (("duration_bounds_s", "max"), "dur_max_box"),
+    (("coloring", "enabled"), "color_trajectories_box"),
+    (("coloring", "metric"), "color_metric_box"),
+    (("coloring", "colormap"), "d_colormap_box"),
+    (("display_layers", "show_localizations"), "show_points_box"),
+    (("display_layers", "show_active_growing_tracks"), "show_tracks_box"),
+    (("display_layers", "show_static_all_tracks"), "show_all_tracks_box"),
+    (("rendering", "marker_size"), "marker_size_box"),
+    (("rendering", "marker_edge_width"), "marker_edge_width_box"),
+    (("rendering", "marker_symbol"), "marker_choice"),
+    (("rendering", "active_track_line_width"), "line_width_box"),
+    (("rendering", "static_track_line_width"), "all_tracks_line_width_box"),
+    (("rendering", "persist_completed_tracks"), "persist_tracks_box"),
+)
+
+
+# Which acquisition-metadata field fills which control when a stack is loaded,
+# and how the change is worded in the log. Only fields the microscope genuinely
+# recorded reach this table - `read_acquisition_metadata` omits the rest - so a
+# control whose value was never calibrated keeps whatever it had.
+ACQUISITION_AUTOFILL = (
+    ("pixel_size_nm", "pixel_size_box", "Pixel size", "{:.1f} nm/px"),
+    ("fps", "fps_box", "Frame rate", "{:.3f} fps"),
+    ("camera_offset_adu", "loc_offset_box", "Camera offset", "{:.0f} ADU"),
+)
+
+# Read off the acquisition but deliberately not applied to anything: they are
+# context for judging whether the values above belong to this run. The objective
+# is the important one - it is the only clue to the pixel size when nobody
+# calibrated it, and it cannot become one without the sensor pitch, which is not
+# recorded anywhere in the file.
+ACQUISITION_CONTEXT = (
+    ("objective", "objective", "{}"),
+    ("camera_chip", "camera", "{}"),
+    ("exposure_ms", "exposure", "{:g} ms"),
+    ("n_frames", "frames", "{:.0f}"),
+)
+
+
+# What napari does when the play button reaches the last frame. Keys are its own
+# LoopMode values; the UI shows the second element.
+PLAYBACK_MODES = {
+    "loop": "Start over",
+    "once": "Stop",
+    "back_and_forth": "Play backwards",
+}
+
+
+# The built-in theme whose canvas is already pure black.
+BLACK_CANVAS_THEME = "dark"
+
+
+def canvas_is_black(theme_id):
+    """True if that theme paints the canvas pure black."""
+    try:
+        from napari.utils.theme import get_theme
+
+        return tuple(get_theme(str(theme_id)).canvas.as_rgb_tuple()[:3]) == (0, 0, 0)
+    except Exception:
+        return False
+
+
+def apply_black_canvas(viewer):
+    """Put the viewer on a theme with a pure black canvas, for screenshots.
+
+    napari's own "dark" theme already paints the canvas black, so this switches
+    to it rather than registering a theme of its own. That distinction matters
+    more than it looks: `viewer.theme` is persisted to napari's *global*
+    settings, so a made-up theme id ends up in a config file that plain napari -
+    launched without this plugin, which is the only thing that registers it -
+    cannot resolve. It then reports a validation error and resets the field on
+    every start. Only built-in theme names are safe to put there.
+
+    A viewer already on a black-canvas theme is left alone.
+    """
+    try:
+        if not canvas_is_black(viewer.theme):
+            viewer.theme = BLACK_CANVAS_THEME
+    except Exception:
+        pass
+
+
+def _napari_playback_settings():
+    """napari's own playback settings, or None on a build that has none.
+
+    The play button belongs to napari, not to this plugin, and it reads its
+    speed from here - so driving these settings is what makes the button run at
+    the requested rate, rather than reimplementing playback.
+    """
+    try:
+        from napari.settings import get_settings
+
+        return get_settings().application
+    except Exception:
+        return None
+
+
+def _playback_fps(default=10):
+    """napari's playback rate, as the whole number of frames per second it is."""
+    settings = _napari_playback_settings()
+    try:
+        return max(1, int(round(float(getattr(settings, "playback_fps", None)))))
+    except (TypeError, ValueError):
+        return default
+
+
+def _playback_mode(default="loop"):
+    settings = _napari_playback_settings()
+    mode = getattr(settings, "playback_mode", None)
+    mode = str(getattr(mode, "value", mode))
+    return mode if mode in PLAYBACK_MODES else default
+
+
+def _dig(mapping, path):
+    """Follow a key path into nested dicts. Returns (found, value)."""
+    node = mapping
+    for key in path:
+        if not isinstance(node, dict) or key not in node:
+            return False, None
+        node = node[key]
+    return True, node
+
+
+def settings_from_metadata(metadata):
+    """Read the restorable parameters out of a metadata.json dict.
+
+    Returns (values, notes): `values` maps widget attribute names to the value to
+    apply, `notes` collects human-readable remarks about anything converted or
+    ignored. Missing entries are simply absent from `values`, so a metadata file
+    from an older version restores what it knows and leaves the rest alone.
+    """
+    values = {}
+    notes = []
+    if not isinstance(metadata, dict):
+        return values, ["not a settings file"]
+
+    for path, attr in SETTINGS_SPEC:
+        found, value = _dig(metadata, path)
+        if found and value is not None:
+            values[attr] = value
+
+    # Not a widget: the frame shift is plugin state, restored by hand below.
+    found, shift = _dig(metadata, ("frame_number_shift",))
+    if found and isinstance(shift, (int, float)):
+        values["_frame_shift"] = int(shift)
+    else:
+        found, legacy = _dig(metadata, ("frame_one_indexed",))
+        if found:
+            values["_frame_shift"] = -1 if legacy else 0
+            notes.append("frame indexing tick box converted to a frame shift")
+
+    # Distance was reported in nm before it was changed to µm; convert rather
+    # than silently applying a value 1000x too large.
+    if "dist_min_box" not in values and "dist_max_box" not in values:
+        found, legacy = _dig(metadata, ("distance_bounds_nm",))
+        if found and isinstance(legacy, dict):
+            for key, attr in (("min", "dist_min_box"), ("max", "dist_max_box")):
+                if isinstance(legacy.get(key), (int, float)):
+                    values[attr] = float(legacy[key]) / 1000.0
+            notes.append("converted distance bounds from nm to µm")
+
+    # Acquisition timing used to live under "diffusion" and now lives under
+    # "linking"; read either, preferring the current location. Frame rate and
+    # frame interval are the same setting, so the interval is only consulted
+    # when no frame rate was recorded.
+    for section in ("diffusion", "linking"):
+        found, fps = _dig(metadata, (section, "fps"))
+        if found and isinstance(fps, (int, float)) and fps > 0:
+            values["fps_box"] = float(fps)
+    if "fps_box" not in values:
+        for section in ("diffusion", "linking"):
+            found, interval_ms = _dig(metadata, (section, "frame_interval_ms"))
+            if found and isinstance(interval_ms, (int, float)) and interval_ms > 0:
+                values["fps_box"] = 1000.0 / float(interval_ms)
+                notes.append("frame rate taken from the frame interval")
+
+    return values, notes
+
+
+def set_widget_value(widget, value):
+    """Set a Qt input from a plain JSON value. Returns True if it took."""
+    if isinstance(widget, QCheckBox):
+        widget.setChecked(bool(value))
+        return True
+    if isinstance(widget, QComboBox):
+        text = str(value)
+        index = widget.findText(text)
+        if index < 0:
+            # Some combos show a sentence but record a short stable key (render
+            # modes, movie groupings), so the key is matched too - otherwise
+            # rewording a label would silently stop restoring that setting.
+            index = widget.findData(text)
+        if index < 0:
+            return False  # a backend/colormap/column this build does not offer
+        widget.setCurrentIndex(index)
+        return True
+    if isinstance(widget, QSpinBox):
+        widget.setValue(int(round(float(value))))  # setValue clamps to the range
+        return True
+    if isinstance(widget, QDoubleSpinBox):
+        widget.setValue(float(value))
+        return True
+    return False
+
+
+def is_sigma_column(column):
+    """True for any PSF-width column: sigma, sigma_x/sigma_y, sigma1/sigma2 [nm]."""
+    return str(column).strip().lower().startswith("sigma")
+
+
 def apply_numeric_filters(df, bounds):
+    """Keep the rows inside every bound.
+
+    Combines the per-column tests into one boolean mask and indexes once. The
+    obvious loop - re-filtering the frame per column - copies the whole table
+    once per bound, which on a million localizations with eight filters costs
+    ~420 ms against ~20 ms here, on every keystroke in the Filter tab.
+    """
+    if df is None:
+        return df
+    mask = None
+    for column, (lower, upper) in bounds.items():
+        if column not in df.columns:
+            continue
+        values = df[column].to_numpy()
+        for limit, test in ((lower, np.greater_equal), (upper, np.less_equal)):
+            if limit is None:
+                continue
+            column_mask = test(values, limit)
+            mask = column_mask if mask is None else (mask & column_mask)
+    if mask is None:
+        return df.copy()
+    return df[mask]
+
+
+def _apply_numeric_filters_reference(df, bounds):
+    """Row-by-row equivalent of apply_numeric_filters, kept as the test oracle."""
     filtered = df.copy()
     for column, (lower, upper) in bounds.items():
         if not column or column not in filtered.columns:
@@ -141,27 +660,58 @@ def apply_numeric_filters(df, bounds):
     return filtered
 
 
+class _Cancelled:
+    """Sentinel returned by a worker that stopped because the user asked it to.
+
+    Cancellation is cooperative: the widget sets a `threading.Event`, the worker
+    notices it at the next iteration boundary and returns this instead of a
+    result. Every `returned` handler checks for it before touching state.
+    """
+
+    __slots__ = ()
+
+    def __repr__(self):
+        return "CANCELLED"
+
+
+CANCELLED = _Cancelled()
+
+
+def _is_cancelled(cancel):
+    return cancel is not None and cancel.is_set()
+
+
 @thread_worker
-def _load_worker(csv_path, image_path):
+def _load_worker(csv_path, image_path, cancel=None):
+    # A single pd.read_csv cannot be interrupted part way, so cancellation is
+    # checked around it; the image decode is chunked and checks continuously.
+    if _is_cancelled(cancel):
+        return CANCELLED
     df = pd.read_csv(csv_path) if csv_path else None
     image = None
+    how = ""
+    acquisition = None
     if image_path:
-        from tifffile import imread
-        try:
-            # Memory-map instead of eagerly reading the whole stack into RAM:
-            # for a large, uncompressed movie (the common case) this is a
-            # near-instant zero-copy open instead of a multi-second (or much
-            # longer) read, with frames paged in lazily as they're accessed.
-            image = imread(image_path, out="memmap")
-        except Exception:
-            image = imread(image_path)
+        if _is_cancelled(cancel):
+            return CANCELLED
+        t0 = time.perf_counter()
+        image, how = open_image_stack(image_path, cancel=cancel)
+        if image is None:
+            return CANCELLED
         if image.ndim == 2:
             image = image[np.newaxis, ...]
-    return df, image
+        how = f"{how} in {time.perf_counter() - t0:.2f} s"
+        # Reading the acquisition parameters means a second pass over a TIFF
+        # header and, for Micro-Manager, a few MB off a sidecar that usually
+        # lives on the same network share as the movie - a second or so that
+        # belongs on this thread rather than in front of the GUI.
+        if not _is_cancelled(cancel):
+            acquisition = read_acquisition_metadata(image_path)
+    return df, image, how, acquisition
 
 
 @thread_worker
-def _link_worker(features, search_range_px, memory, n_frames):
+def _link_worker(features, search_range_px, memory, n_frames, cancel=None):
     results = []
     frame_iter = (group for _, group in features.groupby("frame"))
     linked_iter = tp.link_df_iter(
@@ -172,38 +722,87 @@ def _link_worker(features, search_range_px, memory, n_frames):
         t_column="frame",
     )
     total = max(n_frames, 1)
+    last_pct = -1
     for i, linked_frame in enumerate(linked_iter):
+        if _is_cancelled(cancel):
+            return CANCELLED
         results.append(linked_frame)
-        yield (i + 1) / total
+        pct = int(100 * (i + 1) / total)
+        if pct != last_pct:
+            last_pct = pct
+            yield pct / 100.0
     if results:
         return pd.concat(results, ignore_index=True)
     return pd.DataFrame()
 
 
 @thread_worker
-def _detect_worker(stack, box, min_ng):
+def _warmup_worker():
+    """Compile the jitted fit kernels off the GUI thread."""
+    t0 = time.perf_counter()
+    warmup_fit_kernels()
+    return time.perf_counter() - t0
+
+
+# Frames are detected in parallel. The detection kernels are nogil, so threads
+# give real parallelism (~5x measured); capped because each worker holds a frame
+# and a frame-sized buffer, which adds up on 2048x2048 stacks.
+DETECT_MAX_WORKERS = 8
+
+
+@thread_worker
+def _detect_worker(stack, box, min_ng, cancel=None):
     n_frames = stack.shape[0]
     candidates = [None] * n_frames
     counts = np.zeros(n_frames, dtype=int)
-    for i in range(n_frames):
-        y, x, ng = identify_in_frame(stack[i], min_ng, box)
-        candidates[i] = (y, x, ng)
-        counts[i] = len(y)
-        yield (i + 1) / max(n_frames, 1)
+    workers = max(1, min(DETECT_MAX_WORKERS, os.cpu_count() or 1, n_frames))
+
+    def detect(index):
+        # np.asarray so a lazily-decoded (dask) stack materialises one frame here.
+        return index, identify_in_frame(np.asarray(stack[index]), min_ng, box)
+
+    done = 0
+    last_pct = -1
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        futures = [pool.submit(detect, i) for i in range(n_frames)]
+        try:
+            for future in as_completed(futures):
+                # Checked per frame, while progress is only emitted per percent:
+                # cancel latency is one frame, not one percent of the whole run.
+                if _is_cancelled(cancel):
+                    for pending in futures:
+                        pending.cancel()
+                    return CANCELLED
+                index, (y, x, ng) = future.result()
+                candidates[index] = (y, x, ng)
+                counts[index] = len(y)
+                done += 1
+                # One cross-thread signal + progress-bar repaint per percent.
+                pct = int(100 * done / max(n_frames, 1))
+                if pct != last_pct:
+                    last_pct = pct
+                    yield pct / 100.0
+        except GeneratorExit:
+            for pending in futures:
+                pending.cancel()
+            raise
     return candidates, counts
 
 
 @thread_worker
-def _fit_worker(stack, candidates, box, backend, offset, gain):
+def _fit_worker(stack, candidates, box, backend, offset, gain, cancel=None):
     n_with_candidates = sum(1 for c in candidates if c is not None and len(c[0]) > 0)
     results = [None] * len(candidates)
     done = 0
+    last_pct = -1
     for i, cand in enumerate(candidates):
+        if _is_cancelled(cancel):
+            return CANCELLED
         if cand is None or len(cand[0]) == 0:
             continue
         y, x, ng = cand
         results[i] = localize_frame(
-            stack[i].astype(np.float32, copy=False),
+            np.asarray(stack[i], dtype=np.float32),
             y,
             x,
             box,
@@ -214,42 +813,362 @@ def _fit_worker(stack, candidates, box, backend, offset, gain):
             camera_gain_adu_per_photon=gain,
         )
         done += 1
-        yield done / max(n_with_candidates, 1)
+        pct = int(100 * done / max(n_with_candidates, 1))
+        if pct != last_pct:
+            last_pct = pct
+            yield pct / 100.0
     return concatenate_localizations(results)
 
 
+D_BATCH_TRAJECTORIES = 500
+
+
+# Rows per to_csv call. Only affects how often the export can notice a cancel
+# request and move the progress bar; the file written is identical either way.
+EXPORT_CHUNK_ROWS = 100_000
+
+
+class _RenderFailure:
+    """A render error carried back as a result instead of raised. See `_render_worker`."""
+
+    __slots__ = ("error",)
+
+    def __init__(self, error):
+        self.error = error
+
+
 @thread_worker
-def _compute_d_worker(tracks_df, max_lagtime, fps, mpp):
-    im = tp.imsd(tracks_df, mpp=mpp, fps=fps, max_lagtime=max_lagtime, pos_columns=["x", "y"])
+def _render_worker(kind, options, cancel=None):
+    """Drive the renderer's generator, forwarding progress and honouring cancel.
+
+    The engine (`_render`) yields a fraction and returns the finished array;
+    this adds the bridge to napari's worker signals, plus two things the GUI
+    cannot do for itself. Cancelling closes the generator, which drops the
+    half-finished canvas on the spot instead of waiting for a multi-gigapixel
+    reconstruction nobody is going to look at. And a GPU that fails part way -
+    out of memory, a driver reset, another process taking the card - falls back
+    to the CPU rather than losing the render: it is slower, not wrong.
+
+    Returns (image, backend) so the caller can report and record which one ran.
+    """
+    attempts = [True, False] if options.get("gpu") else [False]
+    for use_gpu in attempts:
+        iterator = None
+        try:
+            iterator = (
+                smlm_render.render_frame_iter(**{**options, "gpu": use_gpu})
+                if kind == "image"
+                else smlm_render.render_movie_iter(**{**options, "gpu": use_gpu})
+            )
+            while True:
+                if _is_cancelled(cancel):
+                    iterator.close()
+                    return CANCELLED
+                try:
+                    fraction = next(iterator)
+                except StopIteration as finished:
+                    return finished.value, ("gpu" if use_gpu else "cpu")
+                yield float(fraction)
+        except Exception as error:
+            if iterator is not None:
+                iterator.close()
+            if not use_gpu:
+                # Deliberately returned, never raised. An exception escaping a
+                # worker is not always delivered as `errored` - a RuntimeError
+                # is swallowed as "the widget went away" - and then `finished`
+                # never fires either, leaving the tab stuck with its buttons
+                # disabled and its progress bar spinning. Returning the failure
+                # keeps the normal completion path, which always tidies up.
+                return _RenderFailure(error)
+        finally:
+            if use_gpu:
+                smlm_render.free_gpu_memory()
+        yield 0.0  # restarting on the CPU; the progress bar starts over
+
+
+def build_save_array(image, spec):
+    """Turn a finished render into the array that gets written.
+
+    Pure numpy: `spec` is the plain description assembled by the widget (see
+    `_save_spec`), holding no Qt objects, so this runs on the worker thread.
+
+    A composite re-renders each overlay through the same reconstruction path as
+    the base image, which is what guarantees they line up; that is real work,
+    and the reason this is not done inline in the save handler.
+    """
+    save_format = spec.get("format", "data")
+    if save_format == "data":
+        result = image
+    elif save_format == "display":
+        result = smlm_render.to_uint8(image, smlm_render.contrast_limits(image))
+    else:
+        result = smlm_render.blend_additive(
+            [_composite_layer(image, layer, spec) for layer in spec["layers"]])
+
+    crop_box = spec.get("crop")
+    if crop_box is not None:
+        options = spec["render"]
+        rows, cols = smlm_render.box_to_slices(
+            crop_box, shape=options["shape"], origin=options["origin"],
+            oversampling=options["oversampling"])
+        result = smlm_render.crop(result, rows, cols, is_movie=spec["is_movie"])
+
+    # Annotations are burned into the pixels, so they go on after the crop -
+    # otherwise cropping could cut one in half or throw it away entirely. They
+    # are skipped for a float32 "data" save, where they would corrupt the
+    # numbers the export exists to preserve.
+    if result.dtype == np.uint8:
+        stamp = spec.get("timestamp")
+        if stamp is not None:
+            _annotate(result, spec["is_movie"], stamp["color"], stamp["position"],
+                      labels=stamp["labels"], atlas=stamp["atlas"])
+        bar = spec.get("scalebar")
+        if bar is not None:
+            _annotate(result, spec["is_movie"], bar["color"], bar["position"],
+                      mask=bar["mask"])
+    return result
+
+
+def _annotate(image, is_movie, color, position, *, mask=None, labels=None, atlas=None):
+    """Draw one annotation into every frame, in place.
+
+    `mask` is the same on each frame (a scale bar); `labels` change from frame
+    to frame (the clock) and are assembled per frame from the glyph atlas.
+    """
+    frames = image if is_movie else [image]
+    for index, frame in enumerate(frames):
+        if labels is not None:
+            text = labels[min(index, len(labels) - 1)] if labels else ""
+            mask_for_frame = smlm_render.compose_text(atlas, text)
+        else:
+            mask_for_frame = mask
+        smlm_render.burn_text(frame, mask_for_frame, color=color, position=position)
+    return image
+
+
+def _composite_layer(image, layer, spec):
+    """One layer of a composite, rendered onto the grid and coloured."""
+    options = spec["render"]
+    if layer["source"] == "base":
+        values = image
+    elif layer["source"] == "image":
+        values = _resample_layer(layer, spec)
+    else:
+        common = dict(
+            x_px=layer["x_px"], y_px=layer["y_px"], shape=options["shape"],
+            origin=options["origin"], oversampling=options["oversampling"],
+            mode="gaussian_global", global_sigma_px=layer["global_sigma_px"],
+            gpu=options["gpu"],
+        )
+        if spec["is_movie"] and layer.get("frames") is not None:
+            values = smlm_render.render_movie(
+                frames=layer["frames"],
+                frames_per_group=options["frames_per_group"],
+                grouping=options["grouping"], step=options["step"],
+                frame_range=options["frame_range"], **common)
+        else:
+            values = smlm_render.render_frame(**common)
+            if spec["is_movie"]:
+                # a layer with no frame axis belongs on every movie frame
+                values = np.broadcast_to(values, (_movie_length(spec),) + values.shape)
+    limits = layer.get("limits") or smlm_render.contrast_limits(values)
+    return smlm_render.colorize(
+        values, color=layer.get("color"), colormap=layer.get("colormap"), limits=limits)
+
+
+def _movie_length(spec):
+    options = spec["render"]
+    first, last = options["frame_range"]
+    return smlm_render.group_count(
+        first, last, options["frames_per_group"], options["grouping"], options["step"])
+
+
+def _resample_layer(layer, spec):
+    """Bring another Image layer onto the render grid, frame by frame."""
+    options = spec["render"]
+    stack = layer["data"]
+    common = dict(
+        shape=options["shape"], origin=options["origin"],
+        oversampling=options["oversampling"],
+        source_scale=layer["scale"], source_translate=layer["translate"],
+    )
+    if not spec["is_movie"]:
+        plane = stack[stack.shape[0] // 2] if layer["has_frames"] else stack
+        return smlm_render.resample_to_grid(plane, **common)
+
+    first, last = options["frame_range"]
+    bounds = smlm_render.group_bounds(
+        first, last, options["frames_per_group"], options["grouping"], options["step"])
+    frames = []
+    for start, _stop in bounds:
+        # the raw frame each group opens on: a single representative plane,
+        # rather than a projection that would look nothing like the movie
+        index = int(np.clip(start, 0, stack.shape[0] - 1)) if layer["has_frames"] else None
+        plane = stack[index] if index is not None else stack
+        frames.append(smlm_render.resample_to_grid(plane, **common))
+    return np.stack(frames, axis=0)
+
+
+@thread_worker
+def _save_render_worker(path, image, spec, metadata, super_pixel_size_nm, png, colormap,
+                        frame_interval_s=None):
+    """Build and write a render off the GUI thread.
+
+    Both halves belong here: a composite has to re-render its overlays, and a
+    5 GB TIFF takes a while to write - doing either on the GUI thread would
+    freeze the window for exactly as long as the render took.
+    """
+    return smlm_render.save_render(
+        path, build_save_array(image, spec), metadata,
+        super_pixel_size_nm=super_pixel_size_nm, png=png, colormap=colormap,
+        frame_interval_s=frame_interval_s,
+    )
+
+
+@thread_worker
+def _export_worker(folder, tables, metadata, cancel=None):
+    """Write the exported tables and metadata off the GUI thread.
+
+    Writing a few hundred thousand localizations to CSV takes seconds, and doing
+    it inline froze the whole window. Everything Qt-owned - the figures, and the
+    widget values behind `metadata` - is prepared by the caller; this only
+    touches plain DataFrames and dicts.
+
+    `tables` is a list of (filename, DataFrame).
+    """
+    data_dir = folder / "data"
+    data_dir.mkdir(parents=True, exist_ok=True)
+
+    # Progress is weighted by rows: the localization table usually dwarfs the rest.
+    total_rows = sum(max(len(frame), 1) for _name, frame in tables) or 1
+    written_rows = 0
+    last_pct = -1
+
+    for name, frame in tables:
+        path = data_dir / name
+        n_rows = len(frame)
+        with open(path, "w", newline="", encoding="utf-8") as handle:
+            if n_rows == 0:
+                frame.to_csv(handle, index=False)
+            for start in range(0, n_rows, EXPORT_CHUNK_ROWS):
+                if _is_cancelled(cancel):
+                    handle.close()
+                    path.unlink(missing_ok=True)  # no half-written table left behind
+                    return CANCELLED
+                stop = min(start + EXPORT_CHUNK_ROWS, n_rows)
+                frame.iloc[start:stop].to_csv(handle, index=False, header=(start == 0))
+                pct = int(100 * (written_rows + stop) / total_rows)
+                if pct != last_pct:
+                    last_pct = pct
+                    yield pct / 100.0
+        written_rows += max(n_rows, 1)
+
+    if _is_cancelled(cancel):
+        return CANCELLED
+    with open(folder / "metadata.json", "w", encoding="utf-8") as handle:
+        json.dump(metadata, handle, indent=2, default=str)
+    return folder
+
+
+def fit_msd_slope(tau, msd):
+    """Least-squares MSD = 4D*tau + c. Returns (slope, intercept, slope_error).
+
+    The fit is done on the raw values and stays that way however the validation
+    plot chooses to *draw* them. Fitting in log space instead would minimise
+    relative rather than absolute residuals, which hands the short lag times -
+    the noisiest, and the ones most contaminated by localization error - far
+    more weight than they have earned.
+
+    The error is the standard error of the slope, and it is an underestimate of
+    the real uncertainty on D: MSD points at different lag times come from
+    overlapping displacements of the same trajectory, so they are strongly
+    correlated, which is exactly what ordinary least squares assumes they are
+    not. It is worth showing because it separates a trajectory long enough to
+    pin its slope down from one that is not, but it is not a confidence
+    interval to quote.
+    """
+    try:
+        (slope, intercept), covariance = np.polyfit(tau, msd, 1, cov=True)
+        error = float(np.sqrt(abs(covariance[0, 0])))
+    except (ValueError, np.linalg.LinAlgError):
+        # The covariance needs more points than parameters + 2. Below that the
+        # slope is still the best line through them; its error is undefined.
+        slope, intercept = np.polyfit(tau, msd, 1)
+        error = float("nan")
+    return float(slope), float(intercept), error
+
+
+@thread_worker
+def _compute_d_worker(tracks_df, max_lagtime, fps, mpp, cancel=None):
+    # MSD is computed independently per trajectory, so running tp.imsd on
+    # batches of whole trajectories is equivalent to one call over all of them -
+    # but it gives the run somewhere to notice a cancel request and a real
+    # percentage to report, instead of one opaque blocking call.
     d_map = {}
     msd_map = {}
-    for pid in im.columns:
-        msd_series = im[pid].dropna()
-        if len(msd_series) < 3:
-            continue
-        tau = msd_series.index.to_numpy(float)
-        msd_vals = msd_series.to_numpy(float)
-        slope, intercept = np.polyfit(tau, msd_vals, 1)
-        D = slope / 4.0
-        if D > 0 and np.isfinite(D):
-            d_map[pid] = D
-            msd_map[pid] = (tau, msd_vals, slope, intercept)
+    last_pct = -1
+
+    for subset, done, total in iter_particle_batches(tracks_df, D_BATCH_TRAJECTORIES):
+        if _is_cancelled(cancel):
+            return CANCELLED
+        im = tp.imsd(subset, mpp=mpp, fps=fps, max_lagtime=max_lagtime, pos_columns=["x", "y"])
+        for pid in im.columns:
+            msd_series = im[pid].dropna()
+            if len(msd_series) < 3:
+                continue
+            tau = msd_series.index.to_numpy(float)
+            msd_vals = msd_series.to_numpy(float)
+            slope, intercept, slope_error = fit_msd_slope(tau, msd_vals)
+            D = slope / 4.0
+            if D > 0 and np.isfinite(D):
+                d_map[pid] = D
+                msd_map[pid] = (tau, msd_vals, slope, intercept, slope_error)
+        pct = int(100 * done / max(total, 1))
+        if pct != last_pct:
+            last_pct = pct
+            yield pct / 100.0
+
     return d_map, msd_map
 
 
 @thread_worker
 def _fit_free_metrics_worker(tracks_df, pixel_size, fps):
+    """Per-trajectory quantities that need no model fitted to them.
+
+    Three ways of asking how far a molecule went, which answer differently and
+    are only worth having together:
+
+      * distance - the path length, every step added up. Grows without bound
+        while a molecule wanders, and is inflated by localization noise: even a
+        stationary spot accumulates roughly one precision per step.
+      * net      - the end-to-end displacement, start to finish. Where it ended
+        up, regardless of how it got there.
+      * straightness - net / distance, between 0 and 1. This is the one that
+        separates directed motion from diffusion: a molecule moving in a line
+        approaches 1, while an N-step random walk sits near 1/sqrt(N) however
+        fast it diffuses. Net displacement on its own cannot make that
+        distinction, because a fast diffuser also ends up a long way away.
+    """
     fps_safe = max(fps, 1e-9)
     distance_map = {}
+    net_map = {}
+    straightness_map = {}
     duration_map = {}
     for pid, group in tracks_df.groupby("particle"):
         group = group.sort_values("frame")
-        dx = np.diff(group["x"].to_numpy(float))
-        dy = np.diff(group["y"].to_numpy(float))
-        distance_map[pid] = float(np.hypot(dx, dy).sum() * pixel_size)
+        x = group["x"].to_numpy(float)
+        y = group["y"].to_numpy(float)
+        # pixel_size is nm/px; every length here is reported in µm.
+        to_um = pixel_size / 1000.0
+        path = float(np.hypot(np.diff(x), np.diff(y)).sum() * to_um)
+        net = float(np.hypot(x[-1] - x[0], y[-1] - y[0]) * to_um) if len(x) else 0.0
+        distance_map[pid] = path
+        net_map[pid] = net
+        # A trajectory that never moved has no direction to be straight in.
+        straightness_map[pid] = net / path if path > 0 else float("nan")
         span = int(group["frame"].max() - group["frame"].min()) + 1
         duration_map[pid] = span / fps_safe
-    return distance_map, duration_map
+    return distance_map, net_map, straightness_map, duration_map
 
 
 class PandasTableModel(QAbstractTableModel):
@@ -288,6 +1207,22 @@ class LocalizationTrackingWidget(QWidget):
     def __init__(self, viewer: napari.Viewer):
         super().__init__()
         self.viewer = viewer
+        # Any layer arriving in the viewer - added here, or dragged in by the
+        # user - has to be put in the same physical world as the rest, or the
+        # scale bar would be describing only some of what is on screen.
+        try:
+            viewer.layers.events.inserted.connect(
+                lambda event=None: self._apply_viewer_scale())
+        except Exception:
+            pass
+        # The canvas clock follows the slider, however the slider was moved -
+        # dragged, or run by the play button.
+        try:
+            viewer.dims.events.current_step.connect(
+                lambda event=None: self._on_current_frame_changed())
+        except Exception:
+            pass
+        apply_black_canvas(viewer)
         self.df = None
         self.df_filtered = None
         self.column_map = {}
@@ -295,13 +1230,24 @@ class LocalizationTrackingWidget(QWidget):
         self._hist_widgets = {}
         self._metric_hist_widgets = {}
         self._metric_bound_boxes = {}
-        self._metric_use_log = {"D": True, "distance": False, "duration": False}
+        # Distance travelled, like D, is spread over orders of magnitude across
+        # a population: on a linear axis nearly every trajectory lands in the
+        # first bin and the plot ends up describing the handful of longest ones.
+        # Duration is bounded by the acquisition and stays linear.
+        # Distance and net displacement, like D, are spread over orders of
+        # magnitude across a population; on a linear axis nearly every
+        # trajectory lands in the first bin. Straightness is a ratio in [0, 1]
+        # and duration is bounded by the acquisition, so both stay linear.
+        self._metric_use_log = {"D": True, "distance": True, "net": True,
+                                "straightness": False, "duration": False}
         self._default_bounds = {}
         self.filter_controls = {}
         self._roi_updating = False
         self._track_diffusion_cache = None
         self._track_msd_cache = None
         self._track_distance_cache = None
+        self._track_net_cache = None
+        self._track_straightness_cache = None
         self._track_duration_cache = None
         self._all_tracks_particle_ids = []
         self._load_worker_ref = None
@@ -310,17 +1256,51 @@ class LocalizationTrackingWidget(QWidget):
         self._loc2d_counts = np.zeros(0, dtype=int)
         self._loc2d_detect_worker_ref = None
         self._loc2d_fit_worker_ref = None
+        self._loc2d_warmup_worker_ref = None
+        self._loc2d_warmup_started = False
+        # Cooperative cancel flags, one per long-running operation. Cleared when
+        # the operation starts, set by its Cancel button.
+        self._load_cancel = threading.Event()
+        self._loc2d_detect_cancel = threading.Event()
+        self._loc2d_fit_cancel = threading.Event()
+        self._render_cancel = threading.Event()
+        self._link_cancel = threading.Event()
+        self._compute_d_cancel = threading.Event()
+        self._export_cancel = threading.Event()
+        self._export_worker_ref = None
         self._compute_d_worker_ref = None
         self._metrics_worker_ref = None
+        self._d_input_track_count = None
+        self._syncing_timing = False
+        self._tracks_layer_particles = None
+        # Last render kept in memory so it can be saved (and re-saved with
+        # different options) without recomputing it.
+        self._render_image = None
+        self._render_movie = None
+        self._render_extent_px = None
+        self._render_frame_range = None
+        self._render_image_info = None
+        self._render_movie_info = None
+        self._render_worker_ref = None
+        self._render_save_worker_ref = None
+        self._syncing_paths = False
+        # How far the loaded frame numbers are shifted to line up with the image
+        # stack; set from the buttons under the CSV field, or guessed on load.
+        self._frame_shift = 0
+        # Filter bounds from a settings file whose columns are not loaded yet.
+        self._pending_filter_bounds = None
         self.setup_ui()
-        self._connect_viewer_events()
 
     # ------------------------------------------------------------------
     # UI construction
     # ------------------------------------------------------------------
     def setup_ui(self):
+        self.setStyleSheet(STYLESHEET)
         root = QVBoxLayout(self)
         root.setContentsMargins(8, 8, 8, 8)
+        root.setSpacing(6)
+
+        root.addWidget(self._build_status_header())
 
         self.tabs = QTabWidget(self)
         root.addWidget(self.tabs)
@@ -328,35 +1308,90 @@ class LocalizationTrackingWidget(QWidget):
         self._build_load_tab()
         self._build_localize_tab()
         self._build_filter_tab()
-        self._build_link_tab()
-        self._build_trajectory_analysis_tab()
-        self._build_data_table_tab()
+        self._build_render_tab()
+        self._build_track_tab()
+        self._build_save_tab()
+        # The data table is a view of the current data, not a step in the
+        # pipeline, so it opens on demand instead of taking up a tab.
+        self._build_data_table_dialog()
         self.tabs.currentChanged.connect(self._on_tab_changed)
 
         self.log_box = QPlainTextEdit()
         self.log_box.setReadOnly(True)
         self.log_box.setMaximumHeight(110)
+        self.log_box.setFont(QFont("Consolas", 8))
+        self.log_box.setStyleSheet(
+            f"QPlainTextEdit {{ background-color: {PANEL_BG}; color: {INK_DIM};"
+            f" border: 1px solid {PANEL_LINE}; border-radius: 4px; }}"
+        )
         root.addWidget(self.log_box)
-
-        self._loc2d_preview_timer = QTimer(self)
-        self._loc2d_preview_timer.setSingleShot(True)
-        self._loc2d_preview_timer.timeout.connect(self._update_loc2d_candidate_overlay)
 
         self._metric_render_timer = QTimer(self)
         self._metric_render_timer.setSingleShot(True)
-        self._metric_render_timer.timeout.connect(self.render_overlay)
+        self._metric_render_timer.timeout.connect(self._refresh_metric_colors)
+        self._update_link_cutoff_label()
+        self._update_status_header()
 
-    def _connect_viewer_events(self):
-        # Only needed to keep the detection-candidate preview boxes (Localize
-        # tab) in sync with the current frame; Points/Tracks layers elsewhere
-        # slice themselves natively and need no callback.
-        try:
-            self.viewer.dims.events.current_step.connect(self._on_current_step_changed)
-        except Exception:
-            pass
+    def _build_status_header(self):
+        """A one-line summary of where the data stands, visible from every tab.
 
-    def _on_current_step_changed(self, event=None):
-        self._loc2d_preview_timer.start(60)
+        The counts used to be spread across the tab that produced them, so
+        answering "how many localizations survived the filter" meant leaving
+        whatever you were doing to go and look.
+        """
+        header = QWidget()
+        layout = QHBoxLayout(header)
+        layout.setContentsMargins(2, 0, 2, 0)
+        self.status_label = QLabel("No data loaded")
+        self.status_label.setProperty("role", "heading")
+        self.status_label.setWordWrap(True)
+        layout.addWidget(self.status_label, 1)
+
+        self.show_table_button = QPushButton("Data table")
+        self.show_table_button.setProperty("secondary", True)
+        self.show_table_button.setToolTip("Open the current localizations as a table")
+        self.show_table_button.clicked.connect(self.show_data_table)
+        layout.addWidget(self.show_table_button)
+
+        self.export_button = QPushButton("Export...")
+        self.export_button.setProperty("primary", True)
+        self.export_button.setToolTip(
+            "Export whatever is currently available: the filtered localizations "
+            "always, plus trajectories and their metrics once they exist."
+        )
+        self.export_button.clicked.connect(self.export_analysis)
+        layout.addWidget(self.export_button)
+
+        self.export_cancel_button = self._cancel_button(self._export_cancel, "the export")
+        layout.addWidget(self.export_cancel_button)
+        self.export_progress = QProgressBar()
+        self.export_progress.setRange(0, 100)
+        self.export_progress.setVisible(False)
+        self.export_progress.setMaximumWidth(120)
+        layout.addWidget(self.export_progress)
+        return header
+
+    def _update_status_header(self):
+        """Refresh the header after anything that changes the data."""
+        if not hasattr(self, "status_label"):
+            return
+        parts = []
+        layer = self._source_image_layer()
+        if layer is not None:
+            shape = getattr(getattr(layer, "data", None), "shape", None)
+            if shape is not None:
+                parts.append(f"{layer.name}  {'x'.join(str(int(v)) for v in shape)}")
+        if self.df is not None:
+            kept = len(self.df_filtered) if self.df_filtered is not None else len(self.df)
+            parts.append(f"{kept} / {len(self.df)} localizations")
+        if self.tracks is not None and not self.tracks.empty:
+            parts.append(f"{self.tracks['particle'].nunique()} trajectories")
+        if self.df is not None:
+            parts.append(f"{self.pixel_size_box.value():.0f} nm/px")
+        self.status_label.setText("     ".join(parts) if parts else "No data loaded")
+        has_data = self.df is not None
+        self.show_table_button.setEnabled(has_data)
+        self.export_button.setEnabled(has_data)
 
     def _get_current_frame(self):
         try:
@@ -367,23 +1402,267 @@ class LocalizationTrackingWidget(QWidget):
             pass
         return 0
 
+    # ------------------------------------------------------------------
+    # Restoring settings from a previous analysis
+    # ------------------------------------------------------------------
+    def load_settings_from_metadata(self, path=None):
+        """Restore the parameters recorded in a previous run's metadata.json."""
+        if path is None:
+            path, _ = QFileDialog.getOpenFileName(
+                self, "Load settings from a previous analysis",
+                filter="Analysis metadata (metadata.json);;JSON files (*.json)",
+            )
+        if not path:
+            return None
+        try:
+            with open(path, encoding="utf-8") as handle:
+                metadata = json.load(handle)
+        except Exception as exc:
+            self.log(f"Could not read settings from {Path(path).name}: {exc}")
+            return None
+
+        applied, skipped, notes = self.apply_settings(metadata)
+        source = metadata.get("source_csv") or metadata.get("source_image")
+        exported = metadata.get("exported_at")
+        self.log(
+            f"Restored {len(applied)} settings from {Path(path).name}"
+            + (f", exported {exported}" if exported else "")
+        )
+        if source:
+            self.log(f"Those settings came from an analysis of {source}")
+        for note in notes:
+            self.log(f"  note: {note}")
+        if skipped:
+            self.log(f"  {len(skipped)} setting(s) not applied: {', '.join(sorted(skipped)[:6])}")
+        return applied
+
+    def apply_settings(self, metadata):
+        """Apply a metadata dict to the controls. Returns (applied, skipped, notes)."""
+        values, notes = settings_from_metadata(metadata)
+        applied, skipped = [], []
+
+        # The frame shift is plugin state rather than a control, so it is
+        # applied directly instead of being pushed into a widget.
+        if "_frame_shift" in values:
+            self._frame_shift = int(values.pop("_frame_shift"))
+            self._update_frame_shift_label()
+            applied.append("_frame_shift")
+
+        for attr, value in values.items():
+            widget = getattr(self, attr, None)
+            if widget is None:
+                skipped.append(attr)
+                continue
+            try:
+                if set_widget_value(widget, value):
+                    applied.append(attr)
+                else:
+                    skipped.append(attr)
+            except Exception:
+                skipped.append(attr)
+
+        bounds = metadata.get("filter_bounds") if isinstance(metadata, dict) else None
+        if isinstance(bounds, dict):
+            n_bounds, unmatched = self._apply_filter_bounds(bounds)
+            if n_bounds:
+                notes.append(f"{n_bounds} filter bound(s) applied")
+            if unmatched:
+                shown = ", ".join(sorted(unmatched)[:3])
+                notes.append(
+                    f"{len(unmatched)} filter bound(s) match no loaded column ({shown}"
+                    + (", ...)" if len(unmatched) > 3 else ")")
+                    + " - kept in case matching data is loaded next"
+                )
+
+        self._apply_histogram_display(metadata.get("metric_histogram_display"),
+                                      self._metric_hist_widgets, notes)
+        self._apply_histogram_display(metadata.get("filter_histogram_display"),
+                                      self._hist_widgets, notes)
+
+        # One refresh at the end rather than one per control.
+        self.apply_filters()
+        self._update_link_cutoff_label()
+        self.render_overlay()
+        return applied, skipped, notes
+
+    def _apply_filter_bounds(self, bounds):
+        """Apply per-column filter bounds; stash the ones whose column isn't loaded.
+
+        Settings are often loaded before the data they belong to, and the filter
+        controls only exist once a table is in. Anything that cannot be applied
+        now is kept and applied when a matching column shows up.
+        """
+        applied = 0
+        pending = {}
+        for column, limits in bounds.items():
+            if not isinstance(limits, dict):
+                continue
+            controls = self.filter_controls.get(column)
+            if controls is None:
+                pending[column] = limits
+                continue
+            lower_box, upper_box = controls
+            try:
+                if isinstance(limits.get("min"), (int, float)):
+                    lower_box.setValue(float(limits["min"]))
+                if isinstance(limits.get("max"), (int, float)):
+                    upper_box.setValue(float(limits["max"]))
+                applied += 1
+            except Exception:
+                pending[column] = limits
+        self._pending_filter_bounds = pending or None
+        return applied, list(pending)
+
+    def _apply_histogram_display(self, section, widgets, notes):
+        if not isinstance(section, dict):
+            return
+        for key, entry in section.items():
+            state = widgets.get(key)
+            if state is None or not isinstance(entry, dict):
+                continue
+            try:
+                if isinstance(entry.get("bins"), (int, float)):
+                    state["bins_box"].setValue(int(entry["bins"]))
+                follow = state.get("follow_box")
+                if follow is not None and isinstance(entry.get("follow_filter"), bool):
+                    follow.setChecked(entry["follow_filter"])
+                log = state.get("log_box")
+                if log is not None and isinstance(entry.get("log_scale"), bool):
+                    log.setChecked(entry["log_scale"])
+                # While the view follows the filter it is derived, not stored.
+                if follow is None or not follow.isChecked():
+                    for name, box in (("view_min", "view_min_box"), ("view_max", "view_max_box")):
+                        if isinstance(entry.get(name), (int, float)):
+                            state[box].setValue(float(entry[name]))
+            except Exception:
+                notes.append(f"could not restore the {key} histogram view")
+
+    # ------------------------------------------------------------------
+    # Acquisition timing: frame rate and frame interval are one setting
+    # ------------------------------------------------------------------
+    def _frame_interval_s(self):
+        return 1.0 / max(self.fps_box.value(), 1e-9)
+
+    def _on_fps_changed(self, fps):
+        if self._syncing_timing:
+            return
+        self._syncing_timing = True
+        try:
+            self.frame_interval_box.setValue(1000.0 / max(float(fps), 1e-9))
+        finally:
+            self._syncing_timing = False
+        self._update_link_cutoff_label()
+
+    def _on_frame_interval_changed(self, interval_ms):
+        if self._syncing_timing:
+            return
+        self._syncing_timing = True
+        try:
+            self.fps_box.setValue(1000.0 / max(float(interval_ms), 1e-9))
+        finally:
+            self._syncing_timing = False
+        self._update_link_cutoff_label()
+
+    def _update_link_cutoff_label(self, *_args):
+        """Live readout of the largest D the current linking parameters can follow."""
+        # The Link tab is built before the D tab, so the timing boxes may not exist yet.
+        if not hasattr(self, "link_cutoff_label") or not hasattr(self, "fps_box"):
+            return
+        search_nm = self.search_box.value()
+        interval_s = self._frame_interval_s()
+        memory = self.memory_box.value()
+        percent = DEFAULT_LINKING_ERROR_RATE * 100
+
+        d_max = max_linkable_diffusion(search_nm, interval_s, memory=0)
+        step = rms_step(d_max, interval_s)
+        lines = [
+            f"Links D up to <b>{d_max:.3g} µm²/s</b> "
+            f"(RMS step {step:.0f} nm; {percent:g}% of steps exceed {search_nm:.0f} nm "
+            f"at Δt = {interval_s * 1000:.3g} ms)"
+        ]
+        if memory > 0:
+            d_gap = max_linkable_diffusion(search_nm, interval_s, memory=memory)
+            lines.append(
+                f"With memory {memory} a gap spans {(memory + 1) * interval_s * 1000:.3g} ms, "
+                f"so closing those gaps needs D ≤ {d_gap:.3g} µm²/s"
+            )
+
+        measured = self._track_diffusion_cache or {}
+        if measured:
+            values = np.asarray(list(measured.values()), float)
+            values = values[np.isfinite(values)]
+            if values.size:
+                over = float((values > d_max).mean() * 100)
+                verdict = "search range looks adequate" if over <= percent else "consider a larger search range"
+                lines.append(
+                    f"{over:.1f}% of your {values.size} measured D values exceed it - {verdict}"
+                )
+        self.link_cutoff_label.setText("<br>".join(lines))
+
+    # ------------------------------------------------------------------
+    # Cancelling long-running operations
+    # ------------------------------------------------------------------
+    def _cancel_button(self, event, label):
+        """A Cancel button wired to `event`, enabled only while work is running."""
+        button = QPushButton("Cancel")
+        button.setProperty("stop", True)
+        button.setEnabled(False)
+        button.setToolTip(f"Stop {label} at the next frame boundary")
+        button.clicked.connect(lambda: self._request_cancel(event, button, label))
+        return button
+
+    def _request_cancel(self, event, button, label):
+        event.set()
+        button.setEnabled(False)
+        self.log(f"Cancelling {label}...")
+
+    def _arm_cancel(self, event, button):
+        event.clear()
+        button.setEnabled(True)
+
     def _build_load_tab(self):
         tab = QWidget()
-        self.tabs.addTab(tab, "Load data")
+        self.tabs.addTab(tab, "Load")
         layout = QVBoxLayout(tab)
 
         data_group = QGroupBox("Data")
         data_layout = QFormLayout(data_group)
         self.csv_edit = QLineEdit()
         self.csv_button = QPushButton("Browse CSV")
+        self.csv_button.setProperty("secondary", True)
         self.csv_button.clicked.connect(self.browse_csv)
         csv_row = QHBoxLayout()
         csv_row.addWidget(self.csv_edit)
         csv_row.addWidget(self.csv_button)
         data_layout.addRow("Localization CSV", csv_row)
 
+        # Right under the CSV, because it is a property of that file: some
+        # software numbers the first frame 0 and some numbers it 1, and a
+        # table that disagrees with its image stack puts every localization on
+        # the wrong frame. Shifting is explicit and reversible - press until
+        # the localizations sit on their spots.
+        shift_row = QHBoxLayout()
+        self.frame_shift_down_button = QPushButton("-1")
+        self.frame_shift_down_button.setProperty("secondary", True)
+        self.frame_shift_down_button.setToolTip("Shift every frame number down by one")
+        self.frame_shift_down_button.clicked.connect(lambda: self.shift_frame_numbers(-1))
+        self.frame_shift_up_button = QPushButton("+1")
+        self.frame_shift_up_button.setProperty("secondary", True)
+        self.frame_shift_up_button.setToolTip("Shift every frame number up by one")
+        self.frame_shift_up_button.clicked.connect(lambda: self.shift_frame_numbers(+1))
+        self.frame_shift_reset_button = QPushButton("Reset")
+        self.frame_shift_reset_button.setProperty("secondary", True)
+        self.frame_shift_reset_button.clicked.connect(lambda: self.shift_frame_numbers(None))
+        self.frame_shift_label = QLabel("no shift")
+        shift_row.addWidget(self.frame_shift_down_button)
+        shift_row.addWidget(self.frame_shift_up_button)
+        shift_row.addWidget(self.frame_shift_reset_button)
+        shift_row.addWidget(self.frame_shift_label, 1)
+        data_layout.addRow("Shift frame numbers", shift_row)
+
         self.image_edit = QLineEdit()
         self.image_button = QPushButton("Browse image")
+        self.image_button.setProperty("secondary", True)
         self.image_button.clicked.connect(self.browse_image)
         image_row = QHBoxLayout()
         image_row.addWidget(self.image_edit)
@@ -394,17 +1673,35 @@ class LocalizationTrackingWidget(QWidget):
         self.pixel_size_box.setRange(1.0, 10000.0)
         self.pixel_size_box.setValue(161.0)
         self.pixel_size_box.setDecimals(1)
-        data_layout.addRow("Pixel size (nm/px)", self.pixel_size_box)
-
-        self.frame_one_indexed_box = QCheckBox(
-            "Localization frame numbers start at 1 (offset -1 to align with image stack)"
+        self.pixel_size_box.setToolTip(
+            "Camera pixel size in the sample plane. Everything physical - the search range, D, the scale bar, the super-resolved pixel - is derived from it, so it is worth getting right."
         )
-        self.frame_one_indexed_box.setChecked(False)
-        data_layout.addRow("", self.frame_one_indexed_box)
+        self.pixel_size_box.setSuffix(" nm/px")
+        data_layout.addRow("Pixel size", self.pixel_size_box)
+
 
         self.load_button = QPushButton("Load data")
+        self.load_button.setProperty("primary", True)
         self.load_button.clicked.connect(self.load_data)
-        data_layout.addRow("", self.load_button)
+        self.load_cancel_button = self._cancel_button(self._load_cancel, "loading")
+        load_row = QHBoxLayout()
+        load_row.addWidget(self.load_button)
+        load_row.addWidget(self.load_cancel_button)
+        data_layout.addRow("", load_row)
+
+        self.load_settings_button = QPushButton("Load settings from a previous analysis...")
+        self.load_settings_button.setProperty("secondary", True)
+        self.load_settings_button.clicked.connect(lambda: self.load_settings_from_metadata())
+        self.load_settings_button.setToolTip(
+            "Read the metadata.json written by a previous export and restore the\n"
+            "parameters it recorded: camera, detection, fitting, linking, diffusion,\n"
+            "filter bounds and display settings.\n\n"
+            "Only settings are restored - never the data, the file paths, or the\n"
+            "results of that run. Filter bounds for columns that are not loaded yet\n"
+            "are kept and applied when matching data arrives, so settings can be\n"
+            "loaded before the data."
+        )
+        data_layout.addRow("", self.load_settings_button)
         self.load_progress = QProgressBar()
         self.load_progress.setRange(0, 0)  # indeterminate
         self.load_progress.setVisible(False)
@@ -431,17 +1728,68 @@ class LocalizationTrackingWidget(QWidget):
         self.marker_choice.setCurrentText("o")
         display_layout.addRow("Marker type", self.marker_choice)
         layout.addWidget(display_group)
+
+        playback_group = QGroupBox("Playback")
+        playback_layout = QFormLayout(playback_group)
+        playback_note = QLabel(
+            "How fast napari's play button (▶, next to the frame slider) "
+            "runs the stack. Set it here, then screen-record the viewer to make "
+            "a movie with every layer exactly as it looks."
+        )
+        playback_note.setWordWrap(True)
+        playback_layout.addRow(playback_note)
+
+        # Whole frames per second: napari's playback_fps is an int, and offering
+        # a fractional one here would only produce a setting it refuses.
+        self.playback_fps_box = QSpinBox()
+        self.playback_fps_box.setRange(1, 1000)
+        self.playback_fps_box.setValue(_playback_fps())
+        self.playback_fps_box.setSuffix(" fps")
+        self.playback_fps_box.setToolTip(
+            "Frames of the stack shown per second of wall clock. napari plays "
+            "at whole frames per second, so this is rounded."
+        )
+        self.playback_realtime_button = QPushButton("Real time")
+        self.playback_realtime_button.setProperty("secondary", True)
+        self.playback_realtime_button.setToolTip(
+            "Play at the rate the camera acquired at, so a second on screen is "
+            "a second at the microscope."
+        )
+        self.playback_realtime_button.clicked.connect(self._set_playback_to_real_time)
+        fps_row = QHBoxLayout()
+        fps_row.addWidget(self.playback_fps_box, 1)
+        fps_row.addWidget(self.playback_realtime_button)
+        playback_layout.addRow("Speed", fps_row)
+
+        self.playback_mode_box = QComboBox()
+        for key, label in PLAYBACK_MODES.items():
+            self.playback_mode_box.addItem(label, key)
+        self.playback_mode_box.setCurrentIndex(
+            max(0, self.playback_mode_box.findData(_playback_mode())))
+        playback_layout.addRow("At the end", self.playback_mode_box)
+
+        self.playback_status = QLabel("-")
+        self.playback_status.setWordWrap(True)
+        playback_layout.addRow("", self.playback_status)
+        layout.addWidget(playback_group)
+
+        self.playback_fps_box.valueChanged.connect(self._on_playback_changed)
+        self.playback_mode_box.currentIndexChanged.connect(
+            lambda _i: self._on_playback_changed())
+        self._on_playback_changed()
+
         layout.addStretch(1)
 
-        self.show_points_box.stateChanged.connect(lambda _checked: self.render_overlay())
-        self.marker_size_box.valueChanged.connect(lambda _v: self.render_overlay())
-        self.marker_edge_width_box.valueChanged.connect(lambda _v: self.render_overlay())
-        self.marker_choice.currentTextChanged.connect(lambda _v: self.render_overlay())
-        self.frame_one_indexed_box.stateChanged.connect(self._on_frame_offset_changed)
+        # Marker style only concerns the points layer, which updates in place -
+        # no reason to rebuild the trajectory layers as well.
+        self.show_points_box.stateChanged.connect(lambda _checked: self._sync_points_layer())
+        self.marker_size_box.valueChanged.connect(lambda _v: self._sync_points_layer())
+        self.marker_edge_width_box.valueChanged.connect(lambda _v: self._sync_points_layer())
+        self.marker_choice.currentTextChanged.connect(lambda _v: self._sync_points_layer())
 
     def _build_localize_tab(self):
         tab = QWidget()
-        self.tabs.addTab(tab, "Localize (2D)")
+        self._localize_tab_index = self.tabs.addTab(tab, "Localize")
         outer_layout = QVBoxLayout(tab)
         outer_layout.setContentsMargins(0, 0, 0, 0)
         scroll = QScrollArea(tab)
@@ -466,11 +1814,17 @@ class LocalizationTrackingWidget(QWidget):
         self.loc_gain_box.setRange(0.01, 1000.0)
         self.loc_gain_box.setDecimals(3)
         self.loc_gain_box.setValue(1.0)
+        self.loc_gain_box.setToolTip(
+            "Camera gain, used to convert counts to photons before fitting. "
+            "The MLE fit assumes photon statistics, so a wrong gain biases the "
+            "photon counts and the uncertainties derived from them."
+        )
         cam_layout.addRow("Gain (ADU/photon)", self.loc_gain_box)
         self.loc_offset_box = QDoubleSpinBox()
         self.loc_offset_box.setRange(0.0, 20000.0)
         self.loc_offset_box.setValue(100.0)
-        cam_layout.addRow("Offset (ADU)", self.loc_offset_box)
+        self.loc_offset_box.setSuffix(" ADU")
+        cam_layout.addRow("Offset", self.loc_offset_box)
         layout.addWidget(cam_group)
 
         det_group = QGroupBox("Detection (local maxima + net gradient)")
@@ -479,21 +1833,29 @@ class LocalizationTrackingWidget(QWidget):
         self.loc_box_size.setRange(3, 51)
         self.loc_box_size.setSingleStep(2)
         self.loc_box_size.setValue(7)
-        det_layout.addRow("Box size (px, odd)", self.loc_box_size)
+        self.loc_box_size.setSuffix(" px")
+        det_layout.addRow("Box size (odd)", self.loc_box_size)
         self.loc_min_ng_box = QDoubleSpinBox()
         self.loc_min_ng_box.setRange(0.0, 1e6)
         self.loc_min_ng_box.setDecimals(1)
         self.loc_min_ng_box.setValue(800.0)
+        self.loc_min_ng_box.setToolTip(
+            "Detection threshold: the summed inward intensity gradient around a candidate. Raise it to reject noise, lower it to catch dim spots - use Preview to see the effect before running every frame."
+        )
         det_layout.addRow("Min net gradient", self.loc_min_ng_box)
         det_buttons = QHBoxLayout()
         self.loc_preview_button = QPushButton("Preview (current frame)")
+        self.loc_preview_button.setProperty("secondary", True)
         self.loc_preview_button.clicked.connect(self.loc2d_preview)
         self.loc_detect_button = QPushButton("Detect all frames")
+        self.loc_detect_button.setProperty("primary", True)
         self.loc_detect_button.clicked.connect(self.loc2d_detect_all)
+        self.loc_detect_cancel_button = self._cancel_button(self._loc2d_detect_cancel, "detection")
         det_buttons.addWidget(self.loc_preview_button)
         det_buttons.addWidget(self.loc_detect_button)
+        det_buttons.addWidget(self.loc_detect_cancel_button)
         det_layout.addRow("", det_buttons)
-        self.loc_show_candidates_box = QCheckBox("Show detection candidates on current frame")
+        self.loc_show_candidates_box = QCheckBox("Show detection candidates on the image")
         self.loc_show_candidates_box.setChecked(True)
         self.loc_show_candidates_box.stateChanged.connect(lambda _c: self._update_loc2d_candidate_overlay())
         det_layout.addRow("", self.loc_show_candidates_box)
@@ -511,14 +1873,32 @@ class LocalizationTrackingWidget(QWidget):
         fit_layout = QFormLayout(fit_group)
         self.loc_backend_box = QComboBox()
         self.loc_backend_box.addItems(["auto", "mle", "fast", "gpu"])
+        self.loc_backend_box.setToolTip(
+            "fast: least-squares Gauss-Newton, elliptical (sx and sy fitted separately).\n"
+            "mle:  Poisson-weighted Gauss-Newton, also elliptical - slower, better at low photon counts.\n"
+            "gpu:  Gpufit GAUSS_2D, which fits a single isotropic sigma, so sx == sy\n"
+            "      for every spot it converges on. Sigma-based filtering therefore\n"
+            "      behaves differently than it does for fast/mle. Spots the GPU does\n"
+            "      not converge on are re-fitted with the CPU MLE, and those few rows\n"
+            "      are elliptical again (sx != sy)."
+        )
         fit_layout.addRow("Backend", self.loc_backend_box)
-        gpu_note = QLabel("\"gpu\" needs Gpufit installed; falls back to CPU MLE automatically otherwise.")
+        gpu_note = QLabel(
+            "\"gpu\" needs Gpufit installed; falls back to CPU MLE automatically otherwise. "
+            "It fits one isotropic sigma (sx == sy), except for spots it fails to "
+            "converge on, which are re-fitted on the CPU."
+        )
         gpu_note.setWordWrap(True)
         fit_layout.addRow("", gpu_note)
         self.loc_fit_button = QPushButton("Fit all detected frames")
+        self.loc_fit_button.setProperty("primary", True)
         self.loc_fit_button.clicked.connect(self.loc2d_fit_all)
         self.loc_fit_button.setEnabled(False)
-        fit_layout.addRow("", self.loc_fit_button)
+        self.loc_fit_cancel_button = self._cancel_button(self._loc2d_fit_cancel, "fitting")
+        fit_buttons = QHBoxLayout()
+        fit_buttons.addWidget(self.loc_fit_button)
+        fit_buttons.addWidget(self.loc_fit_cancel_button)
+        fit_layout.addRow("", fit_buttons)
         self.loc_fit_progress = QProgressBar()
         self.loc_fit_progress.setRange(0, 100)
         self.loc_fit_progress.setVisible(False)
@@ -530,7 +1910,7 @@ class LocalizationTrackingWidget(QWidget):
 
     def _build_filter_tab(self):
         tab = QWidget()
-        self.tabs.addTab(tab, "Filter localizations")
+        self.tabs.addTab(tab, "Filter")
         root = QVBoxLayout(tab)
         root.setContentsMargins(0, 0, 0, 0)
 
@@ -540,16 +1920,16 @@ class LocalizationTrackingWidget(QWidget):
         header_layout.addWidget(self.filter_status)
         buttons_row = QHBoxLayout()
         self.reset_filters_button = QPushButton("Reset filters")
+        self.reset_filters_button.setProperty("secondary", True)
         self.reset_filters_button.clicked.connect(self.reset_filters)
         self.reset_filters_button.setEnabled(False)
         self.apply_filters_button = QPushButton("Apply filters")
+        self.apply_filters_button.setProperty("primary", True)
         self.apply_filters_button.clicked.connect(self.apply_filters)
         self.apply_filters_button.setEnabled(False)
-        self.show_table_button = QPushButton("Show full data table")
-        self.show_table_button.clicked.connect(self.show_data_table)
         buttons_row.addWidget(self.reset_filters_button)
         buttons_row.addWidget(self.apply_filters_button)
-        buttons_row.addWidget(self.show_table_button)
+        buttons_row.addStretch(1)
         header_layout.addLayout(buttons_row)
         note = QLabel(
             "x / y are filtered with the yellow box drawn on the image: drag "
@@ -559,22 +1939,6 @@ class LocalizationTrackingWidget(QWidget):
         note.setWordWrap(True)
         header_layout.addWidget(note)
 
-        # Localizations are usable end-to-end without ever touching the
-        # Link/Trajectory analysis tabs, so exporting lives here too, not
-        # only alongside the tracking-specific controls.
-        export_row = QHBoxLayout()
-        self.export_button_filter = QPushButton("Export localizations / analysis")
-        self.export_button_filter.clicked.connect(self.export_analysis)
-        export_row.addWidget(self.export_button_filter)
-        export_row.addStretch(1)
-        header_layout.addLayout(export_row)
-        export_note = QLabel(
-            "Exports whatever is currently available: filtered localizations "
-            "always, plus trajectories/D/distance/duration if you've linked "
-            "and analyzed them - tracking is entirely optional."
-        )
-        export_note.setWordWrap(True)
-        header_layout.addWidget(export_note)
         root.addWidget(header)
 
         scroll = QScrollArea(tab)
@@ -585,30 +1949,612 @@ class LocalizationTrackingWidget(QWidget):
         root.addWidget(scroll)
         self.filter_layout.addWidget(QLabel("Load data to see filters"), 0, 0)
 
-    def _build_link_tab(self):
+    def _build_render_tab(self):
         tab = QWidget()
-        self.tabs.addTab(tab, "Link")
-        layout = QVBoxLayout(tab)
+        self.tabs.addTab(tab, "Render")
+        outer_layout = QVBoxLayout(tab)
+        outer_layout.setContentsMargins(0, 0, 0, 0)
+        scroll = QScrollArea(tab)
+        scroll.setWidgetResizable(True)
+        content = QWidget()
+        layout = QVBoxLayout(content)
+        scroll.setWidget(content)
+        outer_layout.addWidget(scroll)
+
+        note = QLabel(
+            "Reconstruct a super-resolved image from the localizations that "
+            "pass the current filters - so tightening a filter and rendering "
+            "again shows exactly what that filter does to the reconstruction. "
+            "Pixel values are localization counts (or photons), never rescaled, "
+            "so two renders can be compared quantitatively."
+        )
+        note.setWordWrap(True)
+        layout.addWidget(note)
+
+        # --- source ---------------------------------------------------------
+        source_group = QGroupBox("Localizations to render")
+        source_layout = QFormLayout(source_group)
+        self.render_source_label = QLabel("No localizations loaded")
+        source_layout.addRow("", self.render_source_label)
+
+        # Same two paths as the Load data tab, kept in sync both ways, so a
+        # session that only ever renders never has to leave this tab.
+        self.render_csv_edit = QLineEdit()
+        render_csv_button = QPushButton("Browse CSV")
+        render_csv_button.clicked.connect(self.browse_csv)
+        csv_row = QHBoxLayout()
+        csv_row.addWidget(self.render_csv_edit)
+        csv_row.addWidget(render_csv_button)
+        source_layout.addRow("Localization CSV", csv_row)
+
+        self.render_image_edit = QLineEdit()
+        render_image_button = QPushButton("Browse image")
+        render_image_button.clicked.connect(self.browse_image)
+        image_row = QHBoxLayout()
+        image_row.addWidget(self.render_image_edit)
+        image_row.addWidget(render_image_button)
+        source_layout.addRow("Image (field of view)", image_row)
+
+        self.render_load_button = QPushButton("Load")
+        self.render_load_button.setProperty("secondary", True)
+        self.render_load_button.clicked.connect(self.load_data)
+        self.render_load_button.setToolTip(
+            "Loads through the same path as the Load data tab, so the "
+            "localizations end up filterable and linkable as usual."
+        )
+        source_layout.addRow("", self.render_load_button)
+        layout.addWidget(source_group)
+
+        self._sync_line_edits(self.csv_edit, self.render_csv_edit)
+        self._sync_line_edits(self.image_edit, self.render_image_edit)
+
+        # --- sampling -------------------------------------------------------
+        sampling_group = QGroupBox("Sampling")
+        sampling_layout = QFormLayout(sampling_group)
+        self.render_oversampling_box = QSpinBox()
+        self.render_oversampling_box.setRange(1, 200)
+        self.render_oversampling_box.setValue(10)
+        self.render_oversampling_box.setToolTip(
+            "Super-resolved pixels per camera pixel. The reconstruction should "
+            "be sampled finer than the localization precision, but every "
+            "doubling costs four times the memory."
+        )
+        self.render_oversampling_box.setSuffix(" x")
+        sampling_layout.addRow("Oversampling", self.render_oversampling_box)
+        self.render_size_label = QLabel("-")
+        self.render_size_label.setWordWrap(True)
+        sampling_layout.addRow("", self.render_size_label)
+        self.render_backend_label = QLabel(smlm_render.render_gpu_status())
+        self.render_backend_label.setWordWrap(True)
+        sampling_layout.addRow("", self.render_backend_label)
+        self.render_gpu_box = QCheckBox("Use the GPU when it is available and the frame fits")
+        self.render_gpu_box.setChecked(True)
+        sampling_layout.addRow("", self.render_gpu_box)
+        layout.addWidget(sampling_group)
+
+        # --- mode -----------------------------------------------------------
+        mode_group = QGroupBox("Mode")
+        mode_layout = QFormLayout(mode_group)
+        self.render_mode_box = QComboBox()
+        for key, label in smlm_render.MODES.items():
+            self.render_mode_box.addItem(label, key)
+        self.render_mode_box.setCurrentIndex(
+            self.render_mode_box.findData("gaussian_global")
+        )
+        mode_layout.addRow("Render as", self.render_mode_box)
+
+        self.render_sigma_box = QDoubleSpinBox()
+        self.render_sigma_box.setRange(0.1, 5000.0)
+        self.render_sigma_box.setDecimals(1)
+        self.render_sigma_box.setValue(30.0)
+        self.render_sigma_label = QLabel("Blur width sigma")
+        self.render_sigma_box.setSuffix(" nm")
+        mode_layout.addRow(self.render_sigma_label, self.render_sigma_box)
+
+        self.render_sigma_column_box = QComboBox()
+        self.render_sigma_column_label = QLabel("Width from column")
+        self.render_sigma_column_box.setToolTip(
+            "Usually the localization uncertainty: each molecule is drawn as "
+            "wide as it was actually located, which is the honest picture. "
+            "Choosing a PSF sigma column instead just redraws the diffraction "
+            "limit and throws the super-resolution away."
+        )
+        mode_layout.addRow(self.render_sigma_column_label, self.render_sigma_column_box)
+
+        clamp_row = QHBoxLayout()
+        self.render_sigma_min_box = QDoubleSpinBox()
+        self.render_sigma_min_box.setRange(0.1, 5000.0)
+        self.render_sigma_min_box.setDecimals(1)
+        self.render_sigma_min_box.setValue(5.0)
+        self.render_sigma_max_box = QDoubleSpinBox()
+        self.render_sigma_max_box.setRange(0.1, 5000.0)
+        self.render_sigma_max_box.setDecimals(1)
+        self.render_sigma_max_box.setValue(100.0)
+        clamp_row.addWidget(self.render_sigma_min_box)
+        clamp_row.addWidget(QLabel("to"))
+        clamp_row.addWidget(self.render_sigma_max_box)
+        self.render_clamp_label = QLabel("Clamp width to (nm)")
+        self.render_clamp_label.setToolTip(
+            "A row whose fit returned an absurd precision would otherwise paint "
+            "a huge blob over the reconstruction; rows with no precision at all "
+            "are drawn at the lower bound rather than dropped."
+        )
+        mode_layout.addRow(self.render_clamp_label, clamp_row)
+
+        self.render_photons_box = QCheckBox(
+            "Weight each localization by its photon count instead of counting it once"
+        )
+        mode_layout.addRow("", self.render_photons_box)
+
+        self.render_colormap_box = QComboBox()
+        self.render_colormap_box.addItems(RENDER_COLORMAPS)
+        self.render_colormap_box.setToolTip(
+            "Used for the render layer in the viewer, for the PNG preview, "
+            "and for the reconstruction inside a composite."
+        )
+        mode_layout.addRow("Colormap (display and PNG)", self.render_colormap_box)
+        layout.addWidget(mode_group)
+
+        # --- image ----------------------------------------------------------
+        image_group = QGroupBox("Image")
+        image_layout = QFormLayout(image_group)
+        image_buttons = QHBoxLayout()
+        self.render_image_button = QPushButton("Render image")
+        self.render_image_button.setProperty("primary", True)
+        self.render_image_button.clicked.connect(self.render_smlm_image)
+        self.render_image_button.setEnabled(False)
+        image_buttons.addWidget(self.render_image_button)
+        image_buttons.addStretch(1)
+        image_layout.addRow("", image_buttons)
+        layout.addWidget(image_group)
+
+        # --- movie ----------------------------------------------------------
+        movie_group = QGroupBox("Movie")
+        movie_layout = QFormLayout(movie_group)
+        self.render_frames_per_box = QSpinBox()
+        self.render_frames_per_box.setRange(1, 1_000_000)
+        self.render_frames_per_box.setValue(1000)
+        self.render_frames_per_box.setSuffix(" frames")
+        movie_layout.addRow("Raw frames per super-resolved frame", self.render_frames_per_box)
+
+        self.render_grouping_box = QComboBox()
+        for key, label in smlm_render.GROUPINGS.items():
+            self.render_grouping_box.addItem(label, key)
+        self.render_grouping_box.setToolTip(
+            "Independent blocks: each movie frame holds only its own raw frames.\n"
+            "Cumulative build-up: each frame adds to everything before it, so the\n"
+            "  reconstruction fills in as the movie plays.\n"
+            "Sliding window: a window of that many raw frames advanced by the step\n"
+            "  below, which gives a smoother movie at the cost of re-rendering the\n"
+            "  overlap."
+        )
+        movie_layout.addRow("Grouping", self.render_grouping_box)
+
+        self.render_step_box = QSpinBox()
+        self.render_step_box.setRange(1, 1_000_000)
+        self.render_step_box.setValue(500)
+        self.render_step_box.setSuffix(" frames")
+        self.render_step_label = QLabel("Window step")
+        movie_layout.addRow(self.render_step_label, self.render_step_box)
+
+        self.render_start_frame_box = QSpinBox()
+        self.render_start_frame_box.setRange(0, 100_000_000)
+        self.render_start_frame_box.setValue(0)
+        self.render_start_frame_box.setSpecialValueText("the first frame")
+        self.render_start_frame_box.setToolTip(
+            "Where the movie begins, and for a cumulative build-up where the "
+            "accumulation starts from.\n\n"
+            "Localizations before this frame are left out entirely, so a "
+            "cumulative movie can be made to build up from the moment something "
+            "starts happening rather than from a stretch of bleaching or drift "
+            "at the beginning of the acquisition."
+        )
+        movie_layout.addRow("Start from", self.render_start_frame_box)
+        self.render_start_frame_box.valueChanged.connect(
+            lambda _v: self._update_render_info())
+
+        self.render_movie_label = QLabel("-")
+        self.render_movie_label.setWordWrap(True)
+        movie_layout.addRow("", self.render_movie_label)
+
+        movie_buttons = QHBoxLayout()
+        self.render_movie_button = QPushButton("Render movie")
+        self.render_movie_button.setProperty("primary", True)
+        self.render_movie_button.clicked.connect(self.render_smlm_movie)
+        self.render_movie_button.setEnabled(False)
+        movie_buttons.addWidget(self.render_movie_button)
+        movie_buttons.addStretch(1)
+        movie_layout.addRow("", movie_buttons)
+        layout.addWidget(movie_group)
+
+        layout.addStretch(1)
+
+        self.render_mode_box.currentIndexChanged.connect(self._on_render_mode_changed)
+        self.render_grouping_box.currentIndexChanged.connect(self._on_render_grouping_changed)
+        self.render_oversampling_box.valueChanged.connect(lambda _v: self._update_render_info())
+        self.render_frames_per_box.valueChanged.connect(lambda _v: self._update_render_info())
+        self.render_step_box.valueChanged.connect(lambda _v: self._update_render_info())
+        self.pixel_size_box.valueChanged.connect(lambda _v: self._update_render_info())
+        # The world is measured in nanometres, so it stretches when the pixel
+        # size does - and napari's scale bar with it.
+        self.pixel_size_box.valueChanged.connect(lambda _v: self._apply_viewer_scale())
+        self._on_render_mode_changed()
+        self._on_render_grouping_changed()
+
+    def _build_save_tab(self):
+        """Everything about turning a finished render into files on disk.
+
+        Rendering and saving were one long tab; they are different jobs done at
+        different moments - you render once and then try several ways of
+        writing it out - so the options for each now sit where that job is.
+        """
+        tab = QWidget()
+        self.tabs.addTab(tab, "Save")
+        outer_layout = QVBoxLayout(tab)
+        outer_layout.setContentsMargins(0, 0, 0, 0)
+        scroll = QScrollArea(tab)
+        scroll.setWidgetResizable(True)
+        content = QWidget()
+        layout = QVBoxLayout(content)
+        scroll.setWidget(content)
+        outer_layout.addWidget(scroll)
+
+        note = QLabel(
+            "Render an image or a movie on the Render tab first; this tab "
+            "writes whichever of them you have, as often as you like and in "
+            "whichever format, without rendering again."
+        )
+        note.setWordWrap(True)
+        note.setProperty("role", "note")
+        layout.addWidget(note)
+
+        # --- the save buttons ------------------------------------------------
+        buttons_group = QGroupBox("Write to disk")
+        buttons_layout = QVBoxLayout(buttons_group)
+        image_row = QHBoxLayout()
+        self.render_save_image_button = QPushButton("Save image...")
+        self.render_save_image_button.setProperty("primary", True)
+        self.render_save_image_button.clicked.connect(self.save_render_image)
+        self.render_save_image_button.setEnabled(False)
+        self.render_save_composite_image_button = QPushButton("Save composite image...")
+        self.render_save_composite_image_button.setProperty("secondary", True)
+        self.render_save_composite_image_button.setToolTip(
+            "Save the blend of the layers ticked below, whatever the format "
+            "box above is set to."
+        )
+        self.render_save_composite_image_button.clicked.connect(self.save_composite_image)
+        self.render_save_composite_image_button.setEnabled(False)
+        image_row.addWidget(self.render_save_image_button)
+        image_row.addWidget(self.render_save_composite_image_button)
+        buttons_layout.addLayout(image_row)
+
+        movie_row = QHBoxLayout()
+        self.render_save_movie_button = QPushButton("Save movie...")
+        self.render_save_movie_button.setProperty("primary", True)
+        self.render_save_movie_button.clicked.connect(self.save_render_movie)
+        self.render_save_movie_button.setEnabled(False)
+        # No composite movie button. A blended movie has to be reconstructed at
+        # the render's own resolution and written frame by frame, which made it
+        # both slow and lower resolution than the thing on screen. Screen-record
+        # the viewer instead - set the speed under Playback on the Load tab -
+        # and every layer appears exactly as it looks, at display resolution.
+        movie_row.addWidget(self.render_save_movie_button)
+        buttons_layout.addLayout(movie_row)
+
+        self.render_save_status = QLabel("Nothing rendered yet.")
+        self.render_save_status.setWordWrap(True)
+        self.render_save_status.setProperty("role", "note")
+        buttons_layout.addWidget(self.render_save_status)
+        layout.addWidget(buttons_group)
+
+        # --- output ---------------------------------------------------------
+        output_group = QGroupBox("Output")
+        output_layout = QFormLayout(output_group)
+        self.render_add_layer_box = QCheckBox("Add the render to the viewer, aligned with the raw stack")
+        self.render_add_layer_box.setChecked(True)
+        output_layout.addRow("", self.render_add_layer_box)
+        self.render_png_box = QCheckBox("Also write a contrast-stretched PNG next to the TIFF")
+        self.render_png_box.setChecked(True)
+        output_layout.addRow("", self.render_png_box)
+
+        # Images default to the quantitative format and movies to the light one:
+        # a still is usually the figure or the thing you measure on, while a
+        # movie is almost always something you watch, and float32 makes it four
+        # times larger for a precision nobody plays back.
+        self.render_image_format_box = QComboBox()
+        for key, label in RENDER_SAVE_FORMATS.items():
+            self.render_image_format_box.addItem(label, key)
+        self.render_image_format_box.setCurrentIndex(self.render_image_format_box.findData("data"))
+        output_layout.addRow("Save image as", self.render_image_format_box)
+
+        self.render_movie_format_box = QComboBox()
+        for key, label in RENDER_SAVE_FORMATS.items():
+            if key == "composite":
+                continue  # screen-recorded from the viewer now, not written here
+            self.render_movie_format_box.addItem(label, key)
+        self.render_movie_format_box.setCurrentIndex(self.render_movie_format_box.findData("display"))
+        output_layout.addRow("Save movie as", self.render_movie_format_box)
+
+        save_note = QLabel(
+            "<b>Data</b> keeps the render's own values as float32 - counts, or "
+            "photons when weighted - so two exports stay comparable. "
+            "<b>Display</b> is a contrast-stretched 8-bit copy, a quarter of the "
+            "size, stretched once for the whole movie so frames don't pulse. "
+            "<b>Composite</b> blends the layers below into RGB, for stills only - "
+            "for a blended movie, screen-record the viewer instead (Playback, on "
+            "the Load tab), which keeps every layer as it looks on screen. "
+            "Every one gets a &lt;name&gt;_metadata.json recording the settings "
+            "behind it - the same snapshot the analysis export writes."
+        )
+        save_note.setWordWrap(True)
+        output_layout.addRow("", save_note)
+
+        progress_row = QHBoxLayout()
+        self.render_progress = QProgressBar()
+        self.render_progress.setRange(0, 100)
+        self.render_progress.setVisible(False)
+        self.render_cancel_button = self._cancel_button(self._render_cancel, "rendering")
+        progress_row.addWidget(self.render_progress)
+        progress_row.addWidget(self.render_cancel_button)
+        output_layout.addRow("", progress_row)
+        layout.addWidget(output_group)
+
+        # --- composite ------------------------------------------------------
+        self.render_composite_group = QGroupBox("Composite layers (for the Composite format)")
+        composite_layout = QFormLayout(self.render_composite_group)
+        composite_note = QLabel(
+            "Blended additively, like napari's additive layers: the "
+            "reconstruction in its colormap, with the localizations and the "
+            "trajectories drawn over it. In a movie each layer is grouped the "
+            "same way as the reconstruction, so a trajectory appears while it "
+            "is actually being tracked."
+        )
+        composite_note.setWordWrap(True)
+        composite_layout.addRow("", composite_note)
+
+        self.render_composite_base_box = QCheckBox("Super-resolved reconstruction")
+        self.render_composite_base_box.setChecked(True)
+        composite_layout.addRow("", self.render_composite_base_box)
+
+        locs_row = QHBoxLayout()
+        self.render_composite_locs_box = QCheckBox("Localizations")
+        self.render_composite_locs_box.setChecked(False)
+        self.render_locs_color_box = QComboBox()
+        self.render_locs_color_box.addItems(list(smlm_render.OVERLAY_COLORS))
+        self.render_locs_color_box.setCurrentText("cyan")
+        self.render_locs_size_box = QDoubleSpinBox()
+        self.render_locs_size_box.setRange(1.0, 2000.0)
+        self.render_locs_size_box.setDecimals(0)
+        self.render_locs_size_box.setValue(30.0)
+        locs_row.addWidget(self.render_composite_locs_box)
+        locs_row.addWidget(self.render_locs_color_box)
+        locs_row.addWidget(QLabel("size (nm)"))
+        locs_row.addWidget(self.render_locs_size_box)
+        composite_layout.addRow("", locs_row)
+
+        tracks_row = QHBoxLayout()
+        self.render_composite_tracks_box = QCheckBox("Trajectories")
+        self.render_composite_tracks_box.setChecked(False)
+        self.render_tracks_color_box = QComboBox()
+        self.render_tracks_color_box.addItems(list(smlm_render.OVERLAY_COLORS))
+        self.render_tracks_color_box.setCurrentText("yellow")
+        self.render_tracks_width_box = QDoubleSpinBox()
+        self.render_tracks_width_box.setRange(1.0, 2000.0)
+        self.render_tracks_width_box.setDecimals(0)
+        self.render_tracks_width_box.setValue(30.0)
+        tracks_row.addWidget(self.render_composite_tracks_box)
+        tracks_row.addWidget(self.render_tracks_color_box)
+        tracks_row.addWidget(QLabel("width (nm)"))
+        tracks_row.addWidget(self.render_tracks_width_box)
+        composite_layout.addRow("", tracks_row)
+
+        self.render_composite_all_box = QCheckBox(
+            "Every other visible layer too (the raw stack, candidates, ...)")
+        self.render_composite_all_box.setToolTip(
+            "Adds each visible Image and Points layer in the viewer, drawn with "
+            "its own colormap or colour and its own contrast, sampled onto the "
+            "super-resolved grid. Shapes layers - the filter and crop boxes - "
+            "are controls rather than data, so they are left out."
+        )
+        composite_layout.addRow("", self.render_composite_all_box)
+
+        self.render_composite_status = QLabel("-")
+        self.render_composite_status.setWordWrap(True)
+        composite_layout.addRow("", self.render_composite_status)
+        layout.addWidget(self.render_composite_group)
+
+        # --- time stamp and crop --------------------------------------------
+        stamp_group = QGroupBox("Time stamp and crop")
+        stamp_layout = QFormLayout(stamp_group)
+
+        time_row = QHBoxLayout()
+        self.render_timestamp_box = QCheckBox("Burn in the time")
+        self.render_timestamp_box.setToolTip(
+            "Drawn into the saved pixels, using the frame rate from the Link "
+            "tab. A movie frame is labelled with the time its group starts at; "
+            "a still is labelled with the span it covers."
+        )
+        self.render_timestamp_size_box = QSpinBox()
+        self.render_timestamp_size_box.setRange(4, 2000)
+        self.render_timestamp_size_box.setValue(40)
+        self.render_timestamp_size_box.setSuffix(" px")
+        self.render_timestamp_color_box = QComboBox()
+        self.render_timestamp_color_box.addItems(list(smlm_render.OVERLAY_COLORS))
+        self.render_timestamp_color_box.setCurrentText("white")
+        self.render_timestamp_position_box = QComboBox()
+        self.render_timestamp_position_box.addItems(
+            ["top left", "top right", "bottom left", "bottom right"])
+        time_row.addWidget(self.render_timestamp_box)
+        time_row.addWidget(QLabel("height (px)"))
+        time_row.addWidget(self.render_timestamp_size_box)
+        time_row.addWidget(self.render_timestamp_color_box)
+        time_row.addWidget(self.render_timestamp_position_box)
+        stamp_layout.addRow("", time_row)
+
+        bar_row = QHBoxLayout()
+        self.render_scalebar_box = QCheckBox("Burn in a scale bar")
+        self.render_scalebar_box.setChecked(True)
+        self.render_scalebar_box.setToolTip(
+            "Burns the bar into the pixels of the saved image or movie.\n\n"
+            "For reading sizes on screen, use napari's own scale bar instead - "
+            "it is always on, sits in the corner of the view, and follows the "
+            "zoom. This one only affects the file that gets written.\n\n"
+            "Both are drawn from the pixel size in the Data tab, so a wrong "
+            "pixel size gives a confidently wrong bar."
+        )
+        self.render_scalebar_auto_box = QCheckBox("auto")
+        self.render_scalebar_auto_box.setChecked(True)
+        self.render_scalebar_auto_box.setToolTip(
+            "Pick a round length - 1, 2 or 5 times a power of ten - covering "
+            "about a seventh of the saved width, and keep it up to date as the "
+            "field of view, pixel size or crop changes."
+        )
+        self.render_scalebar_length_box = QDoubleSpinBox()
+        self.render_scalebar_length_box.setRange(1.0, 1e7)
+        self.render_scalebar_length_box.setDecimals(0)
+        self.render_scalebar_length_box.setValue(1000.0)
+        self.render_scalebar_length_box.setSuffix(" nm")
+        self.render_scalebar_length_box.setEnabled(False)
+        self.render_scalebar_color_box = QComboBox()
+        self.render_scalebar_color_box.addItems(list(smlm_render.OVERLAY_COLORS))
+        self.render_scalebar_color_box.setCurrentText("white")
+        self.render_scalebar_position_box = QComboBox()
+        self.render_scalebar_position_box.addItems(
+            ["bottom right", "bottom left", "top right", "top left"])
+        bar_row.addWidget(self.render_scalebar_box)
+        bar_row.addWidget(self.render_scalebar_auto_box)
+        bar_row.addWidget(QLabel("length (nm)"))
+        bar_row.addWidget(self.render_scalebar_length_box)
+        bar_row.addWidget(self.render_scalebar_color_box)
+        bar_row.addWidget(self.render_scalebar_position_box)
+        stamp_layout.addRow("", bar_row)
+        self.render_scalebar_status = QLabel("-")
+        self.render_scalebar_status.setWordWrap(True)
+        stamp_layout.addRow("", self.render_scalebar_status)
+
+        self.render_scalebar_auto_box.stateChanged.connect(self._on_scalebar_auto_changed)
+        self.render_scalebar_length_box.valueChanged.connect(
+            lambda _v: self._update_scalebar_status())
+        self.render_crop_box = QCheckBox("Save only what is inside the crop box")
+        self.render_crop_box.setToolTip(
+            "Puts a resizable rectangle on the image: drag the middle to move "
+            "it, a handle to resize. Only the region inside it is written, at "
+            "full resolution - the render itself still covers the whole field."
+        )
+        self.render_crop_box.stateChanged.connect(lambda _c: self._sync_render_crop_layer())
+        stamp_layout.addRow("", self.render_crop_box)
+        self.render_crop_status = QLabel("-")
+        self.render_crop_status.setWordWrap(True)
+        stamp_layout.addRow("", self.render_crop_status)
+        layout.addWidget(stamp_group)
+        layout.addStretch(1)
+
+    def _sync_line_edits(self, first, second):
+        """Keep two line edits showing the same path without looping forever."""
+        def copy(source, target):
+            def handler(text):
+                if self._syncing_paths:
+                    return
+                self._syncing_paths = True
+                try:
+                    target.setText(text)
+                finally:
+                    self._syncing_paths = False
+            return handler
+
+        first.textChanged.connect(copy(first, second))
+        second.textChanged.connect(copy(second, first))
+        second.setText(first.text())
+
+    def _build_track_tab(self):
+        """Linking and trajectory analysis, in the order they are used.
+
+        They were two tabs, but nobody links without then analysing: splitting
+        them only meant switching tabs mid-thought and losing sight of the
+        parameters that produced the trajectories being analysed.
+        """
+        tab = QWidget()
+        self.tabs.addTab(tab, "Track")
+        outer_layout = QVBoxLayout(tab)
+        outer_layout.setContentsMargins(0, 0, 0, 0)
+        scroll = QScrollArea(tab)
+        scroll.setWidgetResizable(True)
+        content = QWidget()
+        layout = QVBoxLayout(content)
+        scroll.setWidget(content)
+        outer_layout.addWidget(scroll)
+        self._build_link_section(layout)
+        self._build_trajectory_section(layout)
+
+    def _build_link_section(self, layout):
 
         tracking_group = QGroupBox("Tracking")
         tracking_layout = QFormLayout(tracking_group)
+        # Acquisition timing lives here rather than in the diffusion tab: the
+        # frame interval is what turns a search range into a diffusion
+        # coefficient, and it is the lag time D is fitted against. One setting,
+        # two views of it - edit whichever your acquisition software reports.
+        self.fps_box = QDoubleSpinBox()
+        self.fps_box.setRange(0.001, 1e5)
+        self.fps_box.setDecimals(3)
+        self.fps_box.setValue(100.0)
+        self.fps_box.setSuffix(" fps")
+        tracking_layout.addRow("Acquisition frame rate", self.fps_box)
+        self.frame_interval_box = QDoubleSpinBox()
+        self.frame_interval_box.setRange(0.01, 1e6)
+        self.frame_interval_box.setDecimals(3)
+        self.frame_interval_box.setValue(1000.0 / self.fps_box.value())
+        self.frame_interval_box.setToolTip(
+            "Time between consecutive frames, kept in sync with the frame rate above.\n"
+            "Used both for the linking cutoff below and for D in the trajectory tab."
+        )
+        self.frame_interval_box.setSuffix(" ms")
+        tracking_layout.addRow("Frame interval", self.frame_interval_box)
+        self.fps_box.valueChanged.connect(self._on_fps_changed)
+        # Playback speed is quoted against the acquisition rate, so the Load tab
+        # has to hear about this even though the box lives here.
+        self.fps_box.valueChanged.connect(lambda _v: self._update_playback_status())
+        # The canvas clock turns frames into seconds with it, too.
+        self.fps_box.valueChanged.connect(lambda _v: self._update_time_overlay())
+        self.frame_interval_box.valueChanged.connect(self._on_frame_interval_changed)
+
         self.search_box = QDoubleSpinBox()
         self.search_box.setRange(1.0, 10000.0)
         self.search_box.setValue(250.0)
         self.search_box.setDecimals(0)
+        self.search_box.valueChanged.connect(self._update_link_cutoff_label)
         tracking_layout.addRow("Search range (nm)", self.search_box)
         self.memory_box = QSpinBox()
         self.memory_box.setRange(0, 20)
         self.memory_box.setValue(1)
+        self.memory_box.valueChanged.connect(self._update_link_cutoff_label)
         tracking_layout.addRow("Memory", self.memory_box)
         self.min_traj_box = QSpinBox()
         self.min_traj_box.setRange(1, 1000)
         self.min_traj_box.setValue(2)
         tracking_layout.addRow("Min track length", self.min_traj_box)
+        self.link_cutoff_label = QLabel()
+        self.link_cutoff_label.setWordWrap(True)
+        self.link_cutoff_label.setToolTip(
+            "For 2D Brownian motion the step length over a lag t is Rayleigh distributed\n"
+            "with mean square <r^2> = 4Dt, so the fraction of steps longer than the search\n"
+            "range R is exp(-R^2 / 4Dt). Requiring that to stay under the error rate gives\n"
+            "    D_max = R^2 / (4 t ln(1/error)),\n"
+            "which at 1% means the search range must be ~2.15x the RMS step.\n\n"
+            "Memory extends the lag that has to be covered to (memory + 1) * frame interval.\n"
+            "This is a single-particle bound: it does not account for wrong links, which\n"
+            "come from density rather than step length."
+        )
+        tracking_layout.addRow("", self.link_cutoff_label)
         self.link_button = QPushButton("Link trajectories")
+        self.link_button.setProperty("primary", True)
         self.link_button.clicked.connect(self.link_tracks)
         self.link_button.setEnabled(False)
-        tracking_layout.addRow("", self.link_button)
+        self.link_cancel_button = self._cancel_button(self._link_cancel, "linking")
+        link_buttons = QHBoxLayout()
+        link_buttons.addWidget(self.link_button)
+        link_buttons.addWidget(self.link_cancel_button)
+        tracking_layout.addRow("", link_buttons)
         self.link_progress = QProgressBar()
         self.link_progress.setRange(0, 100)
         self.link_progress.setVisible(False)
@@ -621,6 +2567,46 @@ class LocalizationTrackingWidget(QWidget):
         self.line_width_box.setRange(0.5, 10.0)
         self.line_width_box.setValue(1.5)
         render_layout.addRow("Active track line width", self.line_width_box)
+
+        self.traj_fade_box = QSpinBox()
+        self.traj_fade_box.setRange(0, 1000000)
+        self.traj_fade_box.setValue(0)
+        # 0 is not "no tail" but "no limit", which is what the plain number
+        # cannot say - napari fades the tail out over this many frames.
+        self.traj_fade_box.setSpecialValueText("the whole trajectory")
+        self.traj_fade_box.setSuffix(" frames")
+        self.traj_fade_box.setToolTip(
+            "How far behind the current frame a trajectory stays visible before "
+            "it fades out. Short values show where things are moving now; the "
+            "whole trajectory shows where they have been."
+        )
+        render_layout.addRow("Trail length", self.traj_fade_box)
+
+        accumulate_row = QHBoxLayout()
+        self.traj_accumulate_box = QCheckBox("Accumulate from frame")
+        self.traj_accumulate_box.setToolTip(
+            "Instead of a trail of fixed length, keep everything drawn from a "
+            "chosen frame onwards, so the trajectories build up as the movie "
+            "plays.\n\n"
+            "The trail is regrown as the slider moves, which is what makes it "
+            "reach further back the further in you are."
+        )
+        self.traj_start_frame_box = QSpinBox()
+        self.traj_start_frame_box.setRange(0, 100_000_000)
+        self.traj_start_frame_box.setValue(0)
+        self.traj_start_frame_box.setEnabled(False)
+        accumulate_row.addWidget(self.traj_accumulate_box)
+        accumulate_row.addWidget(self.traj_start_frame_box, 1)
+        render_layout.addRow("", accumulate_row)
+
+        self.traj_fade_status = QLabel("-")
+        self.traj_fade_status.setWordWrap(True)
+        render_layout.addRow("", self.traj_fade_status)
+        self.traj_fade_box.valueChanged.connect(lambda _v: self._on_fade_changed())
+        self.traj_accumulate_box.stateChanged.connect(
+            lambda _c: self._on_accumulate_changed())
+        self.traj_start_frame_box.valueChanged.connect(lambda _v: self._on_fade_changed())
+        self.fps_box.valueChanged.connect(lambda _v: self._update_fade_status())
         self.show_tracks_box = QCheckBox("Show trajectories (active, growing)")
         self.show_tracks_box.setChecked(True)
         render_layout.addRow("", self.show_tracks_box)
@@ -642,22 +2628,16 @@ class LocalizationTrackingWidget(QWidget):
         layout.addWidget(render_group)
         layout.addStretch(1)
 
-        for box in (self.show_tracks_box, self.persist_tracks_box, self.show_all_tracks_box):
-            box.stateChanged.connect(lambda _checked: self.render_overlay())
-        self.line_width_box.valueChanged.connect(lambda _v: self.render_overlay())
-        self.all_tracks_line_width_box.valueChanged.connect(lambda _v: self.render_overlay())
+        # Each control touches only the layer it belongs to. Rebuilding a Tracks
+        # layer costs seconds once there are a few thousand trajectories, so
+        # anything that is only a style change is applied to the live layer.
+        self.show_tracks_box.stateChanged.connect(lambda _checked: self._sync_tracks_layer())
+        self.show_all_tracks_box.stateChanged.connect(lambda _checked: self._sync_all_tracks_layer())
+        self.persist_tracks_box.stateChanged.connect(lambda _checked: self._apply_track_style())
+        self.line_width_box.valueChanged.connect(lambda _v: self._apply_track_style())
+        self.all_tracks_line_width_box.valueChanged.connect(lambda _v: self._apply_track_style())
 
-    def _build_trajectory_analysis_tab(self):
-        tab = QWidget()
-        self.tabs.addTab(tab, "Trajectory analysis")
-        outer_layout = QVBoxLayout(tab)
-        outer_layout.setContentsMargins(0, 0, 0, 0)
-        scroll = QScrollArea(tab)
-        scroll.setWidgetResizable(True)
-        content = QWidget()
-        layout = QVBoxLayout(content)
-        scroll.setWidget(content)
-        outer_layout.addWidget(scroll)
+    def _build_trajectory_section(self, layout):
 
         # --- D (requires a linear MSD fit) ---
         d_group = QGroupBox("Diffusion coefficient D (needs a linear MSD fit)")
@@ -667,21 +2647,39 @@ class LocalizationTrackingWidget(QWidget):
         self.max_lagtime_box.setRange(2, 200)
         self.max_lagtime_box.setValue(5)
         params_row.addRow("Max lag time (frames)", self.max_lagtime_box)
-        self.fps_box = QDoubleSpinBox()
-        self.fps_box.setRange(0.001, 1e5)
-        self.fps_box.setValue(100.0)
-        params_row.addRow("Acquisition frame rate (fps)", self.fps_box)
+        self.d_min_length_box = QSpinBox()
+        self.d_min_length_box.setRange(1, 10000)
+        self.d_min_length_box.setValue(2)
+        self.d_min_length_box.setToolTip(
+            "Second, independent length filter, applied on top of the one used when\n"
+            "linking. Set it higher than the linking filter to fit D only on the\n"
+            "longer trajectories: a linear MSD fit on very few points is noisy, but\n"
+            "short tracks are still worth keeping for display and for the fit-free\n"
+            "metrics. Values at or below the linking filter change nothing."
+        )
+        params_row.addRow("Min track length for D (points)", self.d_min_length_box)
+        timing_note = QLabel(
+            "Frame rate / interval is set in the Link tab: the same number sets the "
+            "lag time behind D and the step length the search range has to cover."
+        )
+        timing_note.setWordWrap(True)
+        params_row.addRow("", timing_note)
         self.msd_sample_box = QSpinBox()
         self.msd_sample_box.setRange(1, 50)
         self.msd_sample_box.setValue(10)
         params_row.addRow("Example trajectories to validate", self.msd_sample_box)
         d_layout.addLayout(params_row)
         self.compute_d_button = QPushButton("Compute D")
+        self.compute_d_button.setProperty("primary", True)
         self.compute_d_button.clicked.connect(self.compute_d)
         self.compute_d_button.setEnabled(False)
-        d_layout.addWidget(self.compute_d_button)
+        self.compute_d_cancel_button = self._cancel_button(self._compute_d_cancel, "the D computation")
+        d_buttons = QHBoxLayout()
+        d_buttons.addWidget(self.compute_d_button)
+        d_buttons.addWidget(self.compute_d_cancel_button)
+        d_layout.addLayout(d_buttons)
         self.compute_d_progress = QProgressBar()
-        self.compute_d_progress.setRange(0, 0)  # indeterminate: tp.imsd has no natural progress granularity
+        self.compute_d_progress.setRange(0, 100)  # batched over trajectories, so real progress
         self.compute_d_progress.setVisible(False)
         d_layout.addWidget(self.compute_d_progress)
 
@@ -697,6 +2695,7 @@ class LocalizationTrackingWidget(QWidget):
         self.d_max_box.setRange(1e-6, 1e6)
         self.d_max_box.setDecimals(6)
         self.d_max_box.setValue(1e2)
+        adaptive_steps(self.d_min_box, self.d_max_box)
         d_bounds_row.addWidget(self.d_max_box)
         d_layout.addLayout(d_bounds_row)
         self._metric_bound_boxes["D"] = (self.d_min_box, self.d_max_box)
@@ -717,16 +2716,17 @@ class LocalizationTrackingWidget(QWidget):
         dist_group = QGroupBox("Distance travelled (fit-free: total path length)")
         dist_layout = QVBoxLayout(dist_group)
         dist_bounds_row = QHBoxLayout()
-        dist_bounds_row.addWidget(QLabel("Min (nm)"))
+        dist_bounds_row.addWidget(QLabel("Min (µm)"))
         self.dist_min_box = QDoubleSpinBox()
-        self.dist_min_box.setRange(0, 1e9)
-        self.dist_min_box.setDecimals(1)
+        self.dist_min_box.setRange(0, 1e6)
+        self.dist_min_box.setDecimals(6)
         dist_bounds_row.addWidget(self.dist_min_box)
-        dist_bounds_row.addWidget(QLabel("Max (nm)"))
+        dist_bounds_row.addWidget(QLabel("Max (µm)"))
         self.dist_max_box = QDoubleSpinBox()
-        self.dist_max_box.setRange(0, 1e9)
-        self.dist_max_box.setDecimals(1)
-        self.dist_max_box.setValue(1000.0)
+        self.dist_max_box.setRange(0, 1e6)
+        self.dist_max_box.setDecimals(6)
+        self.dist_max_box.setValue(1.0)
+        adaptive_steps(self.dist_min_box, self.dist_max_box)
         dist_bounds_row.addWidget(self.dist_max_box)
         dist_layout.addLayout(dist_bounds_row)
         self._metric_bound_boxes["distance"] = (self.dist_min_box, self.dist_max_box)
@@ -734,6 +2734,72 @@ class LocalizationTrackingWidget(QWidget):
         self.dist_min_box.valueChanged.connect(lambda _v: self._on_metric_bounds_changed("distance"))
         self.dist_max_box.valueChanged.connect(lambda _v: self._on_metric_bounds_changed("distance"))
         layout.addWidget(dist_group)
+
+        # --- End-to-end displacement (fit-free) ---
+        net_group = QGroupBox("End-to-end displacement (fit-free: start to finish)")
+        net_group.setToolTip(
+            "How far the molecule ended up from where it started, ignoring the "
+            "route. Compare it with the path length above: the two are similar "
+            "for directed motion and very different for a molecule that wandered."
+        )
+        net_layout = QVBoxLayout(net_group)
+        net_bounds_row = QHBoxLayout()
+        net_bounds_row.addWidget(QLabel("Min (µm)"))
+        self.net_min_box = QDoubleSpinBox()
+        self.net_min_box.setRange(0, 1e6)
+        self.net_min_box.setDecimals(6)
+        net_bounds_row.addWidget(self.net_min_box)
+        net_bounds_row.addWidget(QLabel("Max (µm)"))
+        self.net_max_box = QDoubleSpinBox()
+        self.net_max_box.setRange(0, 1e6)
+        self.net_max_box.setDecimals(6)
+        self.net_max_box.setValue(1.0)
+        adaptive_steps(self.net_min_box, self.net_max_box)
+        net_bounds_row.addWidget(self.net_max_box)
+        net_layout.addLayout(net_bounds_row)
+        self._metric_bound_boxes["net"] = (self.net_min_box, self.net_max_box)
+        net_layout.addWidget(self._make_metric_histogram("net"))
+        self.net_min_box.valueChanged.connect(lambda _v: self._on_metric_bounds_changed("net"))
+        self.net_max_box.valueChanged.connect(lambda _v: self._on_metric_bounds_changed("net"))
+        layout.addWidget(net_group)
+
+        # --- Straightness (fit-free) ---
+        straight_group = QGroupBox("Straightness (end-to-end / path length)")
+        straight_group.setToolTip(
+            "The measure that separates directed motion from diffusion.\n\n"
+            "A molecule travelling in a line approaches 1. An N-step random "
+            "walk sits near 1/sqrt(N) however fast it diffuses - so with 25 "
+            "steps, plain diffusion clusters around 0.2 and anything much above "
+            "that is going somewhere.\n\n"
+            "End-to-end displacement on its own cannot make that distinction, "
+            "because a fast diffuser also ends up a long way from the start; it "
+            "is the comparison with the path length that does."
+        )
+        straight_layout = QVBoxLayout(straight_group)
+        straight_bounds_row = QHBoxLayout()
+        straight_bounds_row.addWidget(QLabel("Min"))
+        self.straight_min_box = QDoubleSpinBox()
+        self.straight_min_box.setRange(0.0, 1.0)
+        self.straight_min_box.setDecimals(3)
+        self.straight_min_box.setSingleStep(0.05)
+        straight_bounds_row.addWidget(self.straight_min_box)
+        straight_bounds_row.addWidget(QLabel("Max"))
+        self.straight_max_box = QDoubleSpinBox()
+        self.straight_max_box.setRange(0.0, 1.0)
+        self.straight_max_box.setDecimals(3)
+        self.straight_max_box.setSingleStep(0.05)
+        self.straight_max_box.setValue(1.0)
+        adaptive_steps(self.straight_min_box, self.straight_max_box)
+        straight_bounds_row.addWidget(self.straight_max_box)
+        straight_layout.addLayout(straight_bounds_row)
+        self._metric_bound_boxes["straightness"] = (
+            self.straight_min_box, self.straight_max_box)
+        straight_layout.addWidget(self._make_metric_histogram("straightness"))
+        self.straight_min_box.valueChanged.connect(
+            lambda _v: self._on_metric_bounds_changed("straightness"))
+        self.straight_max_box.valueChanged.connect(
+            lambda _v: self._on_metric_bounds_changed("straightness"))
+        layout.addWidget(straight_group)
 
         # --- Trajectory duration (fit-free) ---
         dur_group = QGroupBox("Trajectory duration (fit-free)")
@@ -749,6 +2815,7 @@ class LocalizationTrackingWidget(QWidget):
         self.dur_max_box.setRange(0, 1e6)
         self.dur_max_box.setDecimals(3)
         self.dur_max_box.setValue(10.0)
+        adaptive_steps(self.dur_min_box, self.dur_max_box)
         dur_bounds_row.addWidget(self.dur_max_box)
         dur_layout.addLayout(dur_bounds_row)
         self._metric_bound_boxes["duration"] = (self.dur_min_box, self.dur_max_box)
@@ -761,46 +2828,63 @@ class LocalizationTrackingWidget(QWidget):
         color_group = QGroupBox("Trajectory coloring")
         color_layout = QFormLayout(color_group)
         self.color_trajectories_box = QCheckBox("Color trajectories by the metric below")
+        self.color_trajectories_box.setToolTip(
+            "Off by default: every trajectory gets its own colour, which is what "
+            "makes neighbouring tracks tellable apart. Tick this to spend the "
+            "colours on a measurement instead - including time, which is then "
+            "one metric among the others rather than the default."
+        )
         color_layout.addRow("", self.color_trajectories_box)
         self.color_metric_box = QComboBox()
-        self.color_metric_box.addItems(["D (diffusion coefficient)", "Distance travelled", "Track duration"])
+        self.color_metric_box.addItems([
+            "D (diffusion coefficient)", "Distance travelled",
+            "End-to-end displacement", "Straightness (directed vs diffusive)",
+            "Track duration", "Time (frame first seen)",
+        ])
         color_layout.addRow("Metric", self.color_metric_box)
         self.d_colormap_box = QComboBox()
         self.d_colormap_box.addItems(D_COLORMAP_CHOICES)
         self.d_colormap_box.setCurrentText(DEFAULT_D_COLORMAP)
         color_layout.addRow("Colormap", self.d_colormap_box)
+        apply_row = QHBoxLayout()
+        self.live_display_box = QCheckBox("Update live")
+        self.live_display_box.setChecked(True)
+        self.live_display_box.setToolTip(
+            "Recolour the trajectories as soon as a bound changes. Uncheck to set\n"
+            "several values first and apply them in one go."
+        )
+        apply_row.addWidget(self.live_display_box)
+        self.apply_display_button = QPushButton("Apply display settings")
+        self.apply_display_button.clicked.connect(self.apply_display_settings)
+        apply_row.addWidget(self.apply_display_button)
+        apply_row.addStretch(1)
+        color_layout.addRow("", apply_row)
         layout.addWidget(color_group)
 
-        self.color_trajectories_box.stateChanged.connect(self._on_color_settings_changed)
+        self.color_trajectories_box.stateChanged.connect(self._on_color_mode_changed)
         self.color_metric_box.currentTextChanged.connect(self._on_color_settings_changed)
         self.d_colormap_box.currentTextChanged.connect(self._on_color_settings_changed)
 
-        # --- Export ---
-        export_group = QGroupBox("Export")
-        export_layout = QVBoxLayout(export_group)
+        # Export itself lives in the header, reachable from every tab - it was
+        # previously offered from two different tabs, wired to the same handler.
         export_note = QLabel(
-            "Saves every plot shown above, the filtered localizations, linked "
-            "trajectories, per-track metrics, and a metadata.json describing "
-            "the parameters used, into a new \"analysis\" subfolder next to "
-            "the source CSV (analysis_2, analysis_3, ... if already present)."
+            "\"Export...\" in the header above saves every plot, the filtered "
+            "localizations, linked trajectories, per-track metrics and a "
+            "metadata.json of the parameters used, into a new \"analysis\" "
+            "folder next to the source data."
         )
         export_note.setWordWrap(True)
-        export_layout.addWidget(export_note)
-        self.export_button = QPushButton("Export analysis")
-        self.export_button.clicked.connect(self.export_analysis)
-        export_layout.addWidget(self.export_button)
-        layout.addWidget(export_group)
+        export_note.setProperty("role", "note")
+        layout.addWidget(export_note)
         layout.addStretch(1)
 
-    def _build_data_table_tab(self):
-        tab = QWidget()
-        self.tabs.addTab(tab, "Data table")
-        layout = QVBoxLayout(tab)
-        top_row = QHBoxLayout()
+    def _build_data_table_dialog(self):
+        self.data_table_dialog = QDialog(self)
+        self.data_table_dialog.setWindowTitle("Localizations")
+        self.data_table_dialog.resize(900, 600)
+        layout = QVBoxLayout(self.data_table_dialog)
         self.data_table_label = QLabel("No data loaded")
-        top_row.addWidget(self.data_table_label)
-        top_row.addStretch(1)
-        layout.addLayout(top_row)
+        layout.addWidget(self.data_table_label)
         self.data_table_model = PandasTableModel()
         self.data_table_view = QTableView()
         self.data_table_view.setModel(self.data_table_model)
@@ -823,19 +2907,43 @@ class LocalizationTrackingWidget(QWidget):
         self.data_table_model.set_dataframe(self.df_filtered)
         if self.df_filtered is not None:
             self.data_table_label.setText(f"{len(self.df_filtered)} rows x {len(self.df_filtered.columns)} columns")
-        for i in range(self.tabs.count()):
-            if self.tabs.tabText(i) == "Data table":
-                self.tabs.setCurrentIndex(i)
-                break
+        self.data_table_dialog.show()
+        self.data_table_dialog.raise_()
 
     def _frame_offset(self):
-        return -1 if self.frame_one_indexed_box.isChecked() else 0
+        return int(self._frame_shift)
 
-    def _on_frame_offset_changed(self, _checked=None):
+    def shift_frame_numbers(self, step):
+        """Move every localization's frame number, or put it back (step=None).
+
+        Applied as an offset rather than by rewriting the frame column, so it
+        stays reversible and the loaded table keeps the numbers the file
+        actually contained; everything that consumes frames - the overlays,
+        the movie grouping, the linking - reads it through `_frame_offset`.
+        """
+        self._frame_shift = 0 if step is None else self._frame_shift + int(step)
+        self._update_frame_shift_label()
         if self.df is None:
             return
-        self.log("Frame indexing changed - re-link trajectories to use the new offset.")
+        self.log(
+            f"Frame numbers shifted by {self._frame_shift:+d}" if self._frame_shift
+            else "Frame numbers back to the values in the file"
+        )
+        self._invalidate_tracks(reason="frame numbers shifted")
         self.apply_filters()
+
+    def _update_frame_shift_label(self):
+        if not hasattr(self, "frame_shift_label"):
+            return
+        if not self._frame_shift:
+            self.frame_shift_label.setText("no shift")
+        else:
+            first = ""
+            frames = self._render_frames()
+            if frames is not None and frames.size:
+                first = f", first frame now {int(frames.min())}"
+            self.frame_shift_label.setText(f"{self._frame_shift:+d}{first}")
+        self.frame_shift_reset_button.setEnabled(bool(self._frame_shift))
 
     # ------------------------------------------------------------------
     # Data loading (background)
@@ -856,8 +2964,9 @@ class LocalizationTrackingWidget(QWidget):
         self.log("Loading data in the background...")
         self.load_button.setEnabled(False)
         self.load_progress.setVisible(True)
+        self._arm_cancel(self._load_cancel, self.load_cancel_button)
 
-        worker = _load_worker(csv_path, image_path)
+        worker = _load_worker(csv_path, image_path, self._load_cancel)
         worker.returned.connect(lambda result: self._on_load_finished(result, csv_path, image_path))
         worker.errored.connect(self._on_load_errored)
         worker.finished.connect(self._on_load_worker_finished)
@@ -866,6 +2975,7 @@ class LocalizationTrackingWidget(QWidget):
 
     def _on_load_worker_finished(self):
         self.load_button.setEnabled(True)
+        self.load_cancel_button.setEnabled(False)
         self.load_progress.setVisible(False)
         self._load_worker_ref = None
 
@@ -873,10 +2983,23 @@ class LocalizationTrackingWidget(QWidget):
         self.log(f"Failed to load data: {exc}")
 
     def _on_load_finished(self, result, csv_path, image_path):
-        df, image = result
+        if result is CANCELLED:
+            self.log("Loading cancelled")
+            return
+        df, image, how, acquisition = result
         self.viewer.layers.clear()
         if image is not None:
-            self.viewer.add_image(image, name=Path(image_path).name, colormap="gray")
+            self.viewer.add_image(
+                image, name=Path(image_path).name, colormap="gray",
+                **self._placed({}, image.ndim))
+            self.log(f"Image {tuple(image.shape)} {image.dtype}: {how}")
+            # The pixel size may move here, so the units follow rather than lead.
+            self._apply_acquisition_metadata(acquisition)
+            self._apply_viewer_scale()
+            # A stack measured in nanometres is hundreds of times "bigger" than
+            # one measured in pixels, and a camera left where the previous world
+            # put it opens somewhere deep inside the first field of view.
+            self._reset_view()
 
         auto_loaded = False
         if df is None and not csv_path and image_path:
@@ -887,6 +3010,10 @@ class LocalizationTrackingWidget(QWidget):
                     csv_path = str(found)
                     self.csv_edit.setText(csv_path)
                     auto_loaded = True
+                    # Before ingesting: filter bounds restored now are applied to
+                    # the table as it arrives, rather than leaving a filtered
+                    # export on screen under controls that say otherwise.
+                    self._restore_previous_run_settings(found)
                 except Exception as exc:
                     self.log(f"Found candidate localizations file {found.name} but could not read it: {exc}")
 
@@ -905,6 +3032,90 @@ class LocalizationTrackingWidget(QWidget):
                 "Use the Localize (2D) tab to detect and fit localizations, "
                 "or load a CSV above to import localizations from elsewhere."
             )
+
+    def _apply_acquisition_metadata(self, acquisition):
+        """Fill the acquisition parameters in from what the microscope recorded.
+
+        Every change is logged with the value it replaced and the field it came
+        from. That is the whole safety net here: these boxes decide what the
+        physical results mean, so silently moving one would be worse than not
+        moving it at all, and the log line is what lets the user notice and undo
+        a value that belongs to a different microscope than they thought.
+        """
+        values = (acquisition or {}).get("values") or {}
+        sources = (acquisition or {}).get("sources") or {}
+        if not values:
+            self.log("No acquisition metadata found alongside the image - "
+                     "the parameters in the Data tab are unchanged.")
+            return
+
+        for key, attr, label, template in ACQUISITION_AUTOFILL:
+            if key not in values:
+                continue
+            box = getattr(self, attr, None)
+            if box is None:
+                continue
+            before = box.value()
+            box.setValue(float(values[key]))
+            after = box.value()  # setValue clamps to the control's range
+            if abs(after - before) <= 1e-9:
+                continue
+            self.log(f"{label}: {template.format(before)} -> "
+                     f"{template.format(after)}, from {sources.get(key, 'the metadata')}")
+
+        context = [f"{label} {template.format(values[key])}"
+                   for key, label, template in ACQUISITION_CONTEXT if key in values]
+        if context:
+            self.log("Acquisition: " + ", ".join(context))
+
+        if "pixel_size_nm" not in values:
+            # Micro-Manager records 0.0 for an objective nobody calibrated, and
+            # the magnification alone cannot recover it without the sensor pitch.
+            note = ("Pixel size is not recorded in this acquisition, so "
+                    f"{self.pixel_size_box.value():.1f} nm/px was left as it was")
+            if "objective" in values:
+                note += f" - check it against the {values['objective']} objective"
+            self.log(note + ".")
+        self._update_scalebar_status()
+
+    def _restore_previous_run_settings(self, locs_path):
+        """Restore the settings of the run that produced an auto-loaded table.
+
+        An auto-loaded table is usually a *filtered* export, so loading it
+        without its parameters puts data on screen that the controls actively
+        misdescribe: bounds that were applied showing as wide open, a pixel size
+        that is not the one those coordinates were computed with. The point of
+        picking the table up automatically is to carry on where that run left
+        off, and that only holds if the controls come with it.
+        """
+        locs_path = Path(locs_path)
+        # The exporter writes metadata.json at the root of the analysis folder
+        # and the tables into data/ beneath it, so look beside and one level up.
+        for folder in (locs_path.parent, locs_path.parent.parent):
+            candidate = folder / "metadata.json"
+            try:
+                if not candidate.is_file():
+                    continue
+            except OSError:
+                continue
+            try:
+                with open(candidate, encoding="utf-8") as handle:
+                    metadata = json.load(handle)
+            except Exception as exc:
+                self.log(f"Found {candidate.name} from that run but could not read it: {exc}")
+                return
+            applied, _skipped, notes = self.apply_settings(metadata)
+            exported = metadata.get("exported_at")
+            self.log(
+                f"Restored {len(applied)} settings from that run's {candidate.name}"
+                + (f", exported {exported}" if exported else "")
+                + " - the controls now describe the data being shown."
+            )
+            for note in notes:
+                self.log(f"  note: {note}")
+            return
+        self.log("No metadata.json beside those localizations, so the parameters "
+                 "on screen are not necessarily the ones that produced them.")
 
     def _find_companion_file(self, base_path, filename_patterns, analysis_relative_path=None):
         base_path = Path(base_path)
@@ -951,6 +3162,7 @@ class LocalizationTrackingWidget(QWidget):
         self._track_msd_cache = None
         self.compute_d_button.setEnabled(True)
         self._start_fit_free_metrics_worker()
+        self._update_status_header()
         self.log(
             f"Auto-detected and loaded {self.tracks['particle'].nunique()} pre-linked "
             f"trajectories from {found.name}"
@@ -968,20 +3180,23 @@ class LocalizationTrackingWidget(QWidget):
         self._track_diffusion_cache = None
         self._track_msd_cache = None
         self._track_distance_cache = None
+        self._track_net_cache = None
+        self._track_straightness_cache = None
         self._track_duration_cache = None
         self.log(log_message)
 
         if frame_is_zero_indexed:
-            self.frame_one_indexed_box.blockSignals(True)
-            self.frame_one_indexed_box.setChecked(False)
-            self.frame_one_indexed_box.blockSignals(False)
+            self._frame_shift = 0
         else:
+            # A table whose first frame is 1 is almost certainly 1-indexed, so
+            # start it shifted; the buttons under the CSV field undo or extend
+            # that if the guess is wrong.
             frame_col = self._resolve_column("frame")
+            self._frame_shift = 0
             if frame_col and frame_col in self.df.columns and not self.df[frame_col].empty:
-                min_frame = self.df[frame_col].min()
-                self.frame_one_indexed_box.blockSignals(True)
-                self.frame_one_indexed_box.setChecked(bool(min_frame == 1))
-                self.frame_one_indexed_box.blockSignals(False)
+                if int(self.df[frame_col].min()) == 1:
+                    self._frame_shift = -1
+                    self.log("Frame numbers start at 1: shifted by -1 to match the image stack")
 
         self._build_filter_tab_contents()
         self.apply_filters_button.setEnabled(True)
@@ -993,6 +3208,9 @@ class LocalizationTrackingWidget(QWidget):
         self.render_overlay()
         self._sync_xy_roi_layer()
         self.viewer.tooltip.visible = True
+        self._refresh_render_tab()
+        self._update_frame_shift_label()
+        self._update_status_header()
         self.data_table_model.set_dataframe(self.df_filtered)
         self.data_table_label.setText(f"{len(self.df_filtered)} rows x {len(self.df_filtered.columns)} columns")
 
@@ -1000,8 +3218,17 @@ class LocalizationTrackingWidget(QWidget):
     # Localize (2D): detection + sub-pixel Gaussian fitting
     # ------------------------------------------------------------------
     def _get_localize_image_layer(self):
+        return self._source_image_layer()
+
+    def _source_image_layer(self):
+        """The raw stack: the first Image layer this plugin did not produce.
+
+        Renders are Image layers too, so without the exclusion the Localize tab
+        would happily start detecting spots inside a reconstruction, and the
+        next render would take its field of view from the previous one.
+        """
         for layer in list(self.viewer.layers.selection) + list(self.viewer.layers):
-            if isinstance(layer, napari.layers.Image):
+            if isinstance(layer, napari.layers.Image) and layer.name not in DERIVED_IMAGE_LAYERS:
                 return layer
         return None
 
@@ -1035,7 +3262,7 @@ class LocalizationTrackingWidget(QWidget):
             self._loc2d_counts = np.zeros(stack.shape[0], dtype=int)
 
         y, x, ng = identify_in_frame(
-            stack[frame_idx].astype(np.float32, copy=False), self.loc_min_ng_box.value(), box
+            np.asarray(stack[frame_idx], dtype=np.float32), self.loc_min_ng_box.value(), box
         )
         self._loc2d_candidates[frame_idx] = (y, x, ng)
         self._loc2d_counts[frame_idx] = len(y)
@@ -1056,8 +3283,9 @@ class LocalizationTrackingWidget(QWidget):
         self.loc_detect_button.setEnabled(False)
         self.loc_detect_progress.setVisible(True)
         self.loc_detect_progress.setValue(0)
+        self._arm_cancel(self._loc2d_detect_cancel, self.loc_detect_cancel_button)
 
-        worker = _detect_worker(stack, box, min_ng)
+        worker = _detect_worker(stack, box, min_ng, self._loc2d_detect_cancel)
         worker.yielded.connect(lambda frac: self.loc_detect_progress.setValue(int(frac * 100)))
         worker.returned.connect(self._on_loc2d_detect_finished)
         worker.errored.connect(lambda exc: self.log(f"Detection failed: {exc}"))
@@ -1067,10 +3295,14 @@ class LocalizationTrackingWidget(QWidget):
 
     def _on_loc2d_detect_worker_finished(self):
         self.loc_detect_button.setEnabled(True)
+        self.loc_detect_cancel_button.setEnabled(False)
         self.loc_detect_progress.setVisible(False)
         self._loc2d_detect_worker_ref = None
 
     def _on_loc2d_detect_finished(self, result):
+        if result is CANCELLED:
+            self.log("Detection cancelled - no candidates were kept")
+            return
         candidates, counts = result
         self._loc2d_candidates = candidates
         self._loc2d_counts = counts
@@ -1084,60 +3316,114 @@ class LocalizationTrackingWidget(QWidget):
         figure = self.loc_counts_figure
         figure.clear()
         if self._loc2d_counts is None or len(self._loc2d_counts) == 0:
+            figure.patch.set_facecolor(PANEL_BG)
             self.loc_counts_canvas.draw_idle()
             return
         ax = figure.add_subplot(111)
-        ax.plot(np.arange(len(self._loc2d_counts)), self._loc2d_counts, color="#ff9800", linewidth=1.2)
+        ax.plot(np.arange(len(self._loc2d_counts)), self._loc2d_counts,
+                color=ACCENT, linewidth=1.2)
+        ax.fill_between(np.arange(len(self._loc2d_counts)), self._loc2d_counts,
+                        color=ACCENT, alpha=0.18)
         ax.set_xlabel("Frame")
         ax.set_ylabel("Detections")
-        ax.set_title("Detections vs frame")
-        ax.grid(alpha=0.3)
+        style_axes(figure, ax, title="Detections vs frame")
         figure.tight_layout()
         self.loc_counts_canvas.draw_idle()
 
     def _update_loc2d_candidate_overlay(self):
-        # This is the one place in the plugin that still does per-frame
-        # Python work (rebuilding a Shapes layer of candidate boxes), since
-        # it has to track the current frame. It's only useful as a detection
-        # preview aid, so skip it entirely - not just cheaply, but with zero
-        # work - whenever the Localize tab isn't the one showing, or the user
-        # has turned it off, so scrubbing through the movie on other tabs
-        # (with locs/tracks overlaid) never triggers it.
-        show = (
-            bool(self._loc2d_candidates)
-            and self.tabs.tabText(self.tabs.currentIndex()) == "Localize (2D)"
-            and self.loc_show_candidates_box.isChecked()
-        )
-        if not show:
-            self._remove_layer(LOC2D_CANDIDATES_LAYER_NAME)
-            return
-        frame_idx = self._get_current_frame()
-        if frame_idx < 0 or frame_idx >= len(self._loc2d_candidates):
-            self._remove_layer(LOC2D_CANDIDATES_LAYER_NAME)
-            return
-        cand = self._loc2d_candidates[frame_idx]
-        if cand is None or len(cand[0]) == 0:
-            self._remove_layer(LOC2D_CANDIDATES_LAYER_NAME)
-            return
-        y, x, _ = cand
-        half = self._loc2d_box_size() / 2.0
-        centers = np.column_stack([np.asarray(y, dtype=np.float64), np.asarray(x, dtype=np.float64)])
-        offsets = np.array([[-half, -half], [-half, half], [half, half], [half, -half]])
-        rects = centers[:, None, :] + offsets[None, :, :]  # (N, 4, 2), vectorized instead of a per-box Python loop
-        if LOC2D_CANDIDATES_LAYER_NAME in self.viewer.layers:
-            self.viewer.layers[LOC2D_CANDIDATES_LAYER_NAME].data = rects
-        else:
-            self.viewer.add_shapes(
-                rects,
-                name=LOC2D_CANDIDATES_LAYER_NAME,
-                shape_type="rectangle",
-                edge_color="yellow",
-                face_color="transparent",
-                edge_width=1,
-            )
+        """Show the detection candidates as squares, on every frame at once.
 
-    def _on_tab_changed(self, _index=None):
-        self._update_loc2d_candidate_overlay()
+        The candidates carry their frame index as their first coordinate, so
+        napari slices them itself as the dims slider moves - exactly like the
+        localizations layer. The earlier version rebuilt a per-frame Shapes
+        layer from a timer hooked to `dims.events.current_step`, which meant
+        the boxes only appeared if that callback fired, only while the Localize
+        tab happened to be showing, and cost a layer rebuild per frame while
+        scrubbing. A Points layer with square symbols draws the same thing with
+        none of that: no callback to miss, no tab gate, and no per-frame work
+        at all (napari handles hundreds of thousands of points comfortably,
+        where a Shapes layer of the same size is unusable - which is why the
+        per-frame rebuild existed in the first place).
+        """
+        frames, centres = self._loc2d_candidate_points()
+        if centres is None or not self.loc_show_candidates_box.isChecked():
+            self._remove_layer(LOC2D_CANDIDATES_LAYER_NAME)
+            return
+
+        coords = np.column_stack([frames, centres[:, 0], centres[:, 1]])
+        size = float(self._loc2d_box_size())
+        if LOC2D_CANDIDATES_LAYER_NAME in self.viewer.layers:
+            layer = self.viewer.layers[LOC2D_CANDIDATES_LAYER_NAME]
+            layer.data = coords
+            layer.size = size
+            layer.visible = True
+            return
+        kwargs = dict(
+            name=LOC2D_CANDIDATES_LAYER_NAME,
+            symbol="square",
+            size=size,
+            face_color="transparent",
+        )
+        # napari renamed the Points outline from edge_* to border_* in 0.5.
+        if napari.__version__.startswith("0.4"):
+            kwargs.update(edge_color="yellow", edge_width=0.08, edge_width_is_relative=True)
+        else:
+            kwargs.update(border_color="yellow", border_width=0.08, border_width_is_relative=True)
+        try:
+            self.viewer.add_points(
+                coords, **self._placed(kwargs, np.asarray(coords).shape[-1]))
+            self._apply_viewer_scale()
+        except Exception as exc:
+            self.log(f"Could not draw the detection candidates: {exc}")
+
+    def _loc2d_candidate_points(self):
+        """(frame index, (y, x)) for every detected candidate, or (None, None)."""
+        per_frame = [
+            (index, cand) for index, cand in enumerate(self._loc2d_candidates or [])
+            if cand is not None and len(cand[0]) > 0
+        ]
+        if not per_frame:
+            return None, None
+        frames = np.concatenate([
+            np.full(len(cand[0]), index, dtype=np.float64) for index, cand in per_frame
+        ])
+        centres = np.concatenate([
+            np.column_stack([np.asarray(cand[0], dtype=np.float64),
+                             np.asarray(cand[1], dtype=np.float64)])
+            for _index, cand in per_frame
+        ])
+        return frames, centres
+
+    def _on_tab_changed(self, index=None):
+        if index is not None and index == getattr(self, "_localize_tab_index", None):
+            self._start_fit_kernel_warmup()
+        # The x/y filter box appears with the Filter tab and goes away again
+        # unless it is actually cropping something.
+        if self.df is not None:
+            self._sync_xy_roi_layer()
+
+    def _start_fit_kernel_warmup(self):
+        """Compile the numba fit kernels in the background on first tab open.
+
+        cache=True persists them to __pycache__, but an editable install
+        invalidates that cache on every pull, and paying the compile inside the
+        first fit looks like a hang.
+        """
+        if self._loc2d_warmup_started or not is_numba_available():
+            return
+        self._loc2d_warmup_started = True
+        worker = _warmup_worker()
+        worker.returned.connect(
+            lambda elapsed: self.log(f"Fit kernels compiled in {elapsed:.1f} s")
+            if elapsed > 0.5 else None
+        )
+        worker.errored.connect(lambda exc: self.log(f"Fit kernel warmup failed: {exc}"))
+        worker.finished.connect(self._on_warmup_worker_finished)
+        self._loc2d_warmup_worker_ref = worker
+        worker.start()
+
+    def _on_warmup_worker_finished(self):
+        self._loc2d_warmup_worker_ref = None
 
     def loc2d_fit_all(self):
         layer = self._get_localize_image_layer()
@@ -1158,8 +3444,11 @@ class LocalizationTrackingWidget(QWidget):
         self.loc_fit_button.setEnabled(False)
         self.loc_fit_progress.setVisible(True)
         self.loc_fit_progress.setValue(0)
+        self._arm_cancel(self._loc2d_fit_cancel, self.loc_fit_cancel_button)
 
-        worker = _fit_worker(stack, self._loc2d_candidates, box, backend, offset, gain)
+        worker = _fit_worker(
+            stack, self._loc2d_candidates, box, backend, offset, gain, self._loc2d_fit_cancel
+        )
         worker.yielded.connect(lambda frac: self.loc_fit_progress.setValue(int(frac * 100)))
         worker.returned.connect(self._on_loc2d_fit_finished)
         worker.errored.connect(lambda exc: self.log(f"Fitting failed: {exc}"))
@@ -1169,10 +3458,14 @@ class LocalizationTrackingWidget(QWidget):
 
     def _on_loc2d_fit_worker_finished(self):
         self.loc_fit_button.setEnabled(True)
+        self.loc_fit_cancel_button.setEnabled(False)
         self.loc_fit_progress.setVisible(False)
         self._loc2d_fit_worker_ref = None
 
     def _on_loc2d_fit_finished(self, locs):
+        if locs is CANCELLED:
+            self.log("Fitting cancelled - localizations from finished frames were discarded")
+            return
         n = len(locs["x"])
         if n == 0:
             self.log("Fitting produced no localizations")
@@ -1192,7 +3485,9 @@ class LocalizationTrackingWidget(QWidget):
                 "net_gradient": locs["net_gradient"].astype(float),
             }
         )
-        self._remove_layer(LOC2D_CANDIDATES_LAYER_NAME)
+        # The candidate squares stay: seeing which detections the fit kept, and
+        # which it threw away, is the point of having both overlays. Untick
+        # "Show detection candidates" on the Localize tab to hide them.
         self._ingest_localization_dataframe(
             df,
             f"Fitted {n} localizations from the loaded image stack (in-app 2D localization)",
@@ -1200,12 +3495,916 @@ class LocalizationTrackingWidget(QWidget):
         )
 
     # ------------------------------------------------------------------
+    # Render (SMLM): reconstructing an image from the localizations
+    # ------------------------------------------------------------------
+    def _on_render_mode_changed(self, *_args):
+        mode = self.render_mode_box.currentData()
+        for widget in (self.render_sigma_label, self.render_sigma_box):
+            widget.setVisible(mode == "gaussian_global")
+        for widget in (self.render_sigma_column_label, self.render_sigma_column_box,
+                       self.render_clamp_label, self.render_sigma_min_box,
+                       self.render_sigma_max_box):
+            widget.setVisible(mode == "gaussian_local")
+        # Counting a localization once is the point of a scatter render; a
+        # photon weight would only turn it back into a brightness map.
+        self.render_photons_box.setEnabled(mode != "scatter")
+        self._update_render_info()
+
+    def _on_render_grouping_changed(self, *_args):
+        sliding = self.render_grouping_box.currentData() == "sliding"
+        self.render_step_label.setVisible(sliding)
+        self.render_step_box.setVisible(sliding)
+        self._update_render_info()
+
+    def _populate_render_sigma_columns(self):
+        """Offer the columns that could describe how wide to draw a molecule."""
+        columns = []
+        if self.df is not None:
+            for column in self.df.columns:
+                name = str(column).lower()
+                if ("uncert" in name or "precision" in name or name.startswith("lp")
+                        or is_sigma_column(column)):
+                    columns.append(str(column))
+        previous = self.render_sigma_column_box.currentText()
+        self.render_sigma_column_box.blockSignals(True)
+        self.render_sigma_column_box.clear()
+        self.render_sigma_column_box.addItems(columns)
+        preferred = self.column_map.get("uncertainty")
+        if previous in columns:
+            self.render_sigma_column_box.setCurrentText(previous)
+        elif preferred and str(preferred) in columns:
+            self.render_sigma_column_box.setCurrentText(str(preferred))
+        self.render_sigma_column_box.blockSignals(False)
+
+    def _render_positions_px(self):
+        """(x, y) in camera pixels for the localizations that pass the filters."""
+        df = self.df_filtered
+        if df is None or df.empty:
+            return None, None
+        x_col = self._resolve_column("x")
+        y_col = self._resolve_column("y")
+        if not x_col or not y_col or x_col not in df.columns or y_col not in df.columns:
+            return None, None
+        pixel_size = max(self.pixel_size_box.value(), 1e-9)
+        return (df[x_col].to_numpy(dtype=float) / pixel_size,
+                df[y_col].to_numpy(dtype=float) / pixel_size)
+
+    def _render_frames(self):
+        df = self.df_filtered
+        if df is None or df.empty:
+            return None
+        frame_col = self._resolve_column("frame")
+        if not frame_col or frame_col not in df.columns:
+            return None
+        return df[frame_col].to_numpy(dtype=np.int64) + self._frame_offset()
+
+    def _refresh_render_tab(self):
+        """Re-read what the Render tab summarises, after any change to the data.
+
+        The extent and frame range are cached here rather than recomputed in
+        `_update_render_info`, which runs on every spin-box keystroke - a full
+        pass over a million localizations per keystroke is exactly the kind of
+        thing that makes a panel feel stuck.
+        """
+        if not hasattr(self, "render_source_label"):
+            return
+        self._render_frame_range = None
+        self._render_extent_px = None
+        x, y = self._render_positions_px()
+        if x is not None and x.size:
+            finite = np.isfinite(x) & np.isfinite(y)
+            if finite.any():
+                self._render_extent_px = (
+                    float(y[finite].min()), float(x[finite].min()),
+                    float(y[finite].max()), float(x[finite].max()),
+                )
+        frames = self._render_frames()
+        if frames is not None and frames.size:
+            self._render_frame_range = (int(frames.min()), int(frames.max()))
+
+        count = 0 if self.df_filtered is None else len(self.df_filtered)
+        self.render_source_label.setText(
+            f"{count} localizations pass the current filters"
+            if self._render_extent_px else "No localizations loaded"
+        )
+        self.render_image_button.setEnabled(self._render_extent_px is not None)
+        self.render_movie_button.setEnabled(
+            self._render_extent_px is not None and self._render_frame_range is not None
+        )
+        self._populate_render_sigma_columns()
+        self._update_render_info()
+
+    def _render_field_of_view(self):
+        """(shape, origin, source_layer) of the render, in camera pixels.
+
+        With a raw stack loaded the render covers exactly it, so the two overlay
+        pixel for pixel. Without one, the render covers the whole camera pixels
+        the localizations fall in - the same grid the image would have imposed,
+        so a table renders identically whether or not its image is open.
+        """
+        layer = self._source_image_layer()
+        shape = getattr(getattr(layer, "data", None), "shape", None)
+        if shape is not None and len(shape) >= 2:
+            return (int(shape[-2]), int(shape[-1])), (-0.5, -0.5), layer
+
+        extent = getattr(self, "_render_extent_px", None)
+        if not extent:
+            return None, None, None
+        min_y, min_x, max_y, max_x = extent
+        first_row, first_col = float(np.floor(min_y)), float(np.floor(min_x))
+        rows = int(np.floor(max_y) - first_row) + 1
+        cols = int(np.floor(max_x) - first_col) + 1
+        return (rows, cols), (first_row - 0.5, first_col - 0.5), None
+
+    def _render_movie_frame_count(self):
+        if not getattr(self, "_render_frame_range", None):
+            return None
+        first, last = self._render_frame_range
+        return smlm_render.group_count(
+            first, last, self.render_frames_per_box.value(),
+            self.render_grouping_box.currentData(), self.render_step_box.value(),
+        )
+
+    def _update_render_info(self):
+        if not hasattr(self, "render_size_label"):
+            return
+        oversampling = self.render_oversampling_box.value()
+        super_pixel_nm = self.pixel_size_box.value() / oversampling
+        shape, _origin, _layer = self._render_field_of_view()
+        if shape is None:
+            self.render_size_label.setText(
+                f"Super-resolved pixel {super_pixel_nm:.1f} nm. Load localizations "
+                "to see the output size."
+            )
+            self.render_movie_label.setText("-")
+            return
+
+        rows, cols = smlm_render.output_shape(shape, oversampling)
+        frame_bytes = smlm_render.estimate_bytes(shape, oversampling)
+        self.render_size_label.setText(
+            f"{shape[1]} x {shape[0]} camera px -> {cols} x {rows} super-resolved px "
+            f"at {super_pixel_nm:.1f} nm/px, {frame_bytes / 1e9:.2f} GB per frame"
+            + ("" if frame_bytes <= RENDER_MAX_BYTES else "  - too large, reduce the oversampling")
+        )
+
+        n_movie_frames = self._render_movie_frame_count()
+        if not n_movie_frames:
+            self.render_movie_label.setText("Load localizations with a frame column to render a movie.")
+            return
+        total = frame_bytes * n_movie_frames
+        message = f"{n_movie_frames} super-resolved frames, {total / 1e9:.2f} GB in memory"
+        if total > RENDER_MAX_BYTES:
+            message += "  - too large, reduce the oversampling or use more raw frames per frame"
+        if self.render_grouping_box.currentData() == "sliding":
+            overlap = self.render_frames_per_box.value() / max(self.render_step_box.value(), 1)
+            if overlap > RENDER_OVERLAP_WARN:
+                message += (
+                    f"  - each localization is redrawn ~{overlap:.0f}x because the "
+                    "windows overlap that much; a larger step renders far faster"
+                )
+        self.render_movie_label.setText(message)
+        self._update_scalebar_status()
+
+    def _render_inputs(self):
+        """Everything the engine needs, or None once the reason has been logged."""
+        x, y = self._render_positions_px()
+        if x is None or x.size == 0:
+            self.log("Load or fit localizations before rendering")
+            return None
+        shape, origin, source_layer = self._render_field_of_view()
+        if shape is None:
+            self.log("Could not work out a field of view to render into")
+            return None
+
+        pixel_size = max(self.pixel_size_box.value(), 1e-9)
+        mode = self.render_mode_box.currentData()
+        options = {
+            "x_px": x, "y_px": y, "shape": shape, "origin": origin,
+            "oversampling": self.render_oversampling_box.value(), "mode": mode,
+        }
+        info = {
+            "mode": mode,
+            "mode_label": smlm_render.MODES[mode],
+            "oversampling": options["oversampling"],
+            "pixel_size_nm_per_px": self.pixel_size_box.value(),
+            "super_resolved_pixel_size_nm": pixel_size / options["oversampling"],
+            "field_of_view_camera_px": [int(shape[0]), int(shape[1])],
+            "origin_camera_px": [float(origin[0]), float(origin[1])],
+            "field_of_view_from": "image layer" if source_layer is not None else "localization extent",
+            "n_localizations": int(x.size),
+            "value_units": "localizations per pixel",
+        }
+
+        if mode == "gaussian_global":
+            options["global_sigma_px"] = self.render_sigma_box.value() / pixel_size
+            info["global_sigma_nm"] = self.render_sigma_box.value()
+        elif mode == "gaussian_local":
+            column = self.render_sigma_column_box.currentText()
+            if not column or column not in self.df_filtered.columns:
+                self.log(
+                    "No localization-precision column to take the width from - "
+                    "pick another render mode, or one of the columns in the list."
+                )
+                return None
+            low = self.render_sigma_min_box.value()
+            high = max(self.render_sigma_max_box.value(), low)
+            widths = np.clip(self.df_filtered[column].to_numpy(dtype=float), low, high)
+            options["sigma_px"] = widths / pixel_size
+            info.update({"sigma_column": column, "sigma_clamp_nm": [low, high]})
+
+        if mode != "scatter" and self.render_photons_box.isChecked():
+            column = self._resolve_column("intensity")
+            if column and column in self.df_filtered.columns:
+                options["weights"] = self.df_filtered[column].to_numpy(dtype=float)
+                info["weighted_by"] = column
+                info["value_units"] = "photons per pixel"
+            else:
+                self.log("No photon-count column found - rendering unweighted counts")
+
+        return options, info, source_layer
+
+    def _render_size_is_sane(self, shape, oversampling, n_frames):
+        needed = smlm_render.estimate_bytes(shape, oversampling, n_frames)
+        if needed <= RENDER_MAX_BYTES:
+            return True
+        rows, cols = smlm_render.output_shape(shape, oversampling)
+        self.log(
+            f"Refusing to render {n_frames} x {cols}x{rows} px = {needed / 1e9:.1f} GB "
+            f"(the limit is {RENDER_MAX_BYTES / 1e9:.0f} GB). Reduce the oversampling"
+            + (", or group more raw frames per super-resolved frame." if n_frames > 1 else ".")
+        )
+        return False
+
+    def render_smlm_image(self):
+        prepared = self._render_inputs()
+        if prepared is None:
+            return
+        options, info, source_layer = prepared
+        if not self._render_size_is_sane(options["shape"], options["oversampling"], 1):
+            return
+        options["gpu"], why = smlm_render.choose_backend(
+            options["shape"], options["oversampling"], self.render_gpu_box.isChecked()
+        )
+        info["backend"] = "gpu" if options["gpu"] else "cpu"
+        info["kind"] = "image"
+        self.render_backend_label.setText(why)
+        self.log(f"Rendering {info['n_localizations']} localizations ({info['mode_label']}) - {why}...")
+        self._start_render("image", options, info, source_layer)
+
+    def render_smlm_movie(self):
+        prepared = self._render_inputs()
+        if prepared is None:
+            return
+        options, info, source_layer = prepared
+        frames = self._render_frames()
+        if frames is None or frames.size == 0:
+            self.log("The localizations have no frame column, so there is nothing to make a movie over")
+            return
+
+        grouping = self.render_grouping_box.currentData()
+        per_group = self.render_frames_per_box.value()
+        step = self.render_step_box.value()
+        # Where the movie begins. Localizations before it fall outside every
+        # group and are dropped by the engine's own frame lookup, so a
+        # cumulative movie accumulates from here rather than from whatever the
+        # earliest surviving localization happens to be.
+        last_frame = int(frames.max())
+        start_frame = max(int(frames.min()), self.render_start_frame_box.value())
+        if start_frame > last_frame:
+            self.log(
+                f"Nothing to render: the movie is set to start at frame "
+                f"{start_frame}, after the last localization at {last_frame}."
+            )
+            return
+        options["frame_range"] = (start_frame, last_frame)
+        n_movie_frames = smlm_render.group_count(
+            start_frame, last_frame, per_group, grouping, step)
+        if not self._render_size_is_sane(
+                options["shape"], options["oversampling"], n_movie_frames):
+            return
+        options["gpu"], why = smlm_render.choose_backend(
+            options["shape"], options["oversampling"], self.render_gpu_box.isChecked()
+        )
+        options.update({
+            "frames": frames, "frames_per_group": per_group,
+            "grouping": grouping, "step": step,
+        })
+        stride = step if grouping == "sliding" else per_group
+        info.update({
+            "kind": "movie",
+            "backend": "gpu" if options["gpu"] else "cpu",
+            "frames_per_group": per_group,
+            "grouping": grouping,
+            "grouping_label": smlm_render.GROUPINGS[grouping],
+            "window_step_frames": step if grouping == "sliding" else None,
+            "n_movie_frames": n_movie_frames,
+            "first_raw_frame": start_frame,
+            "last_raw_frame": last_frame,
+            "raw_frames_per_movie_frame": stride,
+            "frame_interval_s": self._frame_interval_s() * stride,
+        })
+        self.render_backend_label.setText(why)
+        self.log(
+            f"Rendering a {n_movie_frames}-frame movie ({info['grouping_label']}, "
+            f"{per_group} raw frames per frame) - {why}..."
+        )
+        self._start_render("movie", options, info, source_layer)
+
+    def _start_render(self, kind, options, info, source_layer):
+        self._set_render_busy(True)
+        self.render_progress.setVisible(True)
+        self.render_progress.setValue(0)
+        self._arm_cancel(self._render_cancel, self.render_cancel_button)
+        started = time.perf_counter()
+
+        worker = _render_worker(kind, options, self._render_cancel)
+        worker.yielded.connect(lambda fraction: self.render_progress.setValue(int(fraction * 100)))
+        worker.returned.connect(
+            lambda result: self._on_render_finished(result, kind, info, source_layer, options, started)
+        )
+        worker.errored.connect(lambda exc: self.log(f"Rendering failed: {exc}"))
+        worker.finished.connect(self._on_render_worker_finished)
+        self._render_worker_ref = worker
+        worker.start()
+
+    def _set_render_busy(self, busy):
+        self.render_image_button.setEnabled(not busy and self._render_extent_px is not None)
+        self.render_movie_button.setEnabled(
+            not busy and self._render_extent_px is not None
+            and getattr(self, "_render_frame_range", None) is not None
+        )
+
+    def _on_render_worker_finished(self):
+        self._set_render_busy(False)
+        self.render_cancel_button.setEnabled(False)
+        self.render_progress.setVisible(False)
+        self._render_worker_ref = None
+
+    def _on_render_finished(self, result, kind, info, source_layer, options, started):
+        if result is CANCELLED:
+            self.log("Rendering cancelled")
+            return
+        if isinstance(result, _RenderFailure):
+            self.log(f"Rendering failed: {result.error}")
+            return
+        result, backend = result
+        info = dict(info)
+        if backend != info["backend"]:
+            self.log("The GPU render failed part way - it was finished on the CPU instead")
+            info["backend"] = backend
+        info["render_seconds"] = round(time.perf_counter() - started, 3)
+        info["output_shape"] = [int(v) for v in result.shape]
+        info["total_signal"] = float(result.sum())
+
+        if kind == "image":
+            self._render_image, self._render_image_info = result, info
+            self.render_save_image_button.setEnabled(True)
+        else:
+            self._render_movie, self._render_movie_info = result, info
+            self.render_save_movie_button.setEnabled(True)
+        self._update_save_tab()
+
+        if self.render_add_layer_box.isChecked():
+            self._add_render_layer(kind, result, info, source_layer, options)
+        self.log(
+            f"Rendered {'x'.join(str(v) for v in result.shape)} in "
+            f"{info['render_seconds']:.2f} s on the {info['backend'].upper()}"
+        )
+
+    def _add_render_layer(self, kind, image, info, source_layer, options):
+        source_scale, source_translate = (1.0, 1.0), (0.0, 0.0)
+        if source_layer is not None:
+            scale = tuple(float(v) for v in np.ravel(getattr(source_layer, "scale", ())))
+            translate = tuple(float(v) for v in np.ravel(getattr(source_layer, "translate", ())))
+            if len(scale) >= 2:
+                source_scale = scale[-2:]
+            if len(translate) >= 2:
+                source_translate = translate[-2:]
+        scale, translate = smlm_render.layer_transform(
+            options["oversampling"], options["origin"], source_scale, source_translate
+        )
+        name = RENDER_LAYER_NAME if kind == "image" else RENDER_MOVIE_LAYER_NAME
+        if kind == "movie":
+            # One movie frame spans `raw_frames_per_movie_frame` raw frames, so
+            # scaling the time axis by it keeps the dims slider meaning the same
+            # thing for the render as for the raw stack underneath.
+            scale = (float(info["raw_frames_per_movie_frame"]),) + tuple(scale)
+            # A group is placed at the raw frame where it *finishes*, not where
+            # it starts. Placed at its first frame - which is what a bare
+            # `first_raw_frame` does - the reconstruction of frames 0..N-1 is
+            # already on screen at frame 0, so the movie shows molecules before
+            # the stack underneath has seen them and runs a whole window ahead
+            # of the trajectories built from the same data. The offset is the
+            # same for every group in all three groupings, so it stays a
+            # translation rather than needing a per-frame mapping.
+            lag = max(1, int(info.get("frames_per_group", 1) or 1)) - 1
+            translate = (float(info["first_raw_frame"] + lag),) + tuple(translate)
+
+        self._remove_layer(name)
+        try:
+            self.viewer.add_image(
+                image, name=name, colormap=self.render_colormap_box.currentText(),
+                blending="additive", scale=scale, translate=translate,
+                units=self._viewer_units(len(scale)),
+                contrast_limits=smlm_render.contrast_limits(image),
+            )
+        except Exception as exc:
+            self.log(f"Could not add the render to the viewer: {exc}")
+            return
+
+    # --- saving a render ------------------------------------------------
+    def _default_render_path(self, kind, info, force_format=None):
+        csv_path = self.csv_edit.text().strip()
+        image_path = self.image_edit.text().strip()
+        if csv_path:
+            base = Path(csv_path)
+        elif image_path:
+            base = Path(image_path)
+        else:
+            base = Path.cwd() / "localizations"
+        suffix = "movie" if kind == "movie" else "render"
+        box = self.render_movie_format_box if kind == "movie" else self.render_image_format_box
+        # The format is in the name so a composite and the data it came from
+        # never overwrite each other.
+        save_format = force_format or box.currentData()
+        name = f"{base.stem}_{suffix}_{info['mode']}_os{info['oversampling']}_{save_format}.tif"
+        return str(base.parent / name)
+
+    def save_render_image(self):
+        self._save_render("image", self._render_image, self._render_image_info)
+
+    def save_render_movie(self):
+        self._save_render("movie", self._render_movie, self._render_movie_info)
+
+    def save_composite_image(self):
+        """Save the blend directly, without going via the format box."""
+        self._save_render("image", self._render_image, self._render_image_info,
+                          force_format="composite")
+
+    def _update_save_tab(self):
+        """Say what there is to save, and only offer what actually exists."""
+        if not hasattr(self, "render_save_status"):
+            return
+        ready = []
+        for label, image, info in (
+            ("image", self._render_image, self._render_image_info),
+            ("movie", self._render_movie, self._render_movie_info),
+        ):
+            if image is None:
+                continue
+            size = " x ".join(str(int(v)) for v in image.shape)
+            ready.append(f"{label} {size} ({info['mode_label'].split(' (')[0]})")
+        for button in (self.render_save_image_button, self.render_save_composite_image_button):
+            button.setEnabled(self._render_image is not None)
+        for button in (self.render_save_movie_button,):
+            button.setEnabled(self._render_movie is not None)
+        self.render_save_status.setText(
+            "Ready to save: " + ", ".join(ready) if ready else "Nothing rendered yet.")
+
+    # --- the crop box ----------------------------------------------------
+    def _sync_render_crop_layer(self):
+        """Put a resizable rectangle on the image, or take it away again."""
+        if not self.render_crop_box.isChecked():
+            self._remove_layer(RENDER_CROP_LAYER_NAME)
+            self.render_crop_status.setText("-")
+            self._update_render_crop_status()
+            return
+        if RENDER_CROP_LAYER_NAME in self.viewer.layers:
+            self._update_render_crop_status()
+            return
+
+        shape, origin, _layer = self._render_field_of_view()
+        if shape is None:
+            self.log("Load localizations before setting a crop box")
+            self.render_crop_box.setChecked(False)
+            return
+        # Start at the middle half of the field, so the box is obviously a crop
+        # and both handles are on screen.
+        y0 = origin[0] + shape[0] * 0.25
+        y1 = origin[0] + shape[0] * 0.75
+        x0 = origin[1] + shape[1] * 0.25
+        x1 = origin[1] + shape[1] * 0.75
+        rect = np.array([[y0, x0], [y0, x1], [y1, x1], [y1, x0]])
+        try:
+            layer = self.viewer.add_shapes(
+                [rect], shape_type="rectangle", name=RENDER_CROP_LAYER_NAME,
+                edge_color="lime", face_color="transparent", edge_width=2,
+                **self._placed({}, 2),
+            )
+            layer.mode = "select"
+            layer.selected_data = {0}
+            layer.events.data.connect(lambda event=None: self._update_render_crop_status())
+            self._apply_viewer_scale()
+        except Exception as exc:
+            self.log(f"Could not add the crop box: {exc}")
+            self.render_crop_box.setChecked(False)
+            return
+        self._update_render_crop_status()
+
+    def _render_crop_bounds(self):
+        """(y0, x0, y1, x1) of the crop box in camera pixels, or None."""
+        if not self.render_crop_box.isChecked():
+            return None
+        if RENDER_CROP_LAYER_NAME not in self.viewer.layers:
+            return None
+        data = self.viewer.layers[RENDER_CROP_LAYER_NAME].data
+        if len(data) == 0:
+            return None
+        rect = np.asarray(data[0])[:, -2:]
+        return (float(rect[:, 0].min()), float(rect[:, 1].min()),
+                float(rect[:, 0].max()), float(rect[:, 1].max()))
+
+    def _update_render_crop_status(self):
+        box = self._render_crop_bounds()
+        if box is None:
+            self.render_crop_status.setText(
+                "Whole field of view is saved." if not self.render_crop_box.isChecked()
+                else "Drag the green box on the image to choose the region.")
+            return
+        oversampling = self.render_oversampling_box.value()
+        pixel_nm = self.pixel_size_box.value()
+        height_px = int(round((box[2] - box[0]) * oversampling))
+        width_px = int(round((box[3] - box[1]) * oversampling))
+        self.render_crop_status.setText(
+            f"Saving {width_px} x {height_px} super-resolved px "
+            f"({(box[3] - box[1]) * pixel_nm / 1000:.1f} x "
+            f"{(box[2] - box[0]) * pixel_nm / 1000:.1f} um)"
+        )
+        self._update_scalebar_status()
+
+    # --- what a save actually writes ------------------------------------
+    def _overlay_spec(self, x_px, y_px, frames, sigma_nm, color, info):
+        """One overlay, described as plain data for the worker to render.
+
+        The overlay goes through the same reconstruction path as the image it
+        sits on - same origin, oversampling, frame grouping and backend - so it
+        cannot drift relative to it. Sigma is half the requested width, so the
+        drawn feature is about as wide as the number in the box says.
+        """
+        pixel_size = max(self.pixel_size_box.value(), 1e-9)
+        return {
+            "source": "overlay", "color": color,
+            "x_px": x_px, "y_px": y_px, "frames": frames,
+            "global_sigma_px": max(float(sigma_nm), 1.0) / 2.0 / pixel_size,
+        }
+
+    # --- scale bar --------------------------------------------------------
+    def _saved_width_nm(self):
+        """How wide the saved picture is, in nanometres - the crop if there is one."""
+        shape, _origin, _layer = self._render_field_of_view()
+        if shape is None:
+            return None
+        pixel_size = self.pixel_size_box.value()
+        box = self._render_crop_bounds()
+        width_px = (box[3] - box[1]) if box is not None else shape[1]
+        return float(width_px) * pixel_size
+
+    def _on_scalebar_auto_changed(self, *_args):
+        self.render_scalebar_length_box.setEnabled(
+            not self.render_scalebar_auto_box.isChecked())
+        self._update_scalebar_status()
+
+    def _update_scalebar_status(self):
+        """Keep the automatic length in step with the view it has to suit."""
+        if not hasattr(self, "render_scalebar_status"):
+            return
+        width_nm = self._saved_width_nm()
+        if width_nm is None:
+            self.render_scalebar_status.setText("Load localizations to size the scale bar.")
+            return
+        if self.render_scalebar_auto_box.isChecked():
+            length = smlm_render.nice_scale_length(width_nm)
+            self.render_scalebar_length_box.blockSignals(True)
+            self.render_scalebar_length_box.setValue(length)
+            self.render_scalebar_length_box.blockSignals(False)
+        else:
+            length = self.render_scalebar_length_box.value()
+
+        share = 100.0 * length / width_nm
+        note = (f"{smlm_render.format_length(length)} bar across a "
+                f"{smlm_render.format_length(width_nm)} view ({share:.0f}% of it)")
+        if share > 90:
+            note += " - too long to fit, it will be skipped"
+        self.render_scalebar_status.setText(note)
+
+    def _scalebar_spec(self):
+        """The bar and its label, rasterized here for the same reason the clock is."""
+        width_nm = self._saved_width_nm()
+        if width_nm is None:
+            return None
+        self._update_scalebar_status()
+        length_nm = self.render_scalebar_length_box.value()
+        super_pixel_nm = self.pixel_size_box.value() / self.render_oversampling_box.value()
+        length_px = int(round(length_nm / max(super_pixel_nm, 1e-9)))
+        if length_px < 2:
+            self.log("The scale bar is shorter than a pixel - not drawn")
+            return None
+
+        # The bar is sized against the picture, not against a fixed number of
+        # pixels, so it looks the same at any oversampling.
+        rows = int(round(width_nm / max(super_pixel_nm, 1e-9)))
+        thickness = max(2, int(round(rows * 0.006)))
+        label_height = max(8, int(round(rows * 0.03)))
+        atlas = smlm_render.glyph_atlas(label_height)
+        label = smlm_render.compose_text(atlas, smlm_render.format_length(length_nm))
+        return {
+            "mask": smlm_render.scale_bar_mask(length_px, thickness, label),
+            "color": self.render_scalebar_color_box.currentText(),
+            "position": self.render_scalebar_position_box.currentText(),
+            "length_nm": length_nm,
+            "length_px": length_px,
+        }
+
+    def _timestamp_spec(self, info, is_movie):
+        """The labels to burn in, already rasterized.
+
+        The glyphs are drawn here, on the GUI thread, and the worker only
+        assembles and blits them: matplotlib is busy drawing this window's own
+        figures, and rasterizing text from two threads at once is asking for
+        trouble. One pass over the alphabet covers a movie of any length.
+        """
+        interval = self._frame_interval_s()
+        stride = float(info.get("raw_frames_per_movie_frame", 1) or 1)
+        if is_movie:
+            n_frames = int(info.get("n_movie_frames", 1) or 1)
+            # The time a group's window *closes*, matching where the viewer puts
+            # it on the slider. Labelling it with the moment the window opened
+            # would date every frame a whole window earlier than the data in it.
+            lag = max(1, int(info.get("frames_per_group", 1) or 1)) - 1
+            times = [(lag + index * stride) * interval for index in range(n_frames)]
+        else:
+            first = float(info.get("first_raw_frame", 0) or 0)
+            last = float(info.get("last_raw_frame", first) or first)
+            times = [(last - first + 1) * interval]
+        longest = max(times) if times else 0.0
+        return {
+            "atlas": smlm_render.glyph_atlas(self.render_timestamp_size_box.value()),
+            "labels": [smlm_render.format_time(t, longest) for t in times],
+            "color": self.render_timestamp_color_box.currentText(),
+            "position": self.render_timestamp_position_box.currentText(),
+        }
+
+    def _save_spec(self, kind, info, force_format=None):
+        """Everything the worker needs to build the saved array, as plain data.
+
+        Assembled here because it reads Qt widgets and the dataframes, which
+        only the GUI thread may touch; the rendering and blending it describes
+        can then all happen off it. Returns (spec, extra metadata), or
+        (None, None) once the reason has been logged.
+        """
+        box = self.render_movie_format_box if kind == "movie" else self.render_image_format_box
+        save_format = force_format or box.currentData()
+        label = RENDER_SAVE_FORMATS[save_format] if force_format else box.currentText()
+        extra = {"save_format": save_format, "save_format_label": label}
+        is_movie = kind == "movie"
+        spec = {
+            "format": save_format,
+            "is_movie": is_movie,
+            "render": {
+                "shape": tuple(info["field_of_view_camera_px"]),
+                "origin": tuple(info["origin_camera_px"]),
+                "oversampling": info["oversampling"],
+                "gpu": info.get("backend") == "gpu",
+                "frames_per_group": info.get("frames_per_group"),
+                "grouping": info.get("grouping"),
+                "step": info.get("window_step_frames"),
+                # the acquisition the base movie covers, so an overlay that
+                # spans fewer frames still gets the same movie frames
+                "frame_range": (info.get("first_raw_frame"), info.get("last_raw_frame")),
+            },
+            "layers": [],
+            "crop": None,
+            "timestamp": None,
+            "scalebar": None,
+        }
+
+        crop_box = self._render_crop_bounds()
+        if crop_box is not None:
+            spec["crop"] = crop_box
+            rows, cols = smlm_render.box_to_slices(
+                crop_box, shape=spec["render"]["shape"], origin=spec["render"]["origin"],
+                oversampling=spec["render"]["oversampling"])
+            extra["crop_camera_px"] = [round(v, 3) for v in crop_box]
+            extra["crop_output_px"] = [rows.start, cols.start, rows.stop, cols.stop]
+
+        if self.render_timestamp_box.isChecked():
+            spec["timestamp"] = self._timestamp_spec(info, is_movie)
+            extra["timestamp"] = {
+                "height_px": self.render_timestamp_size_box.value(),
+                "color": self.render_timestamp_color_box.currentText(),
+                "position": self.render_timestamp_position_box.currentText(),
+                "frame_interval_s": self._frame_interval_s(),
+            }
+
+        if self.render_scalebar_box.isChecked():
+            scalebar = self._scalebar_spec()
+            spec["scalebar"] = scalebar
+            if scalebar is not None:
+                extra["scale_bar"] = {
+                    "length_nm": scalebar["length_nm"],
+                    "length_super_resolved_px": scalebar["length_px"],
+                    "automatic": self.render_scalebar_auto_box.isChecked(),
+                    "color": scalebar["color"],
+                    "position": scalebar["position"],
+                }
+
+        if save_format != "composite":
+            return spec, extra
+
+        included = []
+        if self.render_composite_base_box.isChecked():
+            colormap = self.render_colormap_box.currentText()
+            spec["layers"].append({"source": "base", "colormap": colormap})
+            included.append(f"reconstruction ({colormap})")
+
+        if self.render_composite_locs_box.isChecked():
+            x_px, y_px = self._render_positions_px()
+            if x_px is None:
+                self.log("No localizations to draw into the composite")
+            else:
+                color = self.render_locs_color_box.currentText()
+                spec["layers"].append(self._overlay_spec(
+                    x_px, y_px, self._render_frames(),
+                    self.render_locs_size_box.value(), color, info))
+                included.append(f"{x_px.size} localizations ({color})")
+
+        if self.render_composite_tracks_box.isChecked():
+            if self.tracks is None or self.tracks.empty:
+                self.log("No trajectories to draw into the composite - link them first")
+            else:
+                # trackpy works in camera pixels, the units the render grid uses
+                x_s, y_s, frames_s = smlm_render.trajectory_samples(
+                    self.tracks["x"].to_numpy(dtype=float),
+                    self.tracks["y"].to_numpy(dtype=float),
+                    self.tracks["frame"].to_numpy(),
+                    self.tracks["particle"].to_numpy(),
+                    spacing_px=0.5 / info["oversampling"],
+                )
+                if x_s.size == 0:
+                    self.log("The trajectories have no linked segments to draw")
+                else:
+                    color = self.render_tracks_color_box.currentText()
+                    spec["layers"].append(self._overlay_spec(
+                        x_s, y_s, frames_s,
+                        self.render_tracks_width_box.value(), color, info))
+                    included.append(
+                        f"{self.tracks['particle'].nunique()} trajectories ({color})")
+
+        if self.render_composite_all_box.isChecked():
+            included.extend(self._viewer_layer_specs(spec, info))
+
+        if not spec["layers"]:
+            self.log("Nothing to composite - tick at least one layer that has data")
+            return None, None
+        extra["composite_layers"] = included
+        self.render_composite_status.setText("Last composite: " + ", ".join(included))
+        return spec, extra
+
+    def _viewer_layer_specs(self, spec, info):
+        """Add every other visible layer to the composite, as plain arrays.
+
+        Image layers are sampled onto the render grid with their own colormap
+        and contrast; Points layers are splatted in their own colour. Shapes
+        layers (the filter box, the crop box) are controls, not data, and are
+        left out. The layer data is read here because only the GUI thread may
+        touch the viewer - what reaches the worker is numpy.
+        """
+        # Every layer about to be read is placed in world units below, so make
+        # sure they are all in the same world first - one that arrived without
+        # going past the inserted event would otherwise be resampled as though
+        # its camera pixels were nanometres.
+        self._apply_viewer_scale()
+
+        included = []
+        already = {RENDER_LAYER_NAME, RENDER_MOVIE_LAYER_NAME, RENDER_CROP_LAYER_NAME,
+                   ROI_LAYER_NAME}
+        if any(layer["source"] == "overlay" for layer in spec["layers"]):
+            already.add(POINTS_LAYER_NAME)  # already added as "Localizations"
+
+        for layer in list(self.viewer.layers):
+            name = getattr(layer, "name", "")
+            if name in already or not getattr(layer, "visible", True):
+                continue
+            # Back out of world units: the render grid is described in camera
+            # pixels, so a layer's placement has to be expressed in those before
+            # it can be resampled onto it.
+            world_to_px = 1.0 / max(self.pixel_size_box.value(), 1e-9)
+            scale = tuple(float(v) * world_to_px
+                          for v in np.ravel(getattr(layer, "scale", (1.0, 1.0))))
+            translate = tuple(float(v) * world_to_px
+                              for v in np.ravel(getattr(layer, "translate", (0.0, 0.0))))
+            data = getattr(layer, "data", None)
+            if data is None:
+                continue
+
+            if isinstance(layer, napari.layers.Image):
+                stack = np.asarray(data)
+                limits = tuple(getattr(layer, "contrast_limits", (None, None)) or (None, None))
+                spec["layers"].append({
+                    "source": "image", "data": stack,
+                    "colormap": self._layer_colormap_name(layer),
+                    "limits": limits if all(v is not None for v in limits) else None,
+                    "scale": scale[-2:] if len(scale) >= 2 else (1.0, 1.0),
+                    "translate": translate[-2:] if len(translate) >= 2 else (0.0, 0.0),
+                    "has_frames": stack.ndim >= 3,
+                })
+                included.append(f"{name} (image)")
+            elif isinstance(layer, napari.layers.Points):
+                points = np.asarray(data, dtype=float)
+                if points.size == 0:
+                    continue
+                frames = points[:, 0] if points.shape[1] >= 3 else None
+                spec["layers"].append(self._overlay_spec(
+                    points[:, -1], points[:, -2], frames,
+                    self.render_locs_size_box.value(),
+                    self._layer_color_name(layer), info))
+                included.append(f"{name} (points)")
+        return included
+
+    @staticmethod
+    def _layer_colormap_name(layer):
+        colormap = getattr(layer, "colormap", None)
+        name = getattr(colormap, "name", colormap)
+        return name if isinstance(name, str) and name in matplotlib.colormaps else "gray"
+
+    @staticmethod
+    def _layer_color_name(layer):
+        """Match a Points layer's outline to one of the overlay colours."""
+        for attribute in ("border_color", "edge_color", "face_color"):
+            value = np.ravel(np.asarray(getattr(layer, attribute, []), dtype=float))
+            if value.size >= 3 and value[:3].max() > 0:
+                target = value[:3]
+                return min(
+                    smlm_render.OVERLAY_COLORS,
+                    key=lambda name: float(np.sum(
+                        (np.asarray(smlm_render.OVERLAY_COLORS[name]) - target) ** 2)),
+                )
+        return "cyan"
+
+    def _save_render(self, kind, image, info, force_format=None):
+        if image is None or info is None:
+            self.log(f"Render the {kind} first")
+            return
+        path, _ = QFileDialog.getSaveFileName(
+            self, f"Save rendered {kind}", self._default_render_path(kind, info, force_format),
+            "TIFF files (*.tif *.tiff)",
+        )
+        if not path:
+            return
+        try:
+            spec, extra = self._save_spec(kind, info, force_format)
+            if spec is None:
+                return
+            metadata = self._render_metadata({**info, **extra})
+        except Exception as exc:
+            self.log(f"Could not prepare the {kind} to save: {exc}")
+            return
+
+        for button in (self.render_save_image_button, self.render_save_movie_button,
+                       self.render_save_composite_image_button):
+            button.setEnabled(False)
+        self.log(f"Writing the {kind} ({extra['save_format']}) to {Path(path).name}...")
+        worker = _save_render_worker(
+            Path(path), image, spec, metadata,
+            info["super_resolved_pixel_size_nm"], self.render_png_box.isChecked(),
+            self.render_colormap_box.currentText(), info.get("frame_interval_s"),
+        )
+        worker.returned.connect(self._on_render_saved)
+        worker.errored.connect(lambda exc: self.log(f"Saving the render failed: {exc}"))
+        worker.finished.connect(self._on_render_save_worker_finished)
+        self._render_save_worker_ref = worker
+        worker.start()
+
+    def _on_render_save_worker_finished(self):
+        self._update_save_tab()
+        self._render_save_worker_ref = None
+
+    def _on_render_saved(self, written):
+        names = ", ".join(Path(p).name for p in written)
+        self.log(f"Saved {names} in {Path(written[0]).parent}")
+
+    def _render_metadata(self, info):
+        """The full analysis snapshot, with what this particular render did.
+
+        Deliberately the same dict the analysis export writes: a saved render
+        then records the camera, detection, fitting and filter settings that
+        produced the localizations behind it, not just the render options - so
+        the picture can be traced back to the data without hunting for the
+        export folder it came from.
+        """
+        metadata = self._collect_metadata(self.csv_edit.text().strip())
+        metadata.setdefault("smlm_rendering", {}).update(info)
+        return metadata
+
+    # ------------------------------------------------------------------
     # Filtering (+ per-column histograms)
     # ------------------------------------------------------------------
     def _default_bounds_for(self, column):
         col_key = next((k for k, v in self.column_map.items() if v == column), None)
-        if col_key == "sigma":
-            return 0.0, 1000.0
+        # Covers sigma_x/sigma_y too, which are not in the column map but need
+        # the same scale as sigma itself.
+        if col_key == "sigma" or is_sigma_column(column):
+            return SIGMA_DEFAULT_BOUNDS_NM
         if col_key == "uncertainty":
             return 0.0, 200.0
         if col_key == "intensity":
@@ -1246,10 +4445,14 @@ class LocalizationTrackingWidget(QWidget):
         for column in ordered_columns:
             lower_box = QDoubleSpinBox()
             lower_box.setRange(-1e9, 1e9)
-            lower_box.setDecimals(3)
+            # Six, not three: a filter column can be anything from a photon
+            # count to an uncertainty in micrometres, and three decimals silently
+            # rounds the small ones to zero.
+            lower_box.setDecimals(FILTER_BOUND_DECIMALS)
             upper_box = QDoubleSpinBox()
             upper_box.setRange(-1e9, 1e9)
-            upper_box.setDecimals(3)
+            upper_box.setDecimals(FILTER_BOUND_DECIMALS)
+            adaptive_steps(lower_box, upper_box)
             default_lower, default_upper = self._default_bounds_for(column)
             lower_box.setValue(default_lower)
             upper_box.setValue(default_upper)
@@ -1283,6 +4486,24 @@ class LocalizationTrackingWidget(QWidget):
                 grid_col = 0
                 grid_row += 1
 
+        # Settings loaded before the data they belong to: now that the controls
+        # exist, apply whatever those bounds match.
+        if self._pending_filter_bounds:
+            pending = self._pending_filter_bounds
+            self._pending_filter_bounds = None
+            applied, unmatched = self._apply_filter_bounds(pending)
+            if applied:
+                self.log(f"Applied {applied} saved filter bound(s) to the new data")
+                # Restoring the bounds is not enough - the data has to actually
+                # be filtered by them, or the values sit in the boxes doing
+                # nothing while the full table stays on screen.
+                self.apply_filters()
+            if unmatched:
+                self.log(
+                    f"{len(unmatched)} saved filter bound(s) match no column here: "
+                    + ", ".join(sorted(unmatched)[:3])
+                )
+
     def apply_filters(self):
         if self.df is None:
             return
@@ -1292,10 +4513,12 @@ class LocalizationTrackingWidget(QWidget):
             upper = upper_box.value()
             bounds[column] = (lower, upper)
         self.df_filtered = apply_numeric_filters(self.df, bounds)
+        self._update_status_header()
         self.filter_status.setText(f"Showing {len(self.df_filtered)} localizations")
         self.log(f"Filtered to {len(self.df_filtered)} localizations")
         self._invalidate_tracks(reason="filters changed")
         self.render_overlay()
+        self._refresh_render_tab()
         self._refresh_histogram_bounds()
         self._sync_xy_roi_layer()
         self.data_table_model.set_dataframe(self.df_filtered)
@@ -1326,11 +4549,14 @@ class LocalizationTrackingWidget(QWidget):
         self._track_diffusion_cache = None
         self._track_msd_cache = None
         self._track_distance_cache = None
+        self._track_net_cache = None
+        self._track_straightness_cache = None
         self._track_duration_cache = None
         self.compute_d_button.setEnabled(False)
         self._remove_layer(TRACKS_LAYER_NAME)
         self._remove_layer(ALL_TRACKS_LAYER_NAME)
         self._clear_metric_histograms()
+        self._update_status_header()
         if reason:
             self.log(f'Trajectories cleared ({reason}) - click "Link trajectories" again.')
 
@@ -1363,8 +4589,11 @@ class LocalizationTrackingWidget(QWidget):
         self.link_button.setEnabled(False)
         self.link_progress.setVisible(True)
         self.link_progress.setValue(0)
+        self._arm_cancel(self._link_cancel, self.link_cancel_button)
 
-        worker = _link_worker(features, search_range_px, self.memory_box.value(), n_frames)
+        worker = _link_worker(
+            features, search_range_px, self.memory_box.value(), n_frames, self._link_cancel
+        )
         worker.yielded.connect(lambda frac: self.link_progress.setValue(int(frac * 100)))
         worker.returned.connect(self._on_link_finished)
         worker.errored.connect(self._on_link_errored)
@@ -1374,6 +4603,7 @@ class LocalizationTrackingWidget(QWidget):
 
     def _on_link_worker_finished(self):
         self.link_button.setEnabled(True)
+        self.link_cancel_button.setEnabled(False)
         self.link_progress.setVisible(False)
         self._link_worker_ref = None
 
@@ -1381,6 +4611,9 @@ class LocalizationTrackingWidget(QWidget):
         self.log(f"Linking failed: {exc}")
 
     def _on_link_finished(self, linked):
+        if linked is CANCELLED:
+            self.log("Linking cancelled - trajectories are unchanged")
+            return
         if linked is None or linked.empty:
             self.log("No trajectories linked")
             self.tracks = None
@@ -1399,6 +4632,7 @@ class LocalizationTrackingWidget(QWidget):
         self.log(f"Linked {traj['particle'].nunique()} trajectories")
         self._start_fit_free_metrics_worker()
         self.render_overlay()
+        self._update_status_header()
 
     def _resolve_column(self, key):
         if self.column_map.get(key):
@@ -1435,6 +4669,193 @@ class LocalizationTrackingWidget(QWidget):
             self.viewer.layers.remove(name)
 
     # ------------------------------------------------------------------
+    # Playback
+    # ------------------------------------------------------------------
+    def _on_playback_changed(self):
+        """Hand the requested speed to napari, which owns the play button."""
+        settings = _napari_playback_settings()
+        if settings is not None:
+            try:
+                settings.playback_fps = int(self.playback_fps_box.value())
+                settings.playback_mode = self.playback_mode_box.currentData()
+            except Exception as exc:
+                self.log(f"Could not set the playback speed: {exc}")
+        self._update_playback_status()
+
+    def _set_playback_to_real_time(self):
+        """The nearest whole frame rate to the one the camera acquired at.
+
+        The rounding is why the status line below quotes the pace rather than
+        claiming real time: 31.9 fps acquired can only be played at 32.
+        """
+        self.playback_fps_box.setValue(
+            max(1, int(round(float(self.fps_box.value())))))
+
+    def _update_playback_status(self):
+        """Say what the chosen speed means against the rate it was acquired at.
+
+        A frame rate on its own says nothing about whether what you are watching
+        is sped up or slowed down, which is the only thing a reader of the
+        finished movie will want to know.
+        """
+        if not hasattr(self, "playback_status"):
+            return
+        playback = int(self.playback_fps_box.value())
+        acquired = getattr(self, "fps_box", None)
+        acquired = float(acquired.value()) if acquired is not None else 0.0
+        if acquired <= 0:
+            self.playback_status.setText(f"{playback:d} frames per second")
+            return
+        ratio = playback / acquired
+        if abs(ratio - 1.0) < 0.005:
+            pace = "real time"
+        elif ratio > 1.0:
+            pace = f"{ratio:.3g}x faster than real time"
+        else:
+            pace = f"{1.0 / ratio:.3g}x slower than real time"
+        self.playback_status.setText(
+            f"{playback:d} fps shown against {acquired:.4g} fps acquired - {pace}"
+        )
+
+    # ------------------------------------------------------------------
+    # Physical units in the viewer
+    # ------------------------------------------------------------------
+    def _reset_view(self):
+        """Frame everything that is loaded, the way opening a file should."""
+        try:
+            self.viewer.reset_view()
+        except Exception:
+            pass  # a viewer without a camera to reset
+
+    def _viewer_scale(self, ndim):
+        """Display scale for a layer whose data is indexed in camera pixels."""
+        scale = [1.0] * max(int(ndim), 2)
+        scale[-2:] = [self.pixel_size_box.value()] * 2
+        return tuple(scale)
+
+    def _viewer_units(self, ndim):
+        units = [VIEWER_FRAME_UNIT] * max(int(ndim), 2)
+        units[-2:] = [VIEWER_SPATIAL_UNIT] * 2
+        return tuple(units)
+
+    def _placed(self, kwargs, ndim):
+        """Add the display transform to the kwargs of a layer measured in pixels."""
+        kwargs = dict(kwargs)
+        kwargs.setdefault("scale", self._viewer_scale(ndim))
+        kwargs.setdefault("units", self._viewer_units(ndim))
+        return kwargs
+
+    @staticmethod
+    def _stretch_layer(layer, factor):
+        """Move a layer with the world when the pixel size changes under it."""
+        scale = np.array(np.ravel(layer.scale), dtype=float)
+        translate = np.array(np.ravel(layer.translate), dtype=float)
+        scale[-2:] *= factor
+        translate[-2:] *= factor
+        layer.scale = scale
+        layer.translate = translate
+
+    def _apply_viewer_scale(self):
+        """Put the viewer in nanometres and show napari's scale bar.
+
+        The bar is napari's own canvas overlay rather than anything drawn here:
+        it sits in the corner of the *viewport*, above every layer, follows pan
+        and zoom, and picks its own round length as the zoom changes. All it
+        needs is for the world to be measured in something physical, which is
+        what this establishes.
+
+        Called whenever a layer is added or the pixel size changes, so the two
+        can never disagree - a scale bar sized by a stale pixel size is worse
+        than none, because it looks authoritative.
+        """
+        if not hasattr(self, "pixel_size_box"):
+            return  # a layer arrived before the Data tab was built
+        pixel_nm = self.pixel_size_box.value()
+        previous = getattr(self, "_viewer_pixel_size_nm", None)
+        for layer in list(self.viewer.layers):
+            try:
+                ndim = len(np.ravel(layer.scale))
+                if layer.name in DERIVED_SCALE_LAYERS:
+                    # Its scale is derived from the layer beneath it, so it is
+                    # only carried along - but it still has to be labelled. A
+                    # single layer left in pixels makes the units inconsistent
+                    # across the viewer, and napari then discards all of them
+                    # and the scale bar silently falls back to counting pixels.
+                    if previous:
+                        self._stretch_layer(layer, pixel_nm / previous)
+                else:
+                    layer.scale = self._viewer_scale(ndim)
+                layer.units = self._viewer_units(ndim)
+            except Exception:
+                continue  # a layer type this napari will not let us annotate
+        self._viewer_pixel_size_nm = pixel_nm
+
+        bar = getattr(self.viewer, "scale_bar", None)
+        if bar is None:
+            return
+        try:
+            # Only what the bar needs to exist and sit out of the way; colour,
+            # box and ticks are left to the user's napari preferences.
+            bar.visible = True
+            bar.position = "bottom_right"
+            # napari tiles overlays that share a corner, working outwards from
+            # the edge in `order`. The bar takes the edge and the clock stacks
+            # directly above it.
+            bar.order = 0
+        except Exception:
+            pass
+        self._update_time_overlay()
+
+    def _on_current_frame_changed(self):
+        """Everything that has to follow the frame slider, in one place."""
+        self._update_time_overlay()
+        self._sync_accumulating_tracks()
+
+    def _update_time_overlay(self):
+        """Keep a clock on the canvas, just above the scale bar.
+
+        Read off the dims slider rather than tracked here, so it is right
+        whether the frame changed by dragging, by the play button, or from
+        anything else that moves the slider.
+        """
+        overlay = getattr(self.viewer, "text_overlay", None)
+        if overlay is None or not hasattr(self, "fps_box"):
+            return
+        frame = self._get_current_frame()
+        interval = self._frame_interval_s()
+        last = self._last_loaded_frame()
+        try:
+            overlay.text = "{} (frame {})".format(
+                smlm_render.format_time(frame * interval,
+                                        (last if last else frame) * interval),
+                frame,
+            )
+            overlay.position = "bottom_right"
+            overlay.order = 1  # above the scale bar, which took order 0
+            overlay.visible = True
+        except Exception:
+            pass
+
+    def _last_loaded_frame(self):
+        """The final frame index in view, so the clock picks one time format.
+
+        A label that switches between "9.4 s" and "01:12" as the slider moves
+        is unreadable; the format is chosen once, from how long the whole
+        acquisition runs.
+        """
+        best = 0
+        for layer in list(self.viewer.layers):
+            try:
+                extent = layer.extent.data
+                if extent is not None and len(extent[1]) >= 3:
+                    best = max(best, int(extent[1][0]))
+            except Exception:
+                continue
+        if not best and self.df is not None and "frame" in self.df:
+            best = int(self.df["frame"].max())
+        return best
+
+    # ------------------------------------------------------------------
     # napari layer synchronization
     # ------------------------------------------------------------------
     def render_overlay(self):
@@ -1444,8 +4865,10 @@ class LocalizationTrackingWidget(QWidget):
         # data and let napari slice them natively, so moving the slider does
         # no Python-side work and stays smooth even with many localizations
         # or trajectories.
-        if self.df_filtered is None or self.df_filtered.empty:
-            return
+        #
+        # No global emptiness check: each layer decides for itself, so that
+        # trajectory settings still apply when there are trajectories but no
+        # localizations to draw (and vice versa).
         self._sync_points_layer()
         self._sync_tracks_layer()
         self._sync_all_tracks_layer()
@@ -1455,7 +4878,8 @@ class LocalizationTrackingWidget(QWidget):
         y_col = self._resolve_column("y")
         frame_col = self._resolve_column("frame")
 
-        if not (self.show_points_box.isChecked() and x_col and y_col and frame_col):
+        has_rows = self.df_filtered is not None and not self.df_filtered.empty
+        if not (self.show_points_box.isChecked() and has_rows and x_col and y_col and frame_col):
             self._remove_layer(POINTS_LAYER_NAME)
             return
 
@@ -1501,8 +4925,10 @@ class LocalizationTrackingWidget(QWidget):
             )
             if features is not None:
                 kwargs["features"] = features
-            self.viewer.add_points(coords, **kwargs)
+            self.viewer.add_points(
+                coords, **self._placed(kwargs, np.asarray(coords).shape[-1]))
         self.viewer.tooltip.visible = True
+        self._apply_viewer_scale()
 
     # ------------------------------------------------------------------
     # Per-trajectory metrics: D (fit-based), distance & duration (fit-free)
@@ -1515,11 +4941,31 @@ class LocalizationTrackingWidget(QWidget):
         fps = max(self.fps_box.value(), 1e-6)
         mpp = max(self.pixel_size_box.value(), 1e-6) / 1000.0  # nm/px -> um/px
 
+        # Second, independent length filter: a linear MSD fit wants more points
+        # than trajectory display or the fit-free metrics do, so D can be
+        # restricted to the longer tracks without discarding the short ones.
+        min_length = int(self.d_min_length_box.value())
+        tracks = filter_tracks_by_length(self.tracks, min_length)
+        n_total = int(self.tracks["particle"].nunique())
+        if tracks.empty:
+            self.log(
+                f"No trajectory has {min_length} or more points "
+                f"(longest of {n_total} is shorter) - lower 'Min track length for D'"
+            )
+            return
+        n_kept = int(tracks["particle"].nunique())
+        self._d_input_track_count = n_kept
+        if n_kept < n_total:
+            self.log(f"D: using {n_kept} of {n_total} trajectories with >= {min_length} points")
+
         self.log("Computing D in the background...")
         self.compute_d_button.setEnabled(False)
         self.compute_d_progress.setVisible(True)
+        self.compute_d_progress.setValue(0)
+        self._arm_cancel(self._compute_d_cancel, self.compute_d_cancel_button)
 
-        worker = _compute_d_worker(self.tracks, max_lagtime, fps, mpp)
+        worker = _compute_d_worker(tracks, max_lagtime, fps, mpp, self._compute_d_cancel)
+        worker.yielded.connect(lambda frac: self.compute_d_progress.setValue(int(frac * 100)))
         worker.returned.connect(self._on_compute_d_finished)
         worker.errored.connect(lambda exc: self.log(f"D computation failed: {exc}"))
         worker.finished.connect(self._on_compute_d_worker_finished)
@@ -1528,14 +4974,21 @@ class LocalizationTrackingWidget(QWidget):
 
     def _on_compute_d_worker_finished(self):
         self.compute_d_button.setEnabled(True)
+        self.compute_d_cancel_button.setEnabled(False)
         self.compute_d_progress.setVisible(False)
         self._compute_d_worker_ref = None
 
     def _on_compute_d_finished(self, result):
+        if result is CANCELLED:
+            self.log("D computation cancelled - previous results are unchanged")
+            return
         d_map, msd_map = result
         self._track_diffusion_cache = d_map
         self._track_msd_cache = msd_map
-        self.log(f"Computed D for {len(d_map)} of {self.tracks['particle'].nunique()} trajectories")
+        n_input = getattr(self, "_d_input_track_count", None) or int(self.tracks["particle"].nunique())
+        self.log(f"Computed D for {len(d_map)} of {n_input} trajectories")
+        # The linking readout can now say how many measured D exceed the cutoff.
+        self._update_link_cutoff_label()
         self._set_metric_default_bounds("D", d_map)
         self._set_metric_view_default("D", d_map)
         self._draw_metric_histogram("D")
@@ -1556,16 +5009,21 @@ class LocalizationTrackingWidget(QWidget):
         worker.start()
 
     def _on_fit_free_metrics_finished(self, result):
-        distance_map, duration_map = result
+        distance_map, net_map, straightness_map, duration_map = result
         self._track_distance_cache = distance_map
+        self._track_net_cache = net_map
+        self._track_straightness_cache = straightness_map
         self._track_duration_cache = duration_map
-        self._set_metric_default_bounds("distance", distance_map)
-        self._set_metric_default_bounds("duration", duration_map)
-        self._set_metric_view_default("distance", distance_map)
-        self._set_metric_view_default("duration", duration_map)
-        self._draw_metric_histogram("distance")
-        self._draw_metric_histogram("duration")
-        self.log(f"Computed distance/duration for {len(distance_map)} trajectories")
+        for key, values in (("distance", distance_map), ("net", net_map),
+                            ("straightness", straightness_map),
+                            ("duration", duration_map)):
+            self._set_metric_default_bounds(key, values)
+            self._set_metric_view_default(key, values)
+            self._draw_metric_histogram(key)
+        self.log(
+            f"Computed distance, end-to-end displacement, straightness and "
+            f"duration for {len(distance_map)} trajectories"
+        )
 
     def _set_metric_default_bounds(self, key, cache):
         boxes = self._metric_bound_boxes.get(key)
@@ -1584,23 +5042,68 @@ class LocalizationTrackingWidget(QWidget):
         max_box.blockSignals(False)
 
     def _metric_cache(self, key):
+        if key == "time":
+            return self._time_metric_cache()
         return getattr(self, METRIC_CACHE_ATTR[key]) or {}
+
+    def _time_metric_cache(self):
+        """The frame each trajectory first appears in.
+
+        Time is the one colouring that needs no computing - it is in the table
+        already - which is why it is built on demand here instead of being
+        cached like D, distance and duration.
+        """
+        if self.tracks is None or self.tracks.empty:
+            return {}
+        return self.tracks.groupby("particle")["frame"].min().to_dict()
 
     def _current_metric_key(self):
         choice = self.color_metric_box.currentText()
-        if choice.startswith("D"):
+        if choice.startswith("D ("):
             return "D"
         if choice.startswith("Distance"):
             return "distance"
+        if choice.startswith("End-to-end"):
+            return "net"
+        if choice.startswith("Straightness"):
+            return "straightness"
+        if choice.startswith("Time"):
+            return "time"
         return "duration"
 
+    def _log_floor(self, key, requested):
+        """A positive lower end for a log scale, from the data when need be.
+
+        Zero is both the natural lower bound for a length or a rate and the one
+        value a log axis cannot place. Substituting a fixed tiny constant - which
+        this used to do - spends most of the axis, and most of the colormap, on
+        decades that hold nothing: the histogram then looks like every
+        trajectory is jammed against the right-hand edge with eight empty
+        decades to its left. The smallest value actually present is the honest
+        floor, and an explicit positive bound is always respected.
+        """
+        if requested > 0:
+            return float(requested)
+        values = np.asarray(list(self._metric_cache(key).values()), float)
+        values = values[np.isfinite(values) & (values > 0)]
+        return float(values.min()) if values.size else 1e-9
+
     def _metric_norm_range(self, key):
+        if key == "time":
+            # No bounds box to read: time is spread over whatever the data
+            # covers, so the first trajectory is at one end of the colormap and
+            # the last at the other however long the acquisition ran.
+            frames = (self.tracks["frame"] if self.tracks is not None
+                      and not self.tracks.empty else None)
+            lo = float(frames.min()) if frames is not None else 0.0
+            hi = float(frames.max()) if frames is not None else 1.0
+            return lo, max(hi, lo + 1e-9), False
         min_box, max_box = self._metric_bound_boxes[key]
         use_log = self._metric_use_log[key]
         lo = min_box.value()
         hi = max_box.value()
         if use_log:
-            lo = max(lo, 1e-12)
+            lo = self._log_floor(key, lo)
             hi = max(hi, lo * 1.0001)
         else:
             hi = max(hi, lo + 1e-9)
@@ -1613,12 +5116,155 @@ class LocalizationTrackingWidget(QWidget):
             return np.clip((np.log10(values) - np.log10(lo)) / (np.log10(hi) - np.log10(lo)), 0.0, 1.0)
         return np.clip((values - lo) / (hi - lo), 0.0, 1.0)
 
-    def _on_color_settings_changed(self, *_args):
-        for key in ("D", "distance", "duration"):
+    def _on_color_mode_changed(self, *_args):
+        # Switching between metric colouring and per-track colours changes what
+        # the layers are coloured *by*, not just the values, so this one does
+        # need a rebuild. It is a single checkbox click, not a dragged value.
+        for key in COMPUTED_METRICS:
             self._draw_metric_histogram(key)
         self.render_overlay()
 
+    def _on_color_settings_changed(self, *_args):
+        for key in COMPUTED_METRICS:
+            self._draw_metric_histogram(key)
+        # Metric choice and colormap are display-only: recolour, do not rebuild.
+        self._refresh_metric_colors()
+
+    def _refresh_metric_colors(self):
+        """Recolour the trajectory layers in place, without rebuilding geometry.
+
+        Metric bounds, the chosen metric and the colormap only affect colour, so
+        touching layer.properties / layer.edge_color is enough. Rebuilding the
+        Tracks and Shapes layers costs seconds once there are a few thousand
+        trajectories; this costs tens of milliseconds.
+        """
+        if self.tracks is None or self.tracks.empty:
+            return
+        if not self.color_trajectories_box.isChecked():
+            # Colours come from track identity, not from a metric: nothing to update.
+            return
+
+        key = self._current_metric_key()
+        cache = self._metric_cache(key)
+
+        if TRACKS_LAYER_NAME in self.viewer.layers and self._tracks_layer_particles is not None:
+            layer = self.viewer.layers[TRACKS_LAYER_NAME]
+            raw = np.array([cache.get(pid, np.nan) for pid in self._tracks_layer_particles], float)
+            norm = np.zeros_like(raw)
+            valid = np.isfinite(raw)
+            if valid.any():
+                norm[valid] = self._normalize_metric(key, raw[valid])
+            try:
+                layer.properties = {"metric_color": norm}
+                layer.colormaps_dict = {
+                    "metric_color": _get_napari_colormap(self.d_colormap_box.currentText())
+                }
+                layer.color_by = "metric_color"
+            except Exception:
+                # Any napari-side refusal falls back to the full rebuild.
+                self.render_overlay()
+                return
+
+        if ALL_TRACKS_LAYER_NAME in self.viewer.layers and self._all_tracks_particle_ids:
+            layer = self.viewer.layers[ALL_TRACKS_LAYER_NAME]
+            cmap = matplotlib.colormaps[self.d_colormap_box.currentText()]
+            colors = np.empty((len(self._all_tracks_particle_ids), 4), float)
+            for i, pid in enumerate(self._all_tracks_particle_ids):
+                val = cache.get(pid)
+                if val is None or not np.isfinite(val):
+                    colors[i] = (0.53, 0.53, 0.53, 1.0)
+                else:
+                    colors[i] = cmap(float(self._normalize_metric(key, np.array([val]))[0]))
+            layer.edge_color = colors
+
+    def apply_display_settings(self):
+        """Explicit refresh, for when live updating is switched off."""
+        self._metric_render_timer.stop()
+        self._apply_track_style()
+        self._refresh_metric_colors()
+
+    def _accumulating_tracks(self):
+        box = getattr(self, "traj_accumulate_box", None)
+        return box is not None and box.isChecked()
+
+    def _tail_length(self):
+        """Frames of trail behind the current one; 0 in the box means all of it.
+
+        Accumulating is the same setting made to grow: the trail is however far
+        the current frame is past the chosen start, so it always reaches back to
+        exactly that frame and no further.
+        """
+        if self._accumulating_tracks():
+            return max(1, self._get_current_frame() - self.traj_start_frame_box.value())
+        return self.traj_fade_box.value() or getattr(self, "_tracks_full_span", 1)
+
+    def _on_accumulate_changed(self):
+        accumulating = self._accumulating_tracks()
+        self.traj_start_frame_box.setEnabled(accumulating)
+        # A fixed trail and an accumulating one are two answers to the same
+        # question, so only one of them is live at a time.
+        self.traj_fade_box.setEnabled(not accumulating)
+        self._on_fade_changed()
+
+    def _on_fade_changed(self):
+        self._apply_track_style()
+        self._update_fade_status()
+
+    def _sync_accumulating_tracks(self):
+        """Regrow the trail as the slider moves, so it still reaches the start."""
+        if not self._accumulating_tracks():
+            return
+        if TRACKS_LAYER_NAME not in self.viewer.layers:
+            return
+        try:
+            self.viewer.layers[TRACKS_LAYER_NAME].tail_length = self._tail_length()
+        except Exception:
+            pass
+
+    def _update_fade_status(self):
+        """Say the trail length in seconds, which is what it is really chosen in."""
+        if not hasattr(self, "traj_fade_status"):
+            return
+        interval = 1.0 / max(float(self.fps_box.value()), 1e-9)
+        if self._accumulating_tracks():
+            start = self.traj_start_frame_box.value()
+            self.traj_fade_status.setText(
+                f"Trajectories build up from frame {start} "
+                f"({start * interval:.3g} s) onwards.")
+            return
+        frames = self.traj_fade_box.value()
+        if frames <= 0:
+            self.traj_fade_status.setText(
+                "Trajectories stay drawn for their whole length.")
+            return
+        self.traj_fade_status.setText(
+            f"{frames} frames of trail = {frames * interval:.3g} s of acquisition.")
+
+    def _apply_track_style(self):
+        """Widths and tail behaviour are properties of the live layers, not a rebuild."""
+        if TRACKS_LAYER_NAME in self.viewer.layers:
+            layer = self.viewer.layers[TRACKS_LAYER_NAME]
+            layer.tail_width = self.line_width_box.value()
+            layer.tail_length = self._tail_length()
+            layer.hide_completed_tracks = not self.persist_tracks_box.isChecked()
+        if ALL_TRACKS_LAYER_NAME in self.viewer.layers:
+            self.viewer.layers[ALL_TRACKS_LAYER_NAME].edge_width = (
+                self.all_tracks_line_width_box.value()
+            )
+
     # --- generic metric histogram (used for D, distance, duration) ---
+    def _on_metric_log_toggled(self, key, use_log):
+        """Switch a metric between a logarithmic and a linear scale.
+
+        The setting is not the histogram's alone: `_metric_norm_range` reads it
+        too, so it decides how the same numbers are spread across the colormap
+        on the trajectories themselves. Changing one without the other would
+        leave the plot and the viewer disagreeing about what a colour means.
+        """
+        self._metric_use_log[key] = bool(use_log)
+        self._draw_metric_histogram(key)
+        self._refresh_metric_colors()
+
     def _make_metric_histogram(self, key):
         container = QWidget()
         layout = QVBoxLayout(container)
@@ -1632,17 +5278,42 @@ class LocalizationTrackingWidget(QWidget):
         bins_box.setMaximumWidth(55)
         toolbar.addWidget(bins_box)
         toolbar.addWidget(QLabel("View:"))
+        # Enough decimals to hold the bounds these mirror when "follow filter"
+        # is on. At four, a D bound of 4e-5 was rounded to a flat zero on the
+        # way in, and the log axis then had to start from nothing and spent
+        # eight decades getting back to the data.
         view_min_box = QDoubleSpinBox()
         view_min_box.setRange(-1e9, 1e9)
-        view_min_box.setDecimals(4)
-        view_min_box.setMaximumWidth(75)
+        view_min_box.setDecimals(METRIC_VIEW_DECIMALS)
+        view_min_box.setMaximumWidth(90)
         toolbar.addWidget(view_min_box)
         toolbar.addWidget(QLabel(u"–"))
         view_max_box = QDoubleSpinBox()
         view_max_box.setRange(-1e9, 1e9)
-        view_max_box.setDecimals(4)
-        view_max_box.setMaximumWidth(75)
+        view_max_box.setDecimals(METRIC_VIEW_DECIMALS)
+        view_max_box.setMaximumWidth(90)
+        adaptive_steps(view_min_box, view_max_box)
         toolbar.addWidget(view_max_box)
+        follow_box = QCheckBox("follow filter")
+        follow_box.setChecked(True)
+        view_min_box.setEnabled(False)  # follow_box starts checked
+        view_max_box.setEnabled(False)
+        follow_box.setToolTip(
+            "Keep the plotted range equal to the min/max bounds above.\n"
+            "Uncheck to set the view range independently of the filter."
+        )
+        toolbar.addWidget(follow_box)
+        log_box = QCheckBox("log")
+        log_box.setChecked(self._metric_use_log.get(key, False))
+        log_box.setToolTip(
+            "Spread the axis logarithmically. These quantities run over orders "
+            "of magnitude across a population - a linear axis piles most "
+            "trajectories into the first bin and shows the spread of the few "
+            "fastest instead.\n\n"
+            "It sets the colour scale as well as the histogram, so the "
+            "trajectories in the viewer are shaded on the same scale."
+        )
+        toolbar.addWidget(log_box)
         toolbar.addStretch(1)
         layout.addLayout(toolbar)
 
@@ -1657,6 +5328,8 @@ class LocalizationTrackingWidget(QWidget):
             "bins_box": bins_box,
             "view_min_box": view_min_box,
             "view_max_box": view_max_box,
+            "follow_box": follow_box,
+            "log_box": log_box,
             "drag": None,
             "lower_line": None,
             "upper_line": None,
@@ -1666,15 +5339,53 @@ class LocalizationTrackingWidget(QWidget):
         bins_box.valueChanged.connect(lambda _v, k=key: self._draw_metric_histogram(k))
         view_min_box.valueChanged.connect(lambda _v, k=key: self._draw_metric_histogram(k))
         view_max_box.valueChanged.connect(lambda _v, k=key: self._draw_metric_histogram(k))
+        follow_box.toggled.connect(lambda _on, k=key: self._on_metric_follow_toggled(k))
+        log_box.toggled.connect(lambda on, k=key: self._on_metric_log_toggled(k, on))
 
         canvas.mpl_connect("button_press_event", lambda evt, k=key: self._on_metric_hist_press(k, evt))
         canvas.mpl_connect("motion_notify_event", lambda evt, k=key: self._on_metric_hist_motion(k, evt))
         canvas.mpl_connect("button_release_event", lambda evt, k=key: self._on_metric_hist_release(k, evt))
         return container
 
+    def _on_metric_follow_toggled(self, key):
+        state = self._metric_hist_widgets.get(key)
+        if not state:
+            return
+        following = state["follow_box"].isChecked()
+        # While following, the view boxes mirror the bounds and are not editable.
+        state["view_min_box"].setEnabled(not following)
+        state["view_max_box"].setEnabled(not following)
+        if following:
+            self._sync_metric_view_to_bounds(key)
+        else:
+            self._draw_metric_histogram(key)
+
+    def _sync_metric_view_to_bounds(self, key):
+        """Mirror the filter bounds into the plotted range, unless decoupled."""
+        state = self._metric_hist_widgets.get(key)
+        if not state or not state["follow_box"].isChecked():
+            return
+        min_box, max_box = self._metric_bound_boxes[key]
+        view_min_box, view_max_box = state["view_min_box"], state["view_max_box"]
+        lower, upper = min_box.value(), max_box.value()
+        if upper <= lower:
+            upper = lower + 1e-9
+        view_min_box.blockSignals(True)
+        view_max_box.blockSignals(True)
+        view_min_box.setValue(lower)
+        view_max_box.setValue(upper)
+        view_min_box.blockSignals(False)
+        view_max_box.blockSignals(False)
+        self._draw_metric_histogram(key)
+
     def _set_metric_view_default(self, key, cache):
         state = self._metric_hist_widgets.get(key)
         if not state or not cache:
+            return
+        if state["follow_box"].isChecked():
+            # The plotted range is the filter range; don't override it with the
+            # data range.
+            self._sync_metric_view_to_bounds(key)
             return
         values = np.asarray(list(cache.values()), float)
         values = values[np.isfinite(values)]
@@ -1717,7 +5428,7 @@ class LocalizationTrackingWidget(QWidget):
 
         centers = np.array([])
         if use_log:
-            view_lo = max(view_lo, 1e-9)
+            view_lo = self._log_floor(key, view_lo)
             shown = values[(values >= view_lo) & (values <= view_hi)]
             if len(shown):
                 bins = np.logspace(np.log10(view_lo), np.log10(view_hi), n_bins + 1)
@@ -1741,18 +5452,22 @@ class LocalizationTrackingWidget(QWidget):
             figure.colorbar(sm, ax=ax)
         if use_log:
             ax.set_xscale("log")
+        if view_hi <= view_lo:
+            # Degenerate range (both bounds still at the same value): give the
+            # axis a nominal span rather than letting matplotlib warn about it.
+            span = abs(view_lo) * 0.5 or 1.0
+            view_lo, view_hi = view_lo - span, view_lo + span
         ax.set_xlim(view_lo, view_hi)
 
         min_box, max_box = self._metric_bound_boxes[key]
         lower, upper = min_box.value(), max_box.value()
-        state["span"] = ax.axvspan(lower, upper, color="black", alpha=0.08, zorder=0)
-        state["lower_line"] = ax.axvline(lower, color="black", linewidth=1.5)
-        state["upper_line"] = ax.axvline(upper, color="black", linewidth=1.5)
+        state["span"] = ax.axvspan(lower, upper, color=LAVENDER, alpha=0.15, zorder=0)
+        state["lower_line"] = ax.axvline(lower, color=LAVENDER, linewidth=1.5)
+        state["upper_line"] = ax.axvline(upper, color=LAVENDER, linewidth=1.5)
 
         ax.set_xlabel(METRIC_LABELS[key])
         ax.set_ylabel("Count")
-        ax.set_title(f"{len(values)} trajectories")
-        ax.grid(True, which="both", axis="both", alpha=0.3)
+        style_axes(figure, ax, title=f"{len(values)} trajectories")
         figure.tight_layout()
         state["canvas"].draw_idle()
 
@@ -1765,7 +5480,7 @@ class LocalizationTrackingWidget(QWidget):
         lower, upper = min_box.value(), max_box.value()
         if state.get("span") is not None:
             state["span"].remove()
-        state["span"] = ax.axvspan(lower, upper, color="black", alpha=0.08, zorder=0)
+        state["span"] = ax.axvspan(lower, upper, color=LAVENDER, alpha=0.15, zorder=0)
         if state.get("lower_line") is not None:
             state["lower_line"].set_xdata([lower, lower])
         if state.get("upper_line") is not None:
@@ -1774,12 +5489,14 @@ class LocalizationTrackingWidget(QWidget):
 
     def _on_metric_bounds_changed(self, key):
         self._sync_metric_hist_lines(key)
-        # Dragging a bound (or typing into the spinbox) fires this on every
-        # intermediate value. Rebuilding the trajectory layers on every one
-        # of those - especially with many trajectories - is what made
-        # "rescaling colors" freeze the UI; coalesce into a single rebuild
-        # a short delay after the last change instead.
-        self._metric_render_timer.start(150)
+        self._sync_metric_view_to_bounds(key)
+        # A metric bound only changes the colour scale - no geometry moves - so
+        # this recolours the existing layers instead of rebuilding them. The
+        # rebuild it used to do costs ~2.8 s for 1500 trajectories against ~70 ms
+        # for a recolour, which is what made every keystroke freeze the UI.
+        # Still coalesced, because typing or dragging fires it per intermediate value.
+        if self.live_display_box.isChecked():
+            self._metric_render_timer.start(120)
 
     def _on_metric_hist_press(self, key, event):
         state = self._metric_hist_widgets.get(key)
@@ -1821,13 +5538,27 @@ class LocalizationTrackingWidget(QWidget):
             return
         state["drag"] = None
         self._metric_render_timer.stop()
-        self.render_overlay()
+        if self.live_display_box.isChecked():
+            self._refresh_metric_colors()
+
+    @staticmethod
+    def _msd_label(pid, D, slope_error):
+        """One legend entry: the trajectory, its D, and how well D is pinned down.
+
+        D is a quarter of the fitted slope, so the error on it is a quarter of
+        the error on the slope. A trajectory too short for the covariance to be
+        defined simply shows no error rather than a fabricated zero.
+        """
+        if not np.isfinite(slope_error):
+            return f"#{pid} D={D:.3g} µm²/s"
+        return f"#{pid} D={D:.3g}±{slope_error / 4.0:.2g} µm²/s"
 
     def _draw_msd_validation(self):
         figure = self.msd_figure
         figure.clear()
         ax = figure.add_subplot(111)
         if not self._track_msd_cache:
+            style_axes(figure, ax)
             self.msd_canvas.draw_idle()
             return
 
@@ -1842,19 +5573,40 @@ class LocalizationTrackingWidget(QWidget):
         )
 
         for i, idx in enumerate(idxs):
-            pid, (tau, msd_vals, slope, intercept) = items[idx]
+            pid, (tau, msd_vals, slope, intercept, slope_error) = items[idx]
             D = self._track_diffusion_cache.get(pid, float("nan"))
-            ax.plot(tau, msd_vals, "o-", color=colors[i], alpha=0.85, markersize=3, linewidth=1)
-            fit_tau = np.array([0.0, tau.max()])
-            ax.plot(
-                fit_tau, slope * fit_tau + intercept, "--", color=colors[i], alpha=0.6, linewidth=1,
-                label=f"#{pid} D={D:.3g} µm²/s",
-            )
+            # Log axes cannot show a non-positive value, and an MSD of exactly
+            # zero at a lag nothing moved over is perfectly possible, so the
+            # points are masked rather than left for matplotlib to drop silently.
+            drawable = np.isfinite(msd_vals) & (msd_vals > 0) & (tau > 0)
+            ax.plot(tau[drawable], msd_vals[drawable], "o-", color=colors[i],
+                    alpha=0.85, markersize=3, linewidth=1)
+
+            # The fit is a straight line in MSD, which on log axes is a curve,
+            # so it needs sampling rather than its two end points. It starts at
+            # the first lag time rather than at zero: tau=0 cannot be drawn, and
+            # a fit with a negative intercept has no positive MSD there anyway.
+            positive_tau = tau[tau > 0]
+            if positive_tau.size:
+                fit_tau = np.geomspace(positive_tau.min(), positive_tau.max(), 100)
+                fit_msd = slope * fit_tau + intercept
+                visible = fit_msd > 0
+                ax.plot(fit_tau[visible], fit_msd[visible], "--", color=colors[i],
+                        alpha=0.6, linewidth=1, label=self._msd_label(pid, D, slope_error))
+
+        # Display only: the fit above was made on the raw values. A log-log MSD
+        # is read for its *slope* - 1 for free diffusion, flatter for confined,
+        # steeper for directed - which a linear plot buries at the short lags
+        # where the difference actually shows.
+        ax.set_xscale("log")
+        ax.set_yscale("log")
         ax.set_xlabel("Lag time (s)")
         ax.set_ylabel("MSD (µm²)")
-        ax.set_title(f"MSD fit validation ({n_sample} example trajectories)")
-        ax.legend(fontsize=6, loc="upper left", ncol=2)
-        ax.grid(True, alpha=0.3)
+        style_axes(figure, ax,
+                   title=f"MSD fit validation ({n_sample} example trajectories)")
+        legend = ax.legend(fontsize=6, loc="upper left", ncol=2,
+                           facecolor=PLOT_BG, edgecolor=PANEL_LINE, labelcolor=INK)
+        legend.get_frame().set_alpha(0.85)
         figure.tight_layout()
         self.msd_canvas.draw_idle()
 
@@ -1866,7 +5618,6 @@ class LocalizationTrackingWidget(QWidget):
             self.log("Load data first")
             return
         self.export_button.setEnabled(False)
-        self.export_button_filter.setEnabled(False)
         try:
             csv_path = self.csv_edit.text().strip()
             image_path = self.image_edit.text().strip()
@@ -1882,15 +5633,52 @@ class LocalizationTrackingWidget(QWidget):
                 base_dir = Path.cwd()
             folder = self._make_analysis_folder(base_dir)
             folder.mkdir(parents=True, exist_ok=True)
+
+            # The figures belong to Qt canvases, so they have to be rendered
+            # here; the tables are just data and go to a worker.
             n_plots = self._export_plots(folder)
-            self._export_data(folder)
-            self._write_metadata(folder, csv_path)
-            self.log(f"Exported {n_plots} plots + data + metadata to {folder}")
+            tables = self._export_tables()
+            metadata = self._collect_metadata(csv_path)
         except Exception as exc:
             self.log(f"Export failed: {exc}")
-        finally:
             self.export_button.setEnabled(True)
-            self.export_button_filter.setEnabled(True)
+            return
+
+        rows = sum(len(frame) for _name, frame in tables)
+        self.log(f"Exported {n_plots} plots; writing {rows} rows to {folder}...")
+        self.export_progress.setVisible(True)
+        self.export_progress.setValue(0)
+        self._arm_cancel(self._export_cancel, self.export_cancel_button)
+
+        worker = _export_worker(folder, tables, metadata, self._export_cancel)
+        worker.yielded.connect(lambda frac: self.export_progress.setValue(int(frac * 100)))
+        worker.returned.connect(self._on_export_finished)
+        worker.errored.connect(lambda exc: self.log(f"Export failed: {exc}"))
+        worker.finished.connect(self._on_export_worker_finished)
+        self._export_worker_ref = worker
+        worker.start()
+
+    def _export_tables(self):
+        """The tables to write, prepared on the GUI thread."""
+        tables = []
+        if self.df_filtered is not None:
+            tables.append(("localizations_filtered.csv", self.df_filtered))
+        if self.tracks is not None and not self.tracks.empty:
+            tables.append(("trajectories.csv", self.tracks))
+            tables.append(("track_metrics.csv", self._track_metrics_frame()))
+        return tables
+
+    def _on_export_worker_finished(self):
+        self.export_button.setEnabled(True)
+        self.export_cancel_button.setEnabled(False)
+        self.export_progress.setVisible(False)
+        self._export_worker_ref = None
+
+    def _on_export_finished(self, result):
+        if result is CANCELLED:
+            self.log("Export cancelled - the folder may hold a partial export")
+            return
+        self.log(f"Export complete: {result}")
 
     def _make_analysis_folder(self, base_dir):
         candidate = base_dir / "analysis"
@@ -1929,32 +5717,31 @@ class LocalizationTrackingWidget(QWidget):
             count += 1
         return count
 
-    def _export_data(self, folder):
-        data_dir = folder / "data"
-        data_dir.mkdir(parents=True, exist_ok=True)
-        if self.df_filtered is not None:
-            self.df_filtered.to_csv(data_dir / "localizations_filtered.csv", index=False)
-        if self.tracks is not None and not self.tracks.empty:
-            self.tracks.to_csv(data_dir / "trajectories.csv", index=False)
-            self._export_track_metrics(data_dir)
-
-    def _export_track_metrics(self, data_dir):
+    def _track_metrics_frame(self):
         particle_ids = sorted(self.tracks["particle"].unique())
         d_map = self._track_diffusion_cache or {}
         distance_map = self._track_distance_cache or {}
+        net_map = self._track_net_cache or {}
+        straightness_map = self._track_straightness_cache or {}
         duration_map = self._track_duration_cache or {}
-        rows = [
+        return pd.DataFrame([
             {
                 "particle": pid,
                 "D_um2_per_s": d_map.get(pid),
-                "distance_nm": distance_map.get(pid),
+                "distance_um": distance_map.get(pid),
+                "net_displacement_um": net_map.get(pid),
+                "straightness": straightness_map.get(pid),
                 "duration_s": duration_map.get(pid),
             }
             for pid in particle_ids
-        ]
-        pd.DataFrame(rows).to_csv(data_dir / "track_metrics.csv", index=False)
+        ])
 
     def _write_metadata(self, folder, csv_path):
+        with open(folder / "metadata.json", "w", encoding="utf-8") as f:
+            json.dump(self._collect_metadata(csv_path), f, indent=2, default=str)
+
+    def _collect_metadata(self, csv_path):
+        """Snapshot every setting as a plain dict, on the GUI thread."""
         n_tracks = int(self.tracks["particle"].nunique()) if self.tracks is not None and not self.tracks.empty else 0
         n_candidate_frames = sum(1 for c in self._loc2d_candidates if c is not None and len(c[0]) > 0)
 
@@ -1973,7 +5760,7 @@ class LocalizationTrackingWidget(QWidget):
             "source_csv": csv_path or None,
             "source_image": self.image_edit.text().strip() or None,
             "pixel_size_nm_per_px": self.pixel_size_box.value(),
-            "frame_one_indexed": self.frame_one_indexed_box.isChecked(),
+            "frame_number_shift": int(self._frame_shift),
             "n_localizations_total": len(self.df) if self.df is not None else 0,
             "n_localizations_filtered": len(self.df_filtered) if self.df_filtered is not None else 0,
             "filter_bounds": {
@@ -1988,21 +5775,74 @@ class LocalizationTrackingWidget(QWidget):
                 "n_frames_with_candidates": int(n_candidate_frames),
                 "n_candidates_total": int(self._loc2d_counts.sum()) if len(self._loc2d_counts) else 0,
             },
+            "smlm_rendering": {
+                "oversampling": self.render_oversampling_box.value(),
+                "mode": self.render_mode_box.currentData(),
+                "mode_label": self.render_mode_box.currentText(),
+                "global_sigma_nm": self.render_sigma_box.value(),
+                "sigma_column": self.render_sigma_column_box.currentText() or None,
+                "sigma_clamp_min_nm": self.render_sigma_min_box.value(),
+                "sigma_clamp_max_nm": self.render_sigma_max_box.value(),
+                "weight_by_photons": self.render_photons_box.isChecked(),
+                "colormap": self.render_colormap_box.currentText(),
+                "use_gpu": self.render_gpu_box.isChecked(),
+                "frames_per_group": self.render_frames_per_box.value(),
+                "grouping": self.render_grouping_box.currentData(),
+                "grouping_label": self.render_grouping_box.currentText(),
+                "window_step_frames": self.render_step_box.value(),
+                "add_layer_to_viewer": self.render_add_layer_box.isChecked(),
+                "write_png_snapshot": self.render_png_box.isChecked(),
+                "image_save_format": self.render_image_format_box.currentData(),
+                "movie_save_format": self.render_movie_format_box.currentData(),
+                "composite": {
+                    "reconstruction": self.render_composite_base_box.isChecked(),
+                    "localizations": self.render_composite_locs_box.isChecked(),
+                    "localization_color": self.render_locs_color_box.currentText(),
+                    "localization_size_nm": self.render_locs_size_box.value(),
+                    "trajectories": self.render_composite_tracks_box.isChecked(),
+                    "trajectory_color": self.render_tracks_color_box.currentText(),
+                    "trajectory_width_nm": self.render_tracks_width_box.value(),
+                    "every_visible_layer": self.render_composite_all_box.isChecked(),
+                },
+                "timestamp": {
+                    "enabled": self.render_timestamp_box.isChecked(),
+                    "height_px": self.render_timestamp_size_box.value(),
+                    "color": self.render_timestamp_color_box.currentText(),
+                    "position": self.render_timestamp_position_box.currentText(),
+                },
+                "scale_bar": {
+                    "enabled": self.render_scalebar_box.isChecked(),
+                    "automatic": self.render_scalebar_auto_box.isChecked(),
+                    "length_nm": self.render_scalebar_length_box.value(),
+                    "color": self.render_scalebar_color_box.currentText(),
+                    "position": self.render_scalebar_position_box.currentText(),
+                },
+                "crop_to_box": self.render_crop_box.isChecked(),
+                "gpu_status": smlm_render.render_gpu_status(),
+            },
             "linking": {
                 "search_range_nm": self.search_box.value(),
                 "memory": self.memory_box.value(),
                 "min_track_length": self.min_traj_box.value(),
+                # Acquisition timing belongs to linking now; older files carry it
+                # under "diffusion" and are still read from there.
+                "fps": self.fps_box.value(),
+                "frame_interval_ms": self.frame_interval_box.value(),
                 "n_trajectories": n_tracks,
             },
             "diffusion": {
                 "max_lagtime_frames": self.max_lagtime_box.value(),
-                "fps": self.fps_box.value(),
+                "min_track_length_for_d": self.d_min_length_box.value(),
                 "d_min": self.d_min_box.value(),
                 "d_max": self.d_max_box.value(),
                 "n_tracks_with_D": len(self._track_diffusion_cache or {}),
                 "msd_validation_sample_count": self.msd_sample_box.value(),
             },
-            "distance_bounds_nm": {"min": self.dist_min_box.value(), "max": self.dist_max_box.value()},
+            "distance_bounds_um": {"min": self.dist_min_box.value(), "max": self.dist_max_box.value()},
+            "net_displacement_bounds_um": {
+                "min": self.net_min_box.value(), "max": self.net_max_box.value()},
+            "straightness_bounds": {
+                "min": self.straight_min_box.value(), "max": self.straight_max_box.value()},
             "duration_bounds_s": {"min": self.dur_min_box.value(), "max": self.dur_max_box.value()},
             "coloring": {
                 "enabled": self.color_trajectories_box.isChecked(),
@@ -2035,12 +5875,15 @@ class LocalizationTrackingWidget(QWidget):
                     "bins": state["bins_box"].value(),
                     "view_min": state["view_min_box"].value(),
                     "view_max": state["view_max_box"].value(),
+                    "follow_filter": state["follow_box"].isChecked(),
+                    # Recorded because it decides how the colours were spread,
+                    # not just how the histogram looked.
+                    "log_scale": state["log_box"].isChecked(),
                 }
                 for key, state in self._metric_hist_widgets.items()
             },
         }
-        with open(folder / "metadata.json", "w", encoding="utf-8") as f:
-            json.dump(metadata, f, indent=2, default=str)
+        return metadata
 
     # ------------------------------------------------------------------
     # Tracks / all-tracks / ROI layers
@@ -2053,11 +5896,17 @@ class LocalizationTrackingWidget(QWidget):
 
         traj = self.tracks.sort_values(["particle", "frame"])
         track_id = traj["particle"].to_numpy(int)
+        # Remembered so colours can later be recomputed in this exact row order
+        # without rebuilding the layer.
+        self._tracks_layer_particles = track_id
         t = traj["frame"].to_numpy(int)
         y = traj["y"].to_numpy(float)
         x = traj["x"].to_numpy(float)
         data = np.column_stack([track_id, t, y, x])
-        tail_length = int(t.max() - t.min()) + 1 if len(t) else 1
+        # Remembered so the trail can be set back to "the whole trajectory"
+        # without rebuilding the layer to find out how long that is.
+        self._tracks_full_span = int(t.max() - t.min()) + 1 if len(t) else 1
+        tail_length = self._tail_length()
         hide_completed = not self.persist_tracks_box.isChecked()
 
         kwargs = dict(
@@ -2085,8 +5934,9 @@ class LocalizationTrackingWidget(QWidget):
             kwargs["color_by"] = "track_id"
             kwargs["colormap"] = "hsv"
 
-        tracks_layer = self.viewer.add_tracks(data, **kwargs)
+        tracks_layer = self.viewer.add_tracks(data, **self._placed(kwargs, 3))
         tracks_layer._get_tooltip_text = self._tracks_layer_tooltip
+        self._apply_viewer_scale()
 
     def _track_tooltip_lines(self, pid):
         if self.tracks is None:
@@ -2105,7 +5955,13 @@ class LocalizationTrackingWidget(QWidget):
             lines.append(f"duration: {duration_map[pid]:.3g} s")
         distance_map = self._track_distance_cache or {}
         if pid in distance_map:
-            lines.append(f"distance: {distance_map[pid]:.3g} nm")
+            lines.append(f"distance: {distance_map[pid]:.3g} µm")
+        net_map = self._track_net_cache or {}
+        if pid in net_map:
+            lines.append(f"end-to-end: {net_map[pid]:.3g} µm")
+        straightness_map = self._track_straightness_cache or {}
+        if pid in straightness_map and np.isfinite(straightness_map[pid]):
+            lines.append(f"straightness: {straightness_map[pid]:.2f}")
         d_map = self._track_diffusion_cache or {}
         if pid in d_map:
             lines.append(f"D: {d_map[pid]:.4g} µm²/s")
@@ -2181,8 +6037,28 @@ class LocalizationTrackingWidget(QWidget):
             face_color="transparent",
             edge_width=self.all_tracks_line_width_box.value(),
             name=ALL_TRACKS_LAYER_NAME,
+            **self._placed({}, 2),
         )
         all_tracks_layer._get_tooltip_text = self._all_tracks_layer_tooltip
+        self._apply_viewer_scale()
+
+    def _xy_filter_is_in_use(self, x_col, y_col):
+        """True when the x/y box is actually cropping something.
+
+        Compared against the bounds the filters were built with: if neither has
+        been moved, the box is selecting the whole field and is only clutter on
+        top of a reconstruction.
+        """
+        for column in (x_col, y_col):
+            lower_box, upper_box = self.filter_controls[column]
+            default = self._default_bounds.get(column)
+            if default is None:
+                continue
+            span = abs(default[1] - default[0]) or 1.0
+            if (abs(lower_box.value() - default[0]) > 1e-6 * span
+                    or abs(upper_box.value() - default[1]) > 1e-6 * span):
+                return True
+        return False
 
     def _sync_xy_roi_layer(self):
         x_col = self._resolve_column("x")
@@ -2193,6 +6069,15 @@ class LocalizationTrackingWidget(QWidget):
             or x_col not in self.filter_controls
             or y_col not in self.filter_controls
         ):
+            self._remove_layer(ROI_LAYER_NAME)
+            return
+
+        # The box is the x/y filter's only control, so it has to be there while
+        # the Filter tab is open. Everywhere else it is just a yellow rectangle
+        # sitting on top of the picture, so it is only kept when it is actually
+        # excluding localizations.
+        on_filter_tab = self.tabs.tabText(self.tabs.currentIndex()) == "Filter"
+        if not on_filter_tab and not self._xy_filter_is_in_use(x_col, y_col):
             self._remove_layer(ROI_LAYER_NAME)
             return
 
@@ -2229,10 +6114,12 @@ class LocalizationTrackingWidget(QWidget):
                     edge_color="yellow",
                     face_color="transparent",
                     edge_width=2,
+                    **self._placed({}, 2),
                 )
                 layer.mode = "select"
                 layer.selected_data = {0}
                 layer.events.data.connect(self._on_roi_changed)
+                self._apply_viewer_scale()
         finally:
             self._roi_updating = False
 
@@ -2290,14 +6177,15 @@ class LocalizationTrackingWidget(QWidget):
         bins_row.addWidget(QLabel("View:"))
         view_min_box = QDoubleSpinBox()
         view_min_box.setRange(-1e9, 1e9)
-        view_min_box.setDecimals(3)
-        view_min_box.setMaximumWidth(75)
+        view_min_box.setDecimals(FILTER_BOUND_DECIMALS)
+        view_min_box.setMaximumWidth(90)
         bins_row.addWidget(view_min_box)
         bins_row.addWidget(QLabel(u"–"))
         view_max_box = QDoubleSpinBox()
         view_max_box.setRange(-1e9, 1e9)
-        view_max_box.setDecimals(3)
-        view_max_box.setMaximumWidth(75)
+        view_max_box.setDecimals(FILTER_BOUND_DECIMALS)
+        view_max_box.setMaximumWidth(90)
+        adaptive_steps(view_min_box, view_max_box)
         bins_row.addWidget(view_max_box)
         bins_row.addStretch(1)
         layout.addLayout(bins_row)

@@ -11,6 +11,8 @@
 !/pyproject.toml
 !/tests/
 !/tests/**
+!/benchmarks/
+!/benchmarks/**
 !/napari_loc_track/
 !/napari_loc_track/**
 
