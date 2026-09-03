@@ -48,6 +48,7 @@ import trackpy as tp
 
 from ._acqmeta import read_acquisition_metadata
 from ._imageio import bin_frames, open_image_stack
+from . import _session as session_io
 from ._tracks import (
     DEFAULT_LINKING_ERROR_RATE,
     filter_tracks_by_length,
@@ -196,6 +197,28 @@ METRIC_VIEW_DECIMALS = 6
 # Filter columns carry whatever units the data came in - photons, nanometres,
 # micrometres - so the bounds need room for the small ones too.
 FILTER_BOUND_DECIMALS = 6
+
+
+def bound_to_box_precision(value, decimals, upward):
+    """A bound rounded *outwards* to what a spin box can hold.
+
+    A default bound is derived from the data and has to include the data it
+    came from. A six-decimal box turns a maximum of 49995.8477774829 into
+    49995.847777, which is below the value it was computed from - so the filter
+    built to keep everything drops the single most extreme localization in the
+    column, and does it silently in every column at once.
+
+    Rounding to the box's precision and then stepping one unit outwards if that
+    went the wrong way is exact in both directions, where scaling by a power of
+    ten and flooring is not.
+    """
+    rounded = round(float(value), decimals)
+    step = 10.0 ** -decimals
+    if upward and rounded < value:
+        return rounded + step
+    if not upward and rounded > value:
+        return rounded - step
+    return rounded
 
 # Only the pieces that need to differ from napari's own theme: the plugin sits
 # inside napari's dock, so inheriting its background and text keeps it looking
@@ -736,6 +759,22 @@ def _load_worker(csv_path, image_path, bin_factor=1, cancel=None):
         if not _is_cancelled(cancel):
             acquisition = read_acquisition_metadata(image_path)
     return df, image, how, acquisition, raw_image
+
+
+@thread_worker
+def _session_save_worker(session_path, manifest, locs_frame, locs_path):
+    """Write a session, and the localizations it cannot recover any other way.
+
+    Off the GUI thread because of that second part: gzipping a table of a few
+    million localizations takes tens of seconds, and the manifest itself is a
+    few kilobytes written in no time at all.
+    """
+    written = 0
+    if locs_frame is not None:
+        locs_frame.to_csv(locs_path, index=False, compression="gzip")
+        written += locs_path.stat().st_size
+    written += session_io.write_session(session_path, manifest)
+    return session_path, written
 
 
 @thread_worker
@@ -1335,6 +1374,15 @@ class LocalizationTrackingWidget(QWidget):
         self._time_bin_applied = 1
         self._bin_worker_ref = None
         self._bin_cancel = threading.Event()
+        # Where the trajectories came from, when they were read rather than
+        # linked: a session re-links its own trajectories but must not re-link
+        # someone else's, which these parameters would not reproduce.
+        self._tracks_source_path = None
+        # The queue of restore steps while a session is being reloaded, and None
+        # at every other moment - the completion hooks test it to tell an
+        # ordinary load from one step of a restore.
+        self._session_restore = None
+        self._session_save_worker_ref = None
         self.setup_ui()
 
     # ------------------------------------------------------------------
@@ -1481,6 +1529,306 @@ class LocalizationTrackingWidget(QWidget):
         if skipped:
             self.log(f"  {len(skipped)} setting(s) not applied: {', '.join(sorted(skipped)[:6])}")
         return applied
+
+    # ------------------------------------------------------------------
+    # Whole sessions: a manifest, and the pipeline re-run from it
+    # ------------------------------------------------------------------
+    def _capture_session_view(self):
+        """Where the viewer is looking, as far as it will say.
+
+        Guarded throughout: this has to work against whatever viewer the plugin
+        was handed, and a view that cannot be read back is not a reason to
+        refuse to save the session.
+        """
+        view = {}
+        dims = getattr(self.viewer, "dims", None)
+        if dims is not None:
+            try:
+                view["current_step"] = [int(v) for v in dims.current_step]
+                view["ndisplay"] = int(dims.ndisplay)
+            except (AttributeError, TypeError, ValueError):
+                pass
+        camera = getattr(self.viewer, "camera", None)
+        if camera is not None:
+            try:
+                view["camera"] = {
+                    "center": [float(v) for v in camera.center],
+                    "zoom": float(camera.zoom),
+                    "angles": [float(v) for v in camera.angles],
+                }
+            except (AttributeError, TypeError, ValueError):
+                pass
+        try:
+            view["layer_visibility"] = {
+                layer.name: bool(layer.visible) for layer in self.viewer.layers
+            }
+        except (AttributeError, TypeError):
+            pass
+        if hasattr(self, "tabs"):
+            view["active_tab"] = int(self.tabs.currentIndex())
+        return view
+
+    def _restore_session_view(self, view):
+        """Put the viewer back where it was, after the data is in place.
+
+        Last of all, because loading resets the camera to the whole field and
+        rebuilding the layers renumbers the slider - both of which would undo
+        this if it ran any earlier.
+        """
+        if not view:
+            return
+        dims = getattr(self.viewer, "dims", None)
+        if dims is not None:
+            try:
+                if "ndisplay" in view:
+                    dims.ndisplay = int(view["ndisplay"])
+                step = view.get("current_step")
+                if step:
+                    # The stack may be shorter than it was - a different binning
+                    # factor, or a truncated file - so every axis is clamped to
+                    # what exists now rather than trusted.
+                    limits = getattr(dims, "nsteps", None)
+                    for axis, value in enumerate(step):
+                        if axis >= len(dims.current_step):
+                            break
+                        if limits is not None and axis < len(limits):
+                            value = min(int(value), max(int(limits[axis]) - 1, 0))
+                        dims.set_current_step(axis, int(value))
+            except (AttributeError, TypeError, ValueError, IndexError):
+                pass
+        camera = getattr(self.viewer, "camera", None)
+        stored = view.get("camera") or {}
+        if camera is not None and stored:
+            try:
+                camera.center = tuple(stored["center"])
+                camera.zoom = float(stored["zoom"])
+                camera.angles = tuple(stored.get("angles", camera.angles))
+            except (AttributeError, TypeError, ValueError, KeyError):
+                pass
+        for name, visible in (view.get("layer_visibility") or {}).items():
+            try:
+                if name in self.viewer.layers:
+                    self.viewer.layers[name].visible = bool(visible)
+            except (AttributeError, TypeError):
+                pass
+        tab = view.get("active_tab")
+        if tab is not None and hasattr(self, "tabs"):
+            try:
+                self.tabs.setCurrentIndex(int(tab))
+            except (TypeError, ValueError):
+                pass
+
+    def _session_manifest(self, session_path):
+        """Everything needed to arrive back here, minus anything reproducible."""
+        session_dir = Path(session_path).parent
+        csv_path = self.csv_edit.text().strip()
+        image_path = self.image_edit.text().strip()
+        has_csv_on_disk = bool(csv_path) and Path(csv_path).is_file()
+        # Localizations that exist only in memory came from fitting in this
+        # session and were never written out. Re-fitting them costs minutes, so
+        # they travel with the session; everything else is a pointer.
+        writes_locs = self.df is not None and not has_csv_on_disk
+        locs_record = (session_io.source_record(session_io.locs_path_for(session_path), session_dir)
+                       if writes_locs
+                       else session_io.source_record(csv_path, session_dir))
+
+        tracks_path = getattr(self, "_tracks_source_path", None)
+        has_tracks = self.tracks is not None and not self.tracks.empty
+        return {
+            session_io.SESSION_KEY: session_io.SESSION_FORMAT,
+            "saved_at": datetime.now().isoformat(timespec="seconds"),
+            "sources": {
+                "image": session_io.source_record(image_path, session_dir),
+                "localizations": locs_record,
+                "trajectories": (session_io.source_record(tracks_path, session_dir)
+                                 if has_tracks and tracks_path else None),
+            },
+            "localizations_saved_with_session": bool(writes_locs),
+            # The same dict the exporter writes, so one restore path serves both
+            # and a setting can never be recorded by one and forgotten by the other.
+            "settings": self._collect_metadata(csv_path),
+            "rebuild": {
+                # Only if they were linked here: trajectories read from a file
+                # were not necessarily produced by these linking parameters, and
+                # re-linking would quietly replace them with different ones.
+                "link": bool(has_tracks and not tracks_path),
+                "diffusion": bool(self._track_diffusion_cache),
+                "render_image": self._render_image is not None,
+            },
+            "view": self._capture_session_view(),
+            # Checked after the restore. A source file edited since the session
+            # was saved rebuilds into something else entirely, and the count is
+            # the cheapest way to notice.
+            "expected": {
+                "localizations": int(len(self.df)) if self.df is not None else 0,
+                "filtered": int(len(self.df_filtered)) if self.df_filtered is not None else 0,
+                "trajectories": int(self.tracks["particle"].nunique()) if has_tracks else 0,
+            },
+        }
+
+    def save_session(self, path=None):
+        """Write the whole working state to a session file."""
+        if self.df is None and not self.image_edit.text().strip():
+            self.log("Nothing to save yet - load an image or some localizations first.")
+            return None
+        if path is None:
+            path, _ = QFileDialog.getSaveFileName(
+                self, "Save session", "", filter=session_io.SESSION_FILTER)
+            if not path:
+                return None
+        session_path = session_io.session_path_for(path)
+
+        try:
+            manifest = self._session_manifest(session_path)
+        except Exception as exc:
+            self.log(f"Could not build the session: {exc}")
+            return None
+
+        locs_frame = self.df if manifest["localizations_saved_with_session"] else None
+        locs_path = session_io.locs_path_for(session_path)
+        if locs_frame is not None:
+            self.log(f"These {len(locs_frame)} localizations are not on disk anywhere "
+                     f"else, so they are being saved with the session...")
+
+        self.save_session_button.setEnabled(False)
+        worker = _session_save_worker(session_path, manifest, locs_frame, locs_path)
+        worker.returned.connect(self._on_session_saved)
+        worker.errored.connect(lambda exc: self.log(f"Saving the session failed: {exc}"))
+        worker.finished.connect(
+            lambda: self.save_session_button.setEnabled(True))
+        self._session_save_worker_ref = worker
+        worker.start()
+        return session_path
+
+    def _on_session_saved(self, result):
+        path, written = result
+        self.log(f"Session saved to {path.name} ({written / 1024:.0f} kB) - "
+                 f"it points at the data rather than copying it, and rebuilds "
+                 f"the analysis on load.")
+
+    def load_session(self, path=None):
+        """Restore a session: apply its settings, then re-run the pipeline."""
+        if path is None:
+            path, _ = QFileDialog.getOpenFileName(
+                self, "Load session", "", filter=session_io.SESSION_FILTER)
+            if not path:
+                return None
+        path = Path(path)
+        try:
+            manifest = session_io.read_session(path)
+        except ValueError as exc:
+            self.log(f"{path.name} {exc}")
+            return None
+
+        session_dir = path.parent
+        missing = session_io.missing_sources(manifest, session_dir)
+        for name, where in missing:
+            self.log(f"The {name} this session refers to is not where it was saved: {where}")
+
+        self.log(f"Loading session {path.name} ({session_io.describe_session(manifest)})")
+
+        # The stack is about to be re-opened from scratch, so the handle held
+        # for re-binning is stale; clearing it stops the restored binning factor
+        # from re-binning the *previous* session's stack on its way past.
+        self._raw_image = None
+        applied, skipped, notes = self.apply_settings(manifest.get("settings") or {})
+        self.log(f"Restored {len(applied)} settings")
+        for note in notes:
+            self.log(f"  note: {note}")
+        if skipped:
+            self.log(f"  {len(skipped)} setting(s) not applied: {', '.join(sorted(skipped)[:6])}")
+
+        sources = manifest.get("sources") or {}
+        image = session_io.resolve_source(sources.get("image"), session_dir)
+        locs = session_io.resolve_source(sources.get("localizations"), session_dir)
+        self.image_edit.setText(str(image) if image else "")
+        self.csv_edit.setText(str(locs) if locs else "")
+
+        self._session_restore = {
+            "manifest": manifest,
+            "session_dir": session_dir,
+            "name": path.name,
+            "steps": ["link", "diffusion", "render", "view"],
+        }
+        if image or locs:
+            self.load_data()
+            if self._load_worker_ref is not None:
+                return manifest      # the chain resumes when the load finishes
+        else:
+            self.log("This session records no data files, so only its settings were restored.")
+        self._session_advance()
+        return manifest
+
+    def _session_advance(self):
+        """Run the next restore step, or finish. Called as each worker ends.
+
+        Every step here is asynchronous, so the sequence cannot be a function:
+        it is a queue that each completed worker pushes along. A step that turns
+        out to have nothing to do falls through to the next one in the same
+        pass rather than stalling the chain waiting for a worker that was never
+        started.
+        """
+        plan = self._session_restore
+        if plan is None:
+            return
+        while plan["steps"]:
+            step = plan["steps"].pop(0)
+            if step == "link" and self._session_relink_wanted(plan):
+                self.link_tracks()
+                if self._link_worker_ref is not None:
+                    return
+            elif step == "diffusion" and self._session_diffusion_wanted(plan):
+                self.compute_d()
+                if self._compute_d_worker_ref is not None:
+                    return
+            elif step == "render" and self._session_render_wanted(plan):
+                self.render_smlm_image()
+                if self._render_worker_ref is not None:
+                    return
+            elif step == "view":
+                self._restore_session_view(plan["manifest"].get("view") or {})
+        self._finish_session_restore()
+
+    def _session_relink_wanted(self, plan):
+        if not (plan["manifest"].get("rebuild") or {}).get("link"):
+            return False
+        if self.tracks is not None and not self.tracks.empty:
+            return False           # a recorded trajectories file was loaded instead
+        return self.df_filtered is not None and not self.df_filtered.empty
+
+    def _session_diffusion_wanted(self, plan):
+        if not (plan["manifest"].get("rebuild") or {}).get("diffusion"):
+            return False
+        return self.tracks is not None and not self.tracks.empty
+
+    def _session_render_wanted(self, plan):
+        if not (plan["manifest"].get("rebuild") or {}).get("render_image"):
+            return False
+        return self.df_filtered is not None and not self.df_filtered.empty
+
+    def _finish_session_restore(self):
+        plan, self._session_restore = self._session_restore, None
+        if plan is None:
+            return
+        expected = (plan["manifest"].get("expected") or {})
+        actual = {
+            "localizations": int(len(self.df)) if self.df is not None else 0,
+            "filtered": int(len(self.df_filtered)) if self.df_filtered is not None else 0,
+            "trajectories": (int(self.tracks["particle"].nunique())
+                             if self.tracks is not None and not self.tracks.empty else 0),
+        }
+        # A source edited since the session was saved rebuilds into something
+        # else, and a session that says it restored a state it did not reach is
+        # worse than one that admits it.
+        differences = [f"{name}: {expected[name]} then, {actual[name]} now"
+                       for name in expected
+                       if int(expected.get(name, 0)) != actual.get(name, 0)]
+        if differences:
+            self.log("Session restored, but not to the same numbers - "
+                     + "; ".join(differences))
+        else:
+            self.log(f"Session {plan['name']} restored.")
+        self._update_status_header()
 
     def apply_settings(self, metadata):
         """Apply a metadata dict to the controls. Returns (applied, skipped, notes)."""
@@ -1777,6 +2125,36 @@ class LocalizationTrackingWidget(QWidget):
         load_row.addWidget(self.load_button)
         load_row.addWidget(self.load_cancel_button)
         data_layout.addRow("", load_row)
+
+        # A session is the whole working state, not just the numbers in the
+        # boxes: which files, which parameters, what had been computed, and
+        # where the viewer was looking. It stays small by pointing at the data
+        # instead of copying it and by rebuilding the analysis on load.
+        session_row = QHBoxLayout()
+        self.save_session_button = QPushButton("Save session...")
+        self.save_session_button.setProperty("secondary", True)
+        self.save_session_button.setToolTip(
+            "Write the whole working state to a small session file: the data "
+            "paths, every parameter, and what had been computed.\n\n"
+            "The raw stack is never copied. Trajectories, diffusion "
+            "coefficients and reconstructions are rebuilt on load from the "
+            "parameters that produced them, so a session is a few kilobytes.\n\n"
+            "The exception is localizations fitted here and never saved "
+            "anywhere - those are written beside the session, gzipped, because "
+            "re-fitting them costs minutes."
+        )
+        self.save_session_button.clicked.connect(lambda: self.save_session())
+        self.load_session_button = QPushButton("Load session...")
+        self.load_session_button.setProperty("secondary", True)
+        self.load_session_button.setToolTip(
+            "Reopen a saved session: restore every parameter, reload the data, "
+            "then re-run linking, diffusion and rendering to arrive back where "
+            "it was left."
+        )
+        self.load_session_button.clicked.connect(lambda: self.load_session())
+        session_row.addWidget(self.save_session_button)
+        session_row.addWidget(self.load_session_button)
+        data_layout.addRow("Session", session_row)
 
         self.load_settings_button = QPushButton("Load settings from a previous analysis...")
         self.load_settings_button.setProperty("secondary", True)
@@ -3078,6 +3456,7 @@ class LocalizationTrackingWidget(QWidget):
         self.load_cancel_button.setEnabled(False)
         self.load_progress.setVisible(False)
         self._load_worker_ref = None
+        self._session_advance()
 
     def _on_load_errored(self, exc):
         self.log(f"Failed to load data: {exc}")
@@ -3368,6 +3747,11 @@ class LocalizationTrackingWidget(QWidget):
         return None
 
     def _try_autoload_trajectories(self, base_path):
+        if self._session_restore is not None:
+            # A session says for itself where its trajectories came from, and
+            # rebuilds them the way it recorded. Picking up whatever file
+            # happens to sit next to the data would restore a different run.
+            return
         found = self._find_companion_file(base_path, TRAJ_FILENAME_PATTERNS, TRAJ_ANALYSIS_SUBPATH)
         if found is None:
             return
@@ -3380,6 +3764,7 @@ class LocalizationTrackingWidget(QWidget):
             self.log(f"Found {found.name} but it doesn't look like a trajectories file - skipped")
             return
         self.tracks = traj.reset_index(drop=True)
+        self._tracks_source_path = found     # read, not linked: never re-linked
         self._track_diffusion_cache = None
         self._track_msd_cache = None
         self.compute_d_button.setEnabled(True)
@@ -4061,6 +4446,7 @@ class LocalizationTrackingWidget(QWidget):
         self.render_cancel_button.setEnabled(False)
         self.render_progress.setVisible(False)
         self._render_worker_ref = None
+        self._session_advance()
 
     def _on_render_finished(self, result, kind, info, source_layer, options, started):
         if result is CANCELLED:
@@ -4676,6 +5062,10 @@ class LocalizationTrackingWidget(QWidget):
             upper_box.setDecimals(FILTER_BOUND_DECIMALS)
             adaptive_steps(lower_box, upper_box)
             default_lower, default_upper = self._default_bounds_for(column)
+            # Outwards, so a default derived from the data cannot exclude the
+            # extreme it was derived from once the box has rounded it.
+            default_lower = bound_to_box_precision(default_lower, FILTER_BOUND_DECIMALS, False)
+            default_upper = bound_to_box_precision(default_upper, FILTER_BOUND_DECIMALS, True)
             lower_box.setValue(default_lower)
             upper_box.setValue(default_upper)
             self.filter_controls[column] = (lower_box, upper_box)
@@ -4828,6 +5218,7 @@ class LocalizationTrackingWidget(QWidget):
         self.link_cancel_button.setEnabled(False)
         self.link_progress.setVisible(False)
         self._link_worker_ref = None
+        self._session_advance()
 
     def _on_link_errored(self, exc):
         self.log(f"Linking failed: {exc}")
@@ -4848,6 +5239,7 @@ class LocalizationTrackingWidget(QWidget):
             self.compute_d_button.setEnabled(False)
             return
         self.tracks = traj.reset_index(drop=True)
+        self._tracks_source_path = None      # linked here, so a session may re-link
         self._track_diffusion_cache = None
         self._track_msd_cache = None
         self.compute_d_button.setEnabled(True)
@@ -5199,6 +5591,7 @@ class LocalizationTrackingWidget(QWidget):
         self.compute_d_cancel_button.setEnabled(False)
         self.compute_d_progress.setVisible(False)
         self._compute_d_worker_ref = None
+        self._session_advance()
 
     def _on_compute_d_finished(self, result):
         if result is CANCELLED:

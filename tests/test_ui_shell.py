@@ -201,18 +201,29 @@ def test_saving_comes_after_tracking():
     assert titles.index("Save") == len(titles) - 1
 
 
-def test_the_save_buttons_live_on_the_save_tab_only():
+def test_the_render_save_buttons_live_on_the_save_tab_only():
     widget = make_widget()
     save_page = widget.tabs.widget(
         [i for i in range(widget.tabs.count())
          if widget.tabs.tabText(i) == "Save"][0])
+    # "Save session..." is deliberately not one of these: a session is state to
+    # be reopened rather than a render written out, so it sits beside Load data.
     saves = [b for b in widget.findChildren(widget_mod.QPushButton)
-             if b.text().startswith("Save ")]
+             if b.text().startswith("Save ") and "session" not in b.text()]
     # image, movie, and a composite still - a composite *movie* is screen-
     # recorded from the viewer now, not written frame by frame from here
     assert len(saves) == 3
     for button in saves:
         assert save_page.isAncestorOf(button)
+
+
+def test_the_session_buttons_sit_with_the_data_loading_controls():
+    widget = make_widget()
+    load_page = widget.tabs.widget(
+        [i for i in range(widget.tabs.count())
+         if widget.tabs.tabText(i) == "Load"][0])
+    for button in (widget.save_session_button, widget.load_session_button):
+        assert load_page.isAncestorOf(button)
 
 
 def test_nothing_is_offered_until_something_is_rendered():

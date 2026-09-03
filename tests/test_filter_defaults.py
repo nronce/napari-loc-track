@@ -55,3 +55,50 @@ def test_distance_is_reported_in_microns():
 
 def test_distance_label_says_microns():
     assert "µm" in widget.METRIC_LABELS["distance"]
+
+
+# --- default bounds must include the data they were derived from --------------
+
+
+@pytest.mark.parametrize("value,decimals,upward,expected", [
+    (49995.8477774829, 6, True, 49995.847778),    # rounds down; must step up
+    (49995.8477774829, 6, False, 49995.847777),   # rounds down; already outward
+    (12.4234341111, 6, False, 12.423434),
+    (0.5, 6, True, 0.5),                          # exact, left alone
+    (500.0, 6, True, 500.0),
+])
+def test_a_bound_is_rounded_outwards_to_what_the_box_can_hold(
+        value, decimals, upward, expected):
+    assert widget.bound_to_box_precision(value, decimals, upward) == pytest.approx(
+        expected, abs=1e-9)
+
+
+def test_the_default_filter_keeps_every_localization_it_was_built_from():
+    """A six-decimal box turns a maximum of 49995.8477774829 into 49995.847777,
+    which is *below* it - so the filter built to keep everything dropped the
+    single most extreme localization in every column at once, silently.
+    """
+    import os
+    import sys
+    from pathlib import Path
+
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    pytest.importorskip("napari_loc_track.widget")
+    import pandas as pd
+
+    sys.path.insert(0, str(Path(__file__).parent))
+    from test_widget_interaction import make_widget
+
+    rng = np.random.default_rng(0)
+    n = 4000
+    frame = pd.DataFrame({
+        "frame": rng.integers(0, 50, n),
+        "x [nm]": rng.uniform(0, 50000, n),
+        "y [nm]": rng.uniform(0, 50000, n),
+        "sigma [nm]": rng.uniform(50, 400, n),
+        "intensity [photon]": rng.uniform(10, 9000, n),
+    })
+    w = make_widget()
+    w._ingest_localization_dataframe(frame, "loaded", True)
+    w.apply_filters()
+    assert len(w.df_filtered) == n
