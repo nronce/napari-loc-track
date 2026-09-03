@@ -194,6 +194,6 @@ def test_the_load_worker_carries_the_acquisition_back_with_the_image(tmp_path):
     """The read is network I/O, so it belongs on the worker, not the GUI thread."""
     stack = _micromanager_stack(tmp_path)
     worker = widget_mod._load_worker("", str(stack))
-    df, image, how, acquisition = worker.work()
+    df, image, how, acquisition, _raw = worker.work()
     assert df is None and image is not None and how
     assert acquisition["values"]["fps"] == pytest.approx(1000.0 / 31.365, abs=0.1)

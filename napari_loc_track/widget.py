@@ -47,7 +47,7 @@ from napari.utils.colormaps import Colormap as NapariColormap
 import trackpy as tp
 
 from ._acqmeta import read_acquisition_metadata
-from ._imageio import open_image_stack
+from ._imageio import bin_frames, open_image_stack
 from ._tracks import (
     DEFAULT_LINKING_ERROR_RATE,
     filter_tracks_by_length,
@@ -359,6 +359,7 @@ def infer_column_map(columns):
 # deliberately never applied.
 SETTINGS_SPEC = (
     (("pixel_size_nm_per_px",), "pixel_size_box"),
+    (("preprocessing", "time_bin_frames"), "bin_factor_box"),
     (("localization_2d", "gain_adu_per_photon"), "loc_gain_box"),
     (("localization_2d", "offset_adu"), "loc_offset_box"),
     (("localization_2d", "box_size_px"), "loc_box_size"),
@@ -437,6 +438,23 @@ ACQUISITION_AUTOFILL = (
     ("fps", "fps_box", "Frame rate", "{:.3f} fps"),
     ("camera_offset_adu", "loc_offset_box", "Camera offset", "{:.0f} ADU"),
 )
+
+# How each autofilled value has to change when raw frames are summed in groups
+# of N. The microscope recorded single raw frames; the pipeline sees their sums,
+# and every quantity that is per-frame rather than per-pixel moves with N. The
+# camera baseline scales up because each raw frame brought its own, and the
+# frame rate scales down because a binned frame spans N exposures. A value not
+# listed here - the pixel size - is unaffected by binning in time.
+ACQUISITION_BIN_EXPONENT = {"camera_offset_adu": 1, "fps": -1}
+
+# Largest group a raw stack can be binned into. Well past anything useful; it is
+# here so a typo cannot ask for a bin longer than any real movie.
+TIME_BIN_MAX = 1000
+
+# How long the time-binning box waits after the last keystroke before re-binning
+# the loaded stack. Long enough that scrolling from 1 to 8 bins once, not eight
+# times.
+TIME_BIN_DEBOUNCE_MS = 400
 
 # Read off the acquisition but deliberately not applied to anything: they are
 # context for judging whether the values above belong to this run. The objective
@@ -682,13 +700,14 @@ def _is_cancelled(cancel):
 
 
 @thread_worker
-def _load_worker(csv_path, image_path, cancel=None):
+def _load_worker(csv_path, image_path, bin_factor=1, cancel=None):
     # A single pd.read_csv cannot be interrupted part way, so cancellation is
     # checked around it; the image decode is chunked and checks continuously.
     if _is_cancelled(cancel):
         return CANCELLED
     df = pd.read_csv(csv_path) if csv_path else None
     image = None
+    raw_image = None
     how = ""
     acquisition = None
     if image_path:
@@ -700,6 +719,15 @@ def _load_worker(csv_path, image_path, cancel=None):
             return CANCELLED
         if image.ndim == 2:
             image = image[np.newaxis, ...]
+        # The raw stack is kept so the binning factor can be changed later
+        # without re-reading the file. It is normally a memory map or a lazy
+        # handle, so holding on to it costs nothing.
+        raw_image = image
+        if bin_factor > 1:
+            image, binned_how = bin_frames(image, bin_factor, cancel=cancel)
+            if image is None:
+                return CANCELLED
+            how = f"{how}, {binned_how}"
         how = f"{how} in {time.perf_counter() - t0:.2f} s"
         # Reading the acquisition parameters means a second pass over a TIFF
         # header and, for Micro-Manager, a few MB off a sidecar that usually
@@ -707,7 +735,17 @@ def _load_worker(csv_path, image_path, cancel=None):
         # belongs on this thread rather than in front of the GUI.
         if not _is_cancelled(cancel):
             acquisition = read_acquisition_metadata(image_path)
-    return df, image, how, acquisition
+    return df, image, how, acquisition, raw_image
+
+
+@thread_worker
+def _bin_worker(raw_image, bin_factor, cancel=None):
+    """Re-bin an already-open stack, for when the factor changes after loading."""
+    t0 = time.perf_counter()
+    image, how = bin_frames(raw_image, bin_factor, cancel=cancel)
+    if image is None:
+        return CANCELLED
+    return image, f"{how} in {time.perf_counter() - t0:.2f} s"
 
 
 @thread_worker
@@ -1289,6 +1327,14 @@ class LocalizationTrackingWidget(QWidget):
         self._frame_shift = 0
         # Filter bounds from a settings file whose columns are not loaded yet.
         self._pending_filter_bounds = None
+        # Time binning: the unbinned stack as it was opened, so the factor can
+        # be changed without re-reading the file, and the factor the camera
+        # baseline and frame rate in the boxes currently account for.
+        self._raw_image = None
+        self._image_layer_name = None
+        self._time_bin_applied = 1
+        self._bin_worker_ref = None
+        self._bin_cancel = threading.Event()
         self.setup_ui()
 
     # ------------------------------------------------------------------
@@ -1478,6 +1524,19 @@ class LocalizationTrackingWidget(QWidget):
                                       self._metric_hist_widgets, notes)
         self._apply_histogram_display(metadata.get("filter_histogram_display"),
                                       self._hist_widgets, notes)
+
+        # A restored binning factor arrives alongside a camera baseline and a
+        # frame rate that already account for it, so the stack is re-binned to
+        # match but those two are left exactly as the file set them - rescaling
+        # them here would apply the factor a second time.
+        if "bin_factor_box" in applied:
+            self._time_bin_timer.stop()
+            factor = int(self.bin_factor_box.value())
+            if factor != self._time_bin_applied:
+                self._time_bin_applied = factor
+                self._update_time_bin_label()
+                if self._raw_image is not None:
+                    self._rebin_loaded_stack(factor)
 
         # One refresh at the end rather than one per control.
         self.apply_filters()
@@ -1669,6 +1728,36 @@ class LocalizationTrackingWidget(QWidget):
         image_row.addWidget(self.image_button)
         data_layout.addRow("Image", image_row)
 
+        # Time binning. A dim emitter spread over several frames is often below
+        # the detection threshold in every one of them and comfortably above it
+        # in their sum, so this is the one preprocessing step worth having in
+        # front of the fit. It costs time resolution, so it is off by default.
+        bin_row = QHBoxLayout()
+        self.bin_factor_box = QSpinBox()
+        self.bin_factor_box.setRange(1, TIME_BIN_MAX)
+        self.bin_factor_box.setValue(1)
+        self.bin_factor_box.setSuffix(" raw frames")
+        self.bin_factor_box.setToolTip(
+            "Sum every N consecutive raw frames into one before detection and "
+            "fitting.\n\n"
+            "Summed, not averaged, so the result still obeys the photon "
+            "statistics the fit assumes. The camera baseline and the frame rate "
+            "are adjusted to match: a binned frame carries N baselines and lasts "
+            "N exposures.\n\n"
+            "Trades time resolution for signal - it will merge blinks and blur "
+            "anything moving faster than N frames."
+        )
+        self.bin_label = QLabel("off")
+        bin_row.addWidget(self.bin_factor_box)
+        bin_row.addWidget(self.bin_label, 1)
+        data_layout.addRow("Time binning", bin_row)
+        self._time_bin_timer = QTimer(self)
+        self._time_bin_timer.setSingleShot(True)
+        self._time_bin_timer.setInterval(TIME_BIN_DEBOUNCE_MS)
+        self._time_bin_timer.timeout.connect(self._apply_time_binning)
+        self.bin_factor_box.valueChanged.connect(
+            lambda _v: self._time_bin_timer.start())
+
         self.pixel_size_box = QDoubleSpinBox()
         self.pixel_size_box.setRange(1.0, 10000.0)
         self.pixel_size_box.setValue(161.0)
@@ -1821,9 +1910,19 @@ class LocalizationTrackingWidget(QWidget):
         )
         cam_layout.addRow("Gain (ADU/photon)", self.loc_gain_box)
         self.loc_offset_box = QDoubleSpinBox()
-        self.loc_offset_box.setRange(0.0, 20000.0)
+        # Wide enough to hold a time-binned baseline: N summed frames carry N
+        # baselines, and the old ceiling of 20000 clipped that silently from
+        # about N=200 on a typical sCMOS.
+        self.loc_offset_box.setRange(0.0, 1e7)
         self.loc_offset_box.setValue(100.0)
         self.loc_offset_box.setSuffix(" ADU")
+        self.loc_offset_box.setToolTip(
+            "Camera baseline subtracted before fitting. Autofilled from the "
+            "acquisition metadata when the camera recorded it.\n\n"
+            "This is the baseline of the frames the fit actually sees, so with "
+            "time binning it is N times the per-frame baseline and moves with "
+            "the binning factor."
+        )
         cam_layout.addRow("Offset", self.loc_offset_box)
         layout.addWidget(cam_group)
 
@@ -2966,7 +3065,8 @@ class LocalizationTrackingWidget(QWidget):
         self.load_progress.setVisible(True)
         self._arm_cancel(self._load_cancel, self.load_cancel_button)
 
-        worker = _load_worker(csv_path, image_path, self._load_cancel)
+        worker = _load_worker(csv_path, image_path,
+                              int(self.bin_factor_box.value()), self._load_cancel)
         worker.returned.connect(lambda result: self._on_load_finished(result, csv_path, image_path))
         worker.errored.connect(self._on_load_errored)
         worker.finished.connect(self._on_load_worker_finished)
@@ -2986,15 +3086,31 @@ class LocalizationTrackingWidget(QWidget):
         if result is CANCELLED:
             self.log("Loading cancelled")
             return
-        df, image, how, acquisition = result
+        # The raw stack is a later addition to the result; older callers (and
+        # the tests that stand in for a worker) still hand over four values.
+        df, image, how, acquisition = result[:4]
+        self._raw_image = result[4] if len(result) > 4 else image
+        # Loading can outrun the debounce on the binning box: the stack has just
+        # been opened at the new factor, so the baseline and frame rate move with
+        # it here rather than waiting for a timer that would then find the factor
+        # already applied and do nothing. Before the autofill, which reads it.
+        self._time_bin_timer.stop()
+        factor = int(self.bin_factor_box.value())
+        if factor != self._time_bin_applied:
+            self._rescale_for_time_binning(max(1, int(self._time_bin_applied)), factor)
+        self._time_bin_applied = factor
         self.viewer.layers.clear()
         if image is not None:
+            self._image_layer_name = Path(image_path).name
             self.viewer.add_image(
-                image, name=Path(image_path).name, colormap="gray",
+                image, name=self._image_layer_name, colormap="gray",
                 **self._placed({}, image.ndim))
             self.log(f"Image {tuple(image.shape)} {image.dtype}: {how}")
             # The pixel size may move here, so the units follow rather than lead.
             self._apply_acquisition_metadata(acquisition)
+            # After the autofill, so the binned exposure it reports is the one
+            # the metadata just set rather than the one it replaced.
+            self._update_time_bin_label()
             self._apply_viewer_scale()
             # A stack measured in nanometres is hundreds of times "bigger" than
             # one measured in pixels, and a camera left where the previous world
@@ -3049,19 +3165,26 @@ class LocalizationTrackingWidget(QWidget):
                      "the parameters in the Data tab are unchanged.")
             return
 
+        factor = max(1, int(self._time_bin_applied))
         for key, attr, label, template in ACQUISITION_AUTOFILL:
             if key not in values:
                 continue
             box = getattr(self, attr, None)
             if box is None:
                 continue
+            # The microscope wrote down what a single raw frame did; the
+            # pipeline sees sums of `factor` of them.
+            recorded = float(values[key]) * factor ** ACQUISITION_BIN_EXPONENT.get(key, 0)
             before = box.value()
-            box.setValue(float(values[key]))
+            box.setValue(recorded)
             after = box.value()  # setValue clamps to the control's range
             if abs(after - before) <= 1e-9:
                 continue
+            binned = ("" if factor == 1 or key not in ACQUISITION_BIN_EXPONENT
+                      else f", for {factor}-frame bins")
             self.log(f"{label}: {template.format(before)} -> "
-                     f"{template.format(after)}, from {sources.get(key, 'the metadata')}")
+                     f"{template.format(after)}, from "
+                     f"{sources.get(key, 'the metadata')}{binned}")
 
         context = [f"{label} {template.format(values[key])}"
                    for key, label, template in ACQUISITION_CONTEXT if key in values]
@@ -3077,6 +3200,105 @@ class LocalizationTrackingWidget(QWidget):
                 note += f" - check it against the {values['objective']} objective"
             self.log(note + ".")
         self._update_scalebar_status()
+
+    # ------------------------------------------------------------------
+    # Time binning: summing raw frames in groups before anything else
+    # ------------------------------------------------------------------
+    def _update_time_bin_label(self):
+        factor = int(self.bin_factor_box.value())
+        if factor <= 1:
+            self.bin_label.setText("off")
+            return
+        parts = [f"summed in {factor}s"]
+        if self._raw_image is not None:
+            n_raw = int(self._raw_image.shape[0])
+            parts.append(f"{n_raw} -> {n_raw // factor} frames")
+        parts.append(f"{self._frame_interval_s() * 1000:.1f} ms each")
+        self.bin_label.setText(", ".join(parts))
+
+    def _rescale_for_time_binning(self, previous, factor):
+        """Move the per-frame quantities from one binning factor to another.
+
+        The camera baseline and the frame rate describe the frames the pipeline
+        is handed, not the frames the camera wrote. Summing N of them multiplies
+        the baseline by N and divides the frame rate by N, and neither is
+        recoverable afterwards: a baseline left at its raw value would be
+        under-subtracted N-fold, and a frame rate left too fast would scale
+        every diffusion coefficient by exactly the same factor - a wrong answer
+        that looks entirely reasonable.
+        """
+        ratio = float(factor) / float(previous)
+        offset_before = self.loc_offset_box.value()
+        self.loc_offset_box.setValue(offset_before * ratio)
+        fps_before = self.fps_box.value()
+        self.fps_box.setValue(fps_before / ratio)  # the frame interval follows
+        self.log(
+            f"Time binning {previous} -> {factor}: camera offset "
+            f"{offset_before:.0f} -> {self.loc_offset_box.value():.0f} ADU, "
+            f"frame rate {fps_before:.3f} -> {self.fps_box.value():.3f} fps"
+        )
+
+    def _apply_time_binning(self):
+        """Act on a change to the binning factor: rescale, then re-bin the stack."""
+        factor = int(self.bin_factor_box.value())
+        previous = max(1, int(self._time_bin_applied))
+        if factor == previous:
+            return
+        self._time_bin_applied = factor
+        self._rescale_for_time_binning(previous, factor)
+        self._update_time_bin_label()
+        if self._raw_image is None:
+            # Nothing open yet; the factor is picked up by the next load.
+            return
+        self._rebin_loaded_stack(factor)
+
+    def _image_layer(self):
+        """The layer holding the loaded stack, by name and then by kind."""
+        if self._image_layer_name and self._image_layer_name in self.viewer.layers:
+            return self.viewer.layers[self._image_layer_name]
+        return self._get_localize_image_layer()
+
+    def _rebin_loaded_stack(self, factor):
+        # A superseded run is told to stop through the flag it was started with,
+        # and this one gets a fresh flag - clearing the shared one instead would
+        # un-cancel the run that has not noticed yet.
+        self._bin_cancel.set()
+        self._bin_cancel = threading.Event()
+        self.bin_factor_box.setEnabled(False)
+        self.load_progress.setVisible(True)
+        worker = _bin_worker(self._raw_image, factor, self._bin_cancel)
+        worker.returned.connect(self._on_rebin_finished)
+        worker.errored.connect(lambda exc: self.log(f"Time binning failed: {exc}"))
+        worker.finished.connect(self._on_rebin_worker_finished)
+        self._bin_worker_ref = worker
+        worker.start()
+
+    def _on_rebin_worker_finished(self):
+        self.bin_factor_box.setEnabled(True)
+        self.load_progress.setVisible(False)
+        self._bin_worker_ref = None
+
+    def _on_rebin_finished(self, result):
+        if result is CANCELLED:
+            self.log("Time binning cancelled")
+            return
+        image, how = result
+        layer = self._image_layer()
+        if layer is None:
+            self.log("Time binning: the image layer is gone; reload to apply it.")
+            return
+        layer.data = image
+        self.log(f"Image {tuple(image.shape)} {image.dtype}: {how}")
+        # Candidates are indexed by frame, and the frames have just been
+        # renumbered. Anything detected against the old binning is meaningless
+        # now, so it goes rather than being silently misapplied.
+        self._loc2d_candidates = [None] * int(image.shape[0])
+        self._loc2d_counts = np.zeros(int(image.shape[0]), dtype=int)
+        self._update_loc2d_candidate_overlay()
+        self._update_time_bin_label()
+        if self.df is not None and len(self.df):
+            self.log("The loaded localizations were produced at a different "
+                     "binning - re-run detection and fitting before trusting them.")
 
     def _restore_previous_run_settings(self, locs_path):
         """Restore the settings of the run that produced an auto-loaded table.
@@ -5761,6 +5983,10 @@ class LocalizationTrackingWidget(QWidget):
             "source_image": self.image_edit.text().strip() or None,
             "pixel_size_nm_per_px": self.pixel_size_box.value(),
             "frame_number_shift": int(self._frame_shift),
+            # The camera offset and frame rate below are recorded as applied,
+            # so they already account for this factor; restoring both together
+            # reproduces the run without applying the binning twice.
+            "preprocessing": {"time_bin_frames": int(self.bin_factor_box.value())},
             "n_localizations_total": len(self.df) if self.df is not None else 0,
             "n_localizations_filtered": len(self.df_filtered) if self.df_filtered is not None else 0,
             "filter_bounds": {
