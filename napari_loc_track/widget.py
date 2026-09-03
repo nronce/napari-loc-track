@@ -6162,35 +6162,69 @@ class LocalizationTrackingWidget(QWidget):
 
         tracks_layer = self.viewer.add_tracks(data, **self._placed(kwargs, 3))
         tracks_layer._get_tooltip_text = self._tracks_layer_tooltip
+        # napari only asks the *active* layer for tooltip text, and only when
+        # tooltips are on at all. They used to be switched on by the points
+        # layer alone, so a session showing trajectories without localizations -
+        # every session that loads trajectories back from a previous run - had a
+        # tooltip that was computed correctly and never displayed.
+        self.viewer.tooltip.visible = True
         self._apply_viewer_scale()
 
+    def _tooltip_diffusion(self, pid):
+        """The D line for one trajectory, with its uncertainty when there is one.
+
+        D is a quarter of the fitted MSD slope, so the error on it is a quarter
+        of the error on the slope. A trajectory too short for the covariance to
+        be defined shows no error rather than a fabricated zero - the same rule
+        the MSD validation legend follows, so the two agree on screen.
+        """
+        D = (self._track_diffusion_cache or {}).get(pid)
+        if D is None:
+            return None
+        fit = (self._track_msd_cache or {}).get(pid)
+        slope_error = fit[4] if fit is not None and len(fit) > 4 else float("nan")
+        if not np.isfinite(slope_error):
+            return f"D {D:.4g} µm²/s"
+        return f"D {D:.4g} ± {slope_error / 4.0:.2g} µm²/s"
+
     def _track_tooltip_lines(self, pid):
+        """What to say about the trajectory under the cursor.
+
+        What identifies it first, then what has been measured about it. A metric
+        that has not been computed yet is left out rather than shown as zero or
+        as a dash: an absent line means "not run", which is a different thing
+        from a trajectory whose straightness really is zero.
+        """
         if self.tracks is None:
             return []
         track_rows = self.tracks[self.tracks["particle"] == pid]
         if track_rows.empty:
             return []
-        frame_span = int(track_rows["frame"].max() - track_rows["frame"].min() + 1)
+        frames = track_rows["frame"].to_numpy(int)
+        first, last = int(frames.min()), int(frames.max())
+        span = last - first + 1
+        # Points can be fewer than the span: the linker bridges gaps up to the
+        # memory setting, so a trajectory may be absent from frames it spans.
         lines = [
-            f"track: {int(pid)}",
-            f"length: {len(track_rows)} points",
-            f"span: {frame_span} frames",
+            f"track {int(pid)}",
+            f"starts at frame {first}, ends at {last}",
+            f"spans {span} frames, {len(track_rows)} points",
         ]
         duration_map = self._track_duration_cache or {}
         if pid in duration_map:
-            lines.append(f"duration: {duration_map[pid]:.3g} s")
+            lines.append(f"duration {duration_map[pid]:.3g} s")
+        diffusion = self._tooltip_diffusion(pid)
+        if diffusion is not None:
+            lines.append(diffusion)
         distance_map = self._track_distance_cache or {}
         if pid in distance_map:
-            lines.append(f"distance: {distance_map[pid]:.3g} µm")
+            lines.append(f"distance travelled {distance_map[pid]:.3g} µm")
         net_map = self._track_net_cache or {}
         if pid in net_map:
-            lines.append(f"end-to-end: {net_map[pid]:.3g} µm")
+            lines.append(f"end-to-end {net_map[pid]:.3g} µm")
         straightness_map = self._track_straightness_cache or {}
         if pid in straightness_map and np.isfinite(straightness_map[pid]):
-            lines.append(f"straightness: {straightness_map[pid]:.2f}")
-        d_map = self._track_diffusion_cache or {}
-        if pid in d_map:
-            lines.append(f"D: {d_map[pid]:.4g} µm²/s")
+            lines.append(f"straightness {straightness_map[pid]:.2f}")
         return lines
 
     def _tracks_layer_tooltip(self, position, *, view_direction=None, dims_displayed=None, world=False):
@@ -6266,6 +6300,7 @@ class LocalizationTrackingWidget(QWidget):
             **self._placed({}, 2),
         )
         all_tracks_layer._get_tooltip_text = self._all_tracks_layer_tooltip
+        self.viewer.tooltip.visible = True
         self._apply_viewer_scale()
 
     def _xy_filter_is_in_use(self, x_col, y_col):
