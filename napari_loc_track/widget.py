@@ -198,6 +198,13 @@ METRIC_VIEW_DECIMALS = 6
 # micrometres - so the bounds need room for the small ones too.
 FILTER_BOUND_DECIMALS = 6
 
+# How closely a localization has to match a trajectory point, in camera pixels,
+# to be recognised as the same one. The two are computed from the same numbers
+# by the same division, so in a single session they agree exactly; this is a
+# guard for trajectories read back from a CSV, where the only thing between them
+# is a float round-trip. Four decimals of a pixel is well under a nanometre.
+LOC_MATCH_DECIMALS = 4
+
 
 def bound_to_box_precision(value, decimals, upward):
     """A bound rounded *outwards* to what a spin box can hold.
@@ -437,6 +444,11 @@ SETTINGS_SPEC = (
     (("straightness_bounds", "max"), "straight_max_box"),
     (("duration_bounds_s", "min"), "dur_min_box"),
     (("duration_bounds_s", "max"), "dur_max_box"),
+    (("dynamics_filter", "D"), "d_filter_box"),
+    (("dynamics_filter", "distance"), "distance_filter_box"),
+    (("dynamics_filter", "net"), "net_filter_box"),
+    (("dynamics_filter", "straightness"), "straightness_filter_box"),
+    (("dynamics_filter", "duration"), "duration_filter_box"),
     (("coloring", "enabled"), "color_trajectories_box"),
     (("coloring", "metric"), "color_metric_box"),
     (("coloring", "colormap"), "d_colormap_box"),
@@ -1307,6 +1319,11 @@ class LocalizationTrackingWidget(QWidget):
         self._hist_widgets = {}
         self._metric_hist_widgets = {}
         self._metric_bound_boxes = {}
+        self._metric_filter_boxes = {}
+        # The dynamics selection, derived on demand from whichever ranges are
+        # ticked and dropped whenever anything it is derived from moves.
+        self._passing_particles_cache = None
+        self._loc_particle_cache = None
         # Distance travelled, like D, is spread over orders of magnitude across
         # a population: on a linear axis nearly every trajectory lands in the
         # first bin and the plot ends up describing the handful of longest ones.
@@ -1423,6 +1440,10 @@ class LocalizationTrackingWidget(QWidget):
         self._metric_render_timer = QTimer(self)
         self._metric_render_timer.setSingleShot(True)
         self._metric_render_timer.timeout.connect(self._refresh_metric_colors)
+        self._track_filter_timer = QTimer(self)
+        self._track_filter_timer.setSingleShot(True)
+        self._track_filter_timer.timeout.connect(self._apply_track_filter)
+        self._update_track_filter_label()
         self._update_link_cutoff_label()
         self._update_status_header()
 
@@ -1476,10 +1497,15 @@ class LocalizationTrackingWidget(QWidget):
             if shape is not None:
                 parts.append(f"{layer.name}  {'x'.join(str(int(v)) for v in shape)}")
         if self.df is not None:
-            kept = len(self.df_filtered) if self.df_filtered is not None else len(self.df)
+            shown = self._displayed_localizations()
+            kept = len(shown) if shown is not None else len(self.df)
             parts.append(f"{kept} / {len(self.df)} localizations")
         if self.tracks is not None and not self.tracks.empty:
-            parts.append(f"{self.tracks['particle'].nunique()} trajectories")
+            n_all = int(self.tracks["particle"].nunique())
+            shown_tracks = self._displayed_tracks()
+            n_shown = int(shown_tracks["particle"].nunique()) if len(shown_tracks) else 0
+            parts.append(f"{n_shown} trajectories" if n_shown == n_all
+                         else f"{n_shown} / {n_all} trajectories")
         if self.df is not None:
             parts.append(f"{self.pixel_size_box.value():.0f} nm/px")
         self.status_label.setText("     ".join(parts) if parts else "No data loaded")
@@ -2943,6 +2969,56 @@ class LocalizationTrackingWidget(QWidget):
         second.textChanged.connect(copy(second, first))
         second.setText(first.text())
 
+    def _make_metric_filter_box(self, key):
+        """The tick box that turns a metric's range from a colour scale into a
+        selection.
+
+        Deliberately the *same* min/max boxes rather than a second pair. Those
+        bounds are already on screen, already drawn as draggable lines on the
+        histogram beside them, and already saved with the run - so the range you
+        have just set by eye on the distribution is the range you filter on, and
+        there is no second set of numbers to keep in agreement with the first.
+        """
+        box = QCheckBox("filter")
+        box.setToolTip(
+            f"Show only trajectories whose {METRIC_LABELS[key].lower()} falls "
+            "between the two values on the left - and only the localizations "
+            "belonging to them.\n\n"
+            "This carries through to the super-resolved reconstruction, so a "
+            "render becomes a picture of the molecules that behaved this way "
+            "rather than of all of them.\n\n"
+            "Trajectories with no value for this metric are excluded."
+        )
+        box.stateChanged.connect(lambda _s, k=key: self._on_metric_filter_toggled(k))
+        self._metric_filter_boxes[key] = box
+        # Also as a plain attribute, which is how the settings machinery finds
+        # a control by name when restoring a run or a session.
+        setattr(self, f"{key.lower()}_filter_box", box)
+        return box
+
+    def _build_track_filter_group(self):
+        """One line saying what the dynamics filter is currently doing."""
+        group = QGroupBox("Dynamics filter")
+        group.setToolTip(
+            "Tick 'filter' beside any of the ranges below to show only the "
+            "trajectories inside it. Several can be combined - a trajectory has "
+            "to satisfy all of them."
+        )
+        layout = QVBoxLayout(group)
+        self.track_filter_label = QLabel()
+        self.track_filter_label.setWordWrap(True)
+        self.track_filter_label.setProperty("role", "note")
+        layout.addWidget(self.track_filter_label)
+        row = QHBoxLayout()
+        self.clear_track_filter_button = QPushButton("Show all trajectories again")
+        self.clear_track_filter_button.setProperty("secondary", True)
+        self.clear_track_filter_button.clicked.connect(self.clear_track_filters)
+        self.clear_track_filter_button.setEnabled(False)
+        row.addWidget(self.clear_track_filter_button)
+        row.addStretch(1)
+        layout.addLayout(row)
+        return group
+
     def _build_track_tab(self):
         """Linking and trajectory analysis, in the order they are used.
 
@@ -2962,6 +3038,7 @@ class LocalizationTrackingWidget(QWidget):
         outer_layout.addWidget(scroll)
         self._build_link_section(layout)
         self._build_trajectory_section(layout)
+        layout.addWidget(self._build_track_filter_group())
 
     def _build_link_section(self, layout):
 
@@ -3174,6 +3251,7 @@ class LocalizationTrackingWidget(QWidget):
         self.d_max_box.setValue(1e2)
         adaptive_steps(self.d_min_box, self.d_max_box)
         d_bounds_row.addWidget(self.d_max_box)
+        d_bounds_row.addWidget(self._make_metric_filter_box("D"))
         d_layout.addLayout(d_bounds_row)
         self._metric_bound_boxes["D"] = (self.d_min_box, self.d_max_box)
         d_layout.addWidget(self._make_metric_histogram("D"))
@@ -3205,6 +3283,7 @@ class LocalizationTrackingWidget(QWidget):
         self.dist_max_box.setValue(1.0)
         adaptive_steps(self.dist_min_box, self.dist_max_box)
         dist_bounds_row.addWidget(self.dist_max_box)
+        dist_bounds_row.addWidget(self._make_metric_filter_box("distance"))
         dist_layout.addLayout(dist_bounds_row)
         self._metric_bound_boxes["distance"] = (self.dist_min_box, self.dist_max_box)
         dist_layout.addWidget(self._make_metric_histogram("distance"))
@@ -3233,6 +3312,7 @@ class LocalizationTrackingWidget(QWidget):
         self.net_max_box.setValue(1.0)
         adaptive_steps(self.net_min_box, self.net_max_box)
         net_bounds_row.addWidget(self.net_max_box)
+        net_bounds_row.addWidget(self._make_metric_filter_box("net"))
         net_layout.addLayout(net_bounds_row)
         self._metric_bound_boxes["net"] = (self.net_min_box, self.net_max_box)
         net_layout.addWidget(self._make_metric_histogram("net"))
@@ -3269,6 +3349,7 @@ class LocalizationTrackingWidget(QWidget):
         adaptive_steps(self.straight_min_box, self.straight_max_box)
         straight_bounds_row.addWidget(self.straight_max_box)
         straight_layout.addLayout(straight_bounds_row)
+        straight_bounds_row.addWidget(self._make_metric_filter_box("straightness"))
         self._metric_bound_boxes["straightness"] = (
             self.straight_min_box, self.straight_max_box)
         straight_layout.addWidget(self._make_metric_histogram("straightness"))
@@ -3294,6 +3375,7 @@ class LocalizationTrackingWidget(QWidget):
         self.dur_max_box.setValue(10.0)
         adaptive_steps(self.dur_min_box, self.dur_max_box)
         dur_bounds_row.addWidget(self.dur_max_box)
+        dur_bounds_row.addWidget(self._make_metric_filter_box("duration"))
         dur_layout.addLayout(dur_bounds_row)
         self._metric_bound_boxes["duration"] = (self.dur_min_box, self.dur_max_box)
         dur_layout.addWidget(self._make_metric_histogram("duration"))
@@ -3765,6 +3847,7 @@ class LocalizationTrackingWidget(QWidget):
             return
         self.tracks = traj.reset_index(drop=True)
         self._tracks_source_path = found     # read, not linked: never re-linked
+        self._invalidate_track_filter()
         self._track_diffusion_cache = None
         self._track_msd_cache = None
         self.compute_d_button.setEnabled(True)
@@ -3784,6 +3867,7 @@ class LocalizationTrackingWidget(QWidget):
         self.df_filtered = self.df.copy()
         self.column_map = infer_column_map(self.df.columns)
         self.tracks = None
+        self._invalidate_track_filter()
         self._track_diffusion_cache = None
         self._track_msd_cache = None
         self._track_distance_cache = None
@@ -4144,8 +4228,13 @@ class LocalizationTrackingWidget(QWidget):
         self.render_sigma_column_box.blockSignals(False)
 
     def _render_positions_px(self):
-        """(x, y) in camera pixels for the localizations that pass the filters."""
-        df = self.df_filtered
+        """(x, y) in camera pixels for the localizations that pass the filters.
+
+        The dynamics filter is one of those filters, which is what makes a
+        reconstruction of only the fast - or only the directed - molecules a
+        matter of ticking a box rather than of exporting and re-importing.
+        """
+        df = self._displayed_localizations()
         if df is None or df.empty:
             return None, None
         x_col = self._resolve_column("x")
@@ -4157,7 +4246,7 @@ class LocalizationTrackingWidget(QWidget):
                 df[y_col].to_numpy(dtype=float) / pixel_size)
 
     def _render_frames(self):
-        df = self.df_filtered
+        df = self._displayed_localizations()
         if df is None or df.empty:
             return None
         frame_col = self._resolve_column("frame")
@@ -4276,7 +4365,14 @@ class LocalizationTrackingWidget(QWidget):
         """Everything the engine needs, or None once the reason has been logged."""
         x, y = self._render_positions_px()
         if x is None or x.size == 0:
-            self.log("Load or fit localizations before rendering")
+            # Two very different reasons to have nothing to draw, and saying the
+            # wrong one sends the user to look for missing data that is there.
+            if (self._active_metric_filters()
+                    and self.df_filtered is not None and not self.df_filtered.empty):
+                self.log("The dynamics filter is keeping no localizations, so "
+                         "there is nothing to render - widen a range or untick it.")
+            else:
+                self.log("Load or fit localizations before rendering")
             return None
         shape, origin, source_layer = self._render_field_of_view()
         if shape is None:
@@ -5125,6 +5221,7 @@ class LocalizationTrackingWidget(QWidget):
             upper = upper_box.value()
             bounds[column] = (lower, upper)
         self.df_filtered = apply_numeric_filters(self.df, bounds)
+        self._invalidate_track_filter()
         self._update_status_header()
         self.filter_status.setText(f"Showing {len(self.df_filtered)} localizations")
         self.log(f"Filtered to {len(self.df_filtered)} localizations")
@@ -5158,6 +5255,7 @@ class LocalizationTrackingWidget(QWidget):
         if self.tracks is None:
             return
         self.tracks = None
+        self._invalidate_track_filter()
         self._track_diffusion_cache = None
         self._track_msd_cache = None
         self._track_distance_cache = None
@@ -5240,6 +5338,7 @@ class LocalizationTrackingWidget(QWidget):
             return
         self.tracks = traj.reset_index(drop=True)
         self._tracks_source_path = None      # linked here, so a session may re-link
+        self._invalidate_track_filter()
         self._track_diffusion_cache = None
         self._track_msd_cache = None
         self.compute_d_button.setEnabled(True)
@@ -5486,19 +5585,23 @@ class LocalizationTrackingWidget(QWidget):
         self._sync_points_layer()
         self._sync_tracks_layer()
         self._sync_all_tracks_layer()
+        # Whatever brought us here - a link, a new metric, a moved bound - the
+        # one line describing the dynamics filter is now out of date.
+        self._update_track_filter_label()
 
     def _sync_points_layer(self):
         x_col = self._resolve_column("x")
         y_col = self._resolve_column("y")
         frame_col = self._resolve_column("frame")
 
-        has_rows = self.df_filtered is not None and not self.df_filtered.empty
+        shown = self._displayed_localizations()
+        has_rows = shown is not None and not shown.empty
         if not (self.show_points_box.isChecked() and has_rows and x_col and y_col and frame_col):
             self._remove_layer(POINTS_LAYER_NAME)
             return
 
         geom_cols = [frame_col, y_col, x_col]
-        valid = self.df_filtered.dropna(subset=geom_cols)
+        valid = shown.dropna(subset=geom_cols)
         if valid.empty:
             self._remove_layer(POINTS_LAYER_NAME)
             return
@@ -5600,6 +5703,7 @@ class LocalizationTrackingWidget(QWidget):
         d_map, msd_map = result
         self._track_diffusion_cache = d_map
         self._track_msd_cache = msd_map
+        self._invalidate_track_filter()
         n_input = getattr(self, "_d_input_track_count", None) or int(self.tracks["particle"].nunique())
         self.log(f"Computed D for {len(d_map)} of {n_input} trajectories")
         # The linking readout can now say how many measured D exceed the cutoff.
@@ -5629,6 +5733,7 @@ class LocalizationTrackingWidget(QWidget):
         self._track_net_cache = net_map
         self._track_straightness_cache = straightness_map
         self._track_duration_cache = duration_map
+        self._invalidate_track_filter()
         for key, values in (("distance", distance_map), ("net", net_map),
                             ("straightness", straightness_map),
                             ("duration", duration_map)):
@@ -5702,6 +5807,181 @@ class LocalizationTrackingWidget(QWidget):
         values = np.asarray(list(self._metric_cache(key).values()), float)
         values = values[np.isfinite(values) & (values > 0)]
         return float(values.min()) if values.size else 1e-9
+
+    # ------------------------------------------------------------------
+    # Selecting trajectories by what was measured about them
+    # ------------------------------------------------------------------
+    def _active_metric_filters(self):
+        """The (metric, low, high) ranges currently selecting, in tick order."""
+        active = []
+        for key in COMPUTED_METRICS:
+            box = self._metric_filter_boxes.get(key)
+            if box is None or not box.isChecked():
+                continue
+            low_box, high_box = self._metric_bound_boxes[key]
+            active.append((key, low_box.value(), high_box.value()))
+        return active
+
+    def _invalidate_track_filter(self):
+        """Drop the derived selection. Cheap; it is rebuilt on the next read."""
+        self._passing_particles_cache = None
+        self._loc_particle_cache = None
+
+    def _localization_particles(self):
+        """Which trajectory each filtered localization belongs to, or -1.
+
+        Matched on frame and position rather than carried through the linker as
+        an extra column, because trajectories are as often read back from a
+        previous run's CSV as linked in this session, and a join works the same
+        for both. Within a session the coordinates on the two sides are the same
+        floats - one is computed from the other - so the match is exact.
+        """
+        if self._loc_particle_cache is not None:
+            return self._loc_particle_cache
+
+        df = self.df_filtered
+        n_rows = 0 if df is None else len(df)
+        particles = np.full(n_rows, -1, dtype=np.int64)
+        x_col = self._resolve_column("x")
+        y_col = self._resolve_column("y")
+        frame_col = self._resolve_column("frame")
+        have_tracks = self.tracks is not None and not self.tracks.empty
+        if n_rows and have_tracks and x_col and y_col and frame_col:
+            pixel_size = max(self.pixel_size_box.value(), 1e-9)
+            wanted = pd.DataFrame({
+                "frame": df[frame_col].to_numpy(np.int64) + self._frame_offset(),
+                "x": np.round(df[x_col].to_numpy(float) / pixel_size, LOC_MATCH_DECIMALS),
+                "y": np.round(df[y_col].to_numpy(float) / pixel_size, LOC_MATCH_DECIMALS),
+            })
+            known = pd.DataFrame({
+                "frame": self.tracks["frame"].to_numpy(np.int64),
+                "x": np.round(self.tracks["x"].to_numpy(float), LOC_MATCH_DECIMALS),
+                "y": np.round(self.tracks["y"].to_numpy(float), LOC_MATCH_DECIMALS),
+                "particle": self.tracks["particle"].to_numpy(np.int64),
+            }).drop_duplicates(subset=["frame", "x", "y"])
+            merged = wanted.merge(known, on=["frame", "x", "y"], how="left", sort=False)
+            particles = merged["particle"].fillna(-1).to_numpy(np.int64)
+
+        self._loc_particle_cache = particles
+        return particles
+
+    def _passing_particles(self):
+        """Trajectories inside every active range, or None when none is active.
+
+        None and the empty set mean different things and both happen: None is
+        "no dynamics filter, show everything", the empty set is "a filter that
+        nothing satisfies", which has to leave the canvas empty rather than
+        quietly showing all of it.
+
+        A trajectory with no value for a metric being filtered on is excluded.
+        D in particular is only fitted for trajectories long enough to support
+        it, so filtering on D also drops the short ones - which is why the
+        summary line counts them out loud.
+        """
+        active = self._active_metric_filters()
+        if not active:
+            return None
+        if self._passing_particles_cache is not None:
+            return self._passing_particles_cache
+        if self.tracks is None or self.tracks.empty:
+            return set()
+
+        passing = set(self.tracks["particle"].to_numpy().tolist())
+        for key, low, high in active:
+            cache = self._metric_cache(key) or {}
+            passing = {pid for pid in passing
+                       if pid in cache
+                       and np.isfinite(cache[pid])
+                       and low <= cache[pid] <= high}
+        self._passing_particles_cache = passing
+        return passing
+
+    def _displayed_tracks(self):
+        """The trajectories to show: all of them, or those the filter kept."""
+        passing = self._passing_particles()
+        if passing is None or self.tracks is None or self.tracks.empty:
+            return self.tracks
+        return self.tracks[self.tracks["particle"].isin(passing)]
+
+    def _displayed_localizations(self):
+        """The localizations to show and to render.
+
+        This is the point of the whole feature: a reconstruction built from
+        these is a reconstruction of the molecules that behaved a certain way,
+        so "where do the fast ones go?" becomes a picture rather than a table.
+        """
+        passing = self._passing_particles()
+        df = self.df_filtered
+        if passing is None or df is None or df.empty:
+            return df
+        particles = self._localization_particles()
+        if particles.size != len(df):        # caches out of step; show everything
+            return df
+        if not passing:
+            return df.iloc[:0]
+        keep = np.isin(particles, np.fromiter(passing, np.int64, len(passing)))
+        return df[keep]
+
+    def _track_filter_summary(self):
+        """What the dynamics filter is doing, in one line."""
+        active = self._active_metric_filters()
+        if not active:
+            return "No dynamics filter - every trajectory is shown."
+        if self.tracks is None or self.tracks.empty:
+            return "No trajectories to filter yet - link some first."
+        passing = self._passing_particles()
+        n_total = int(self.tracks["particle"].nunique())
+        n_kept = len(passing)
+        criteria = ", ".join(
+            f"{METRIC_LABELS[key].split(' (')[0]} {low:g}-{high:g}"
+            for key, low, high in active)
+        line = f"{criteria}: {n_kept} of {n_total} trajectories"
+        df = self.df_filtered
+        if df is not None and not df.empty:
+            line += f", {len(self._displayed_localizations())} of {len(df)} localizations"
+        # Missing values are the surprise worth naming: filtering on D drops
+        # every trajectory too short for the fit, and nothing else says so.
+        unmeasured = 0
+        for key, _low, _high in active:
+            cache = self._metric_cache(key) or {}
+            unmeasured = max(unmeasured, sum(
+                1 for pid in self.tracks["particle"].unique()
+                if pid not in cache or not np.isfinite(cache[pid])))
+        if unmeasured:
+            line += f" ({unmeasured} have no value for a filtered metric and are excluded)"
+        return line
+
+    def _update_track_filter_label(self):
+        if hasattr(self, "track_filter_label"):
+            self.track_filter_label.setText(self._track_filter_summary())
+        if hasattr(self, "clear_track_filter_button"):
+            self.clear_track_filter_button.setEnabled(bool(self._active_metric_filters()))
+
+    def _apply_track_filter(self):
+        """Rebuild everything the selection feeds: layers, render, counts."""
+        self._invalidate_track_filter()
+        self._update_track_filter_label()
+        self.render_overlay()
+        self._refresh_render_tab()
+        self._update_status_header()
+
+    def _on_metric_filter_toggled(self, key):
+        box = self._metric_filter_boxes.get(key)
+        if box is not None:
+            low_box, high_box = self._metric_bound_boxes[key]
+            state = "on" if box.isChecked() else "off"
+            self.log(f"Dynamics filter on {METRIC_LABELS[key]} {state}"
+                     + (f" ({low_box.value():g} to {high_box.value():g})"
+                        if box.isChecked() else ""))
+        self._apply_track_filter()
+
+    def clear_track_filters(self):
+        for box in self._metric_filter_boxes.values():
+            box.blockSignals(True)
+            box.setChecked(False)
+            box.blockSignals(False)
+        self.log("Dynamics filters cleared - every trajectory is shown again")
+        self._apply_track_filter()
 
     def _metric_norm_range(self, key):
         if key == "time":
@@ -6105,13 +6385,21 @@ class LocalizationTrackingWidget(QWidget):
     def _on_metric_bounds_changed(self, key):
         self._sync_metric_hist_lines(key)
         self._sync_metric_view_to_bounds(key)
-        # A metric bound only changes the colour scale - no geometry moves - so
-        # this recolours the existing layers instead of rebuilding them. The
-        # rebuild it used to do costs ~2.8 s for 1500 trajectories against ~70 ms
-        # for a recolour, which is what made every keystroke freeze the UI.
-        # Still coalesced, because typing or dragging fires it per intermediate value.
-        if self.live_display_box.isChecked():
-            self._metric_render_timer.start(120)
+        self._invalidate_track_filter()
+        if not self.live_display_box.isChecked():
+            return
+        if self._active_metric_filters():
+            # Now the bound decides *which* trajectories exist, not just what
+            # colour they are, so the layers have to be rebuilt. Coalesced
+            # harder than a recolour because it costs a great deal more.
+            self._track_filter_timer.start(250)
+            return
+        # A metric bound otherwise only changes the colour scale - no geometry
+        # moves - so this recolours the existing layers instead of rebuilding
+        # them. The rebuild it used to do costs ~2.8 s for 1500 trajectories
+        # against ~70 ms for a recolour, which is what made every keystroke
+        # freeze the UI. Still coalesced: typing fires it per intermediate value.
+        self._metric_render_timer.start(120)
 
     def _on_metric_hist_press(self, key, event):
         state = self._metric_hist_widgets.get(key)
@@ -6274,12 +6562,19 @@ class LocalizationTrackingWidget(QWidget):
         worker.start()
 
     def _export_tables(self):
-        """The tables to write, prepared on the GUI thread."""
+        """The tables to write, prepared on the GUI thread.
+
+        What is exported is what is on screen, dynamics filter included: an
+        export that quietly held more than the reconstruction beside it would
+        be the more confusing of the two answers.
+        """
         tables = []
-        if self.df_filtered is not None:
-            tables.append(("localizations_filtered.csv", self.df_filtered))
-        if self.tracks is not None and not self.tracks.empty:
-            tables.append(("trajectories.csv", self.tracks))
+        shown_locs = self._displayed_localizations()
+        if shown_locs is not None:
+            tables.append(("localizations_filtered.csv", shown_locs))
+        shown_tracks = self._displayed_tracks()
+        if shown_tracks is not None and not shown_tracks.empty:
+            tables.append(("trajectories.csv", shown_tracks))
             tables.append(("track_metrics.csv", self._track_metrics_frame()))
         return tables
 
@@ -6333,7 +6628,8 @@ class LocalizationTrackingWidget(QWidget):
         return count
 
     def _track_metrics_frame(self):
-        particle_ids = sorted(self.tracks["particle"].unique())
+        shown = self._displayed_tracks()
+        particle_ids = sorted(shown["particle"].unique())
         d_map = self._track_diffusion_cache or {}
         distance_map = self._track_distance_cache or {}
         net_map = self._track_net_cache or {}
@@ -6463,6 +6759,14 @@ class LocalizationTrackingWidget(QWidget):
             "straightness_bounds": {
                 "min": self.straight_min_box.value(), "max": self.straight_max_box.value()},
             "duration_bounds_s": {"min": self.dur_min_box.value(), "max": self.dur_max_box.value()},
+            # Which ranges were selecting rather than only colouring. Recorded
+            # beside the bounds themselves, which are already here under
+            # "diffusion", "distance_bounds_um" and the rest.
+            "dynamics_filter": {
+                key: box.isChecked() for key, box in self._metric_filter_boxes.items()
+            },
+            "n_trajectories_after_dynamics_filter": (
+                int(self._displayed_tracks()["particle"].nunique()) if n_tracks else 0),
             "coloring": {
                 "enabled": self.color_trajectories_box.isChecked(),
                 "metric": self.color_metric_box.currentText(),
@@ -6509,11 +6813,12 @@ class LocalizationTrackingWidget(QWidget):
     # ------------------------------------------------------------------
     def _sync_tracks_layer(self):
         self._remove_layer(TRACKS_LAYER_NAME)
-        has_tracks = self.tracks is not None and not self.tracks.empty
+        shown = self._displayed_tracks()
+        has_tracks = shown is not None and not shown.empty
         if not (self.show_tracks_box.isChecked() and has_tracks):
             return
 
-        traj = self.tracks.sort_values(["particle", "frame"])
+        traj = shown.sort_values(["particle", "frame"])
         track_id = traj["particle"].to_numpy(int)
         # Remembered so colours can later be recomputed in this exact row order
         # without rebuilding the layer.
@@ -6646,7 +6951,8 @@ class LocalizationTrackingWidget(QWidget):
 
     def _sync_all_tracks_layer(self):
         self._remove_layer(ALL_TRACKS_LAYER_NAME)
-        has_tracks = self.tracks is not None and not self.tracks.empty
+        shown = self._displayed_tracks()
+        has_tracks = shown is not None and not shown.empty
         if not (self.show_all_tracks_box.isChecked() and has_tracks):
             return
 
@@ -6658,7 +6964,7 @@ class LocalizationTrackingWidget(QWidget):
         paths = []
         edge_colors = []
         particle_ids = []
-        for i, (pid, group) in enumerate(self.tracks.groupby("particle")):
+        for i, (pid, group) in enumerate(shown.groupby("particle")):
             y = group["y"].to_numpy(float)
             x = group["x"].to_numpy(float)
             if len(x) < 2:
