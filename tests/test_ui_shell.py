@@ -100,7 +100,7 @@ def test_the_header_names_the_loaded_image():
 def test_the_tabs_are_the_pipeline_and_nothing_else():
     widget = make_widget()
     assert [widget.tabs.tabText(i) for i in range(widget.tabs.count())] == [
-        "Load", "Localize", "Filter", "Render", "Track", "Save"]
+        "Load", "Localize", "Filter", "Track", "Render", "Save"]
 
 
 def test_export_is_offered_once():
@@ -194,10 +194,17 @@ def test_the_old_tick_box_is_gone_but_its_setting_still_loads():
 # --- the Save tab ------------------------------------------------------------
 
 
-def test_saving_comes_after_tracking():
+def test_rendering_comes_after_tracking():
+    """A reconstruction is as often built from a dynamics selection as from
+    every localization, and that selection needs the trajectories first."""
     widget = make_widget()
     titles = [widget.tabs.tabText(i) for i in range(widget.tabs.count())]
-    assert titles.index("Save") == titles.index("Track") + 1
+    assert titles.index("Render") == titles.index("Track") + 1
+
+
+def test_saving_comes_last():
+    widget = make_widget()
+    titles = [widget.tabs.tabText(i) for i in range(widget.tabs.count())]
     assert titles.index("Save") == len(titles) - 1
 
 

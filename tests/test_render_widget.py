@@ -98,7 +98,7 @@ def test_the_tabs_follow_the_pipeline():
     """Load, then detect, then filter, then the two things you can do with it."""
     widget = make_widget()
     titles = [widget.tabs.tabText(i) for i in range(widget.tabs.count())]
-    assert titles == ["Load", "Localize", "Filter", "Render", "Track", "Save"]
+    assert titles == ["Load", "Localize", "Filter", "Track", "Render", "Save"]
     # the Localize tab is remembered by index, which a reshuffle must not break
     assert widget.tabs.tabText(widget._localize_tab_index) == "Localize"
     # the data table is a view, not a step: it opens on demand

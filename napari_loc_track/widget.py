@@ -145,6 +145,21 @@ VIEWER_FRAME_UNIT = "pixel"
 # from scratch - only carried along when the world itself changes.
 DERIVED_SCALE_LAYERS = (RENDER_LAYER_NAME, RENDER_MOVIE_LAYER_NAME)
 
+# Renders used to be one layer with one fixed name, replaced on every run.
+# Several can now coexist - one per dynamics selection, which is the point of
+# rendering the mobile and immobile populations separately - so they are
+# recognised by a mark left in the layer's own metadata rather than by name.
+RENDER_LAYER_TAG = "napari_loc_track_render"
+
+
+def is_render_layer(layer):
+    """A layer this plugin rendered, whatever it ended up being called."""
+    metadata = getattr(layer, "metadata", None) or {}
+    if metadata.get(RENDER_LAYER_TAG):
+        return True
+    # Layers from before the tag existed, and sessions restored from them.
+    return getattr(layer, "name", "") in DERIVED_IMAGE_LAYERS
+
 RENDER_COLORMAPS = ["magma", "inferno", "viridis", "hot", "gray", "twilight"]
 # What a saved render holds. Keys are stable identifiers stored in metadata.
 RENDER_SAVE_FORMATS = {
@@ -419,6 +434,8 @@ SETTINGS_SPEC = (
     (("smlm_rendering", "grouping"), "render_grouping_box"),
     (("smlm_rendering", "window_step_frames"), "render_step_box"),
     (("smlm_rendering", "add_layer_to_viewer"), "render_add_layer_box"),
+    (("smlm_rendering", "layer_name"), "render_layer_name_edit"),
+    (("smlm_rendering", "population_split_p"), "render_population_p_box"),
     (("smlm_rendering", "write_png_snapshot"), "render_png_box"),
     (("smlm_rendering", "image_save_format"), "render_image_format_box"),
     (("smlm_rendering", "movie_save_format"), "render_movie_format_box"),
@@ -685,6 +702,12 @@ def set_widget_value(widget, value):
         return True
     if isinstance(widget, QDoubleSpinBox):
         widget.setValue(float(value))
+        return True
+    if isinstance(widget, QLineEdit):
+        # Only settings, never paths: the ones restored through here are names
+        # the user chose (the render layer's), and a path from another machine
+        # would point at nothing.
+        widget.setText("" if value is None else str(value))
         return True
     return False
 
@@ -1541,8 +1564,12 @@ class LocalizationTrackingWidget(QWidget):
         self._build_load_tab()
         self._build_localize_tab()
         self._build_filter_tab()
-        self._build_render_tab()
+        # Track before Render: a reconstruction is now as often built from a
+        # dynamics selection as from every localization, and you cannot make
+        # that selection until the trajectories and their metrics exist. The
+        # tab order is the order the work is done in.
         self._build_track_tab()
+        self._build_render_tab()
         self._build_save_tab()
         # The data table is a view of the current data, not a step in the
         # pipeline, so it opens on demand instead of taking up a tab.
@@ -2596,6 +2623,8 @@ class LocalizationTrackingWidget(QWidget):
         )
         note.setWordWrap(True)
         layout.addWidget(note)
+
+        layout.addWidget(self._build_render_population_group())
 
         # --- source ---------------------------------------------------------
         source_group = QGroupBox("Localizations to render")
@@ -4154,7 +4183,7 @@ class LocalizationTrackingWidget(QWidget):
         next render would take its field of view from the previous one.
         """
         for layer in list(self.viewer.layers.selection) + list(self.viewer.layers):
-            if isinstance(layer, napari.layers.Image) and layer.name not in DERIVED_IMAGE_LAYERS:
+            if isinstance(layer, napari.layers.Image) and not is_render_layer(layer):
                 return layer
         return None
 
@@ -4810,6 +4839,137 @@ class LocalizationTrackingWidget(QWidget):
             f"{info['render_seconds']:.2f} s on the {info['backend'].upper()}"
         )
 
+    # ------------------------------------------------------------------
+    # Rendering one population at a time, into a layer of its own
+    # ------------------------------------------------------------------
+    def _render_layer_name(self, kind):
+        """Where this render lands. A name per selection, so they accumulate."""
+        base = self.render_layer_name_edit.text().strip() or RENDER_LAYER_NAME
+        return base if kind == "image" else f"{base}_movie"
+
+    def _render_population_label(self):
+        """What this render was built from, recorded with the layer."""
+        active = self._active_metric_filters()
+        if not active:
+            return "all localizations"
+        return "; ".join(f"{METRIC_LABELS[key].split(' (')[0]} {low:g}-{high:g}"
+                         for key, low, high in active)
+
+    def _set_render_population(self, which):
+        """Point the dynamics filter at a named population, and name the layer.
+
+        The two presets are the common case and the reason the feature exists:
+        one reconstruction of the molecules that stayed put and one of the
+        molecules that moved, from a single acquisition, in separate layers that
+        blend additively so they can be read together or alone.
+        """
+        threshold = self.render_population_p_box.value()
+        boxes = self._metric_filter_boxes
+        for key, box in boxes.items():
+            if key != "pstatic":
+                box.blockSignals(True)
+                box.setChecked(False)
+                box.blockSignals(False)
+
+        pstatic = boxes.get("pstatic")
+        if which == "all":
+            pstatic.blockSignals(True)
+            pstatic.setChecked(False)
+            pstatic.blockSignals(False)
+            self.render_layer_name_edit.setText(RENDER_LAYER_NAME)
+        else:
+            if which == "immobile":
+                low, high = threshold, 1.0
+            else:
+                low, high = 0.0, threshold
+            self.pstatic_min_box.setValue(low)
+            self.pstatic_max_box.setValue(high)
+            pstatic.blockSignals(True)
+            pstatic.setChecked(True)
+            pstatic.blockSignals(False)
+            self.render_layer_name_edit.setText(f"{RENDER_LAYER_NAME}_{which}")
+
+        self._apply_track_filter()
+        self._update_render_population_label()
+        if which != "all" and not (self._track_pstatic_cache or {}):
+            self.log("No immobility test results yet - link trajectories, then "
+                     "the test runs with the rest of the fit-free metrics.")
+
+    def _update_render_population_label(self):
+        """Say what the next render will be built from, without leaving the tab."""
+        if not hasattr(self, "render_population_label"):
+            return
+        summary = self._track_filter_summary()
+        name = self._render_layer_name("image")
+        self.render_population_label.setText(
+            f"{summary}  →  layer '{name}'")
+
+    def _build_render_population_group(self):
+        group = QGroupBox("Which molecules to render")
+        group.setToolTip(
+            "A reconstruction of a chosen population rather than of everything.\n\n"
+            "Each render goes into the layer named below, so rendering the "
+            "immobile molecules and then the mobile ones leaves two layers that "
+            "blend additively - the structural half and the dynamic half of the "
+            "same acquisition, side by side or on top of each other."
+        )
+        layout = QVBoxLayout(group)
+
+        row = QHBoxLayout()
+        for label, which, tip in (
+            ("Immobile", "immobile",
+             "Trajectories consistent with a molecule that never moved."),
+            ("Mobile", "mobile",
+             "Trajectories that moved further than their own localization error."),
+            ("All", "all", "Clear the dynamics filter and render everything."),
+        ):
+            button = QPushButton(label)
+            button.setProperty("secondary", True)
+            button.setToolTip(tip)
+            button.clicked.connect(lambda _c, w=which: self._set_render_population(w))
+            row.addWidget(button)
+        row.addWidget(QLabel("at p ="))
+        self.render_population_p_box = QDoubleSpinBox()
+        self.render_population_p_box.setRange(0.0, 1.0)
+        self.render_population_p_box.setDecimals(4)
+        self.render_population_p_box.setValue(0.05)
+        self.render_population_p_box.setToolTip(
+            "The significance the split is made at. At 0.05, one immobile "
+            "molecule in twenty is misfiled as mobile - the price of a test "
+            "with a calibrated false-positive rate."
+        )
+        adaptive_steps(self.render_population_p_box)
+        row.addWidget(self.render_population_p_box)
+        row.addStretch(1)
+        layout.addLayout(row)
+
+        name_row = QHBoxLayout()
+        name_row.addWidget(QLabel("Layer name"))
+        self.render_layer_name_edit = QLineEdit(RENDER_LAYER_NAME)
+        self.render_layer_name_edit.setToolTip(
+            "Renders replace the layer of this name and leave every other one "
+            "alone, so changing it before each render is what builds a set."
+        )
+        self.render_layer_name_edit.textChanged.connect(
+            lambda _t: self._update_render_population_label())
+        name_row.addWidget(self.render_layer_name_edit, 1)
+        layout.addLayout(name_row)
+
+        self.render_population_label = QLabel()
+        self.render_population_label.setWordWrap(True)
+        self.render_population_label.setProperty("role", "note")
+        layout.addWidget(self.render_population_label)
+
+        note = QLabel(
+            "Any of the ranges on the Track tab select here too - these three "
+            "are shortcuts for the common split. Ticking 'filter' beside "
+            "diffusion, path length or straightness works the same way."
+        )
+        note.setWordWrap(True)
+        note.setProperty("role", "note")
+        layout.addWidget(note)
+        return group
+
     def _add_render_layer(self, kind, image, info, source_layer, options):
         source_scale, source_translate = (1.0, 1.0), (0.0, 0.0)
         if source_layer is not None:
@@ -4822,7 +4982,7 @@ class LocalizationTrackingWidget(QWidget):
         scale, translate = smlm_render.layer_transform(
             options["oversampling"], options["origin"], source_scale, source_translate
         )
-        name = RENDER_LAYER_NAME if kind == "image" else RENDER_MOVIE_LAYER_NAME
+        name = self._render_layer_name(kind)
         if kind == "movie":
             # One movie frame spans `raw_frames_per_movie_frame` raw frames, so
             # scaling the time axis by it keeps the dims slider meaning the same
@@ -4846,6 +5006,12 @@ class LocalizationTrackingWidget(QWidget):
                 blending="additive", scale=scale, translate=translate,
                 units=self._viewer_units(len(scale)),
                 contrast_limits=smlm_render.contrast_limits(image),
+                # Marked rather than named, so a render keeps being recognised
+                # as one when it is called "immobile" instead of "smlm_render".
+                # "additive" blending above is what lets two populations
+                # rendered separately be read as one picture.
+                metadata={RENDER_LAYER_TAG: True,
+                          "dynamics_selection": self._render_population_label()},
             )
         except Exception as exc:
             self.log(f"Could not add the render to the viewer: {exc}")
@@ -5215,8 +5381,9 @@ class LocalizationTrackingWidget(QWidget):
         self._apply_viewer_scale()
 
         included = []
-        already = {RENDER_LAYER_NAME, RENDER_MOVIE_LAYER_NAME, RENDER_CROP_LAYER_NAME,
-                   ROI_LAYER_NAME}
+        already = {RENDER_CROP_LAYER_NAME, ROI_LAYER_NAME}
+        already.update(layer.name for layer in self.viewer.layers
+                       if is_render_layer(layer))
         if any(layer["source"] == "overlay" for layer in spec["layers"]):
             already.add(POINTS_LAYER_NAME)  # already added as "Localizations"
 
@@ -5725,7 +5892,7 @@ class LocalizationTrackingWidget(QWidget):
         for layer in list(self.viewer.layers):
             try:
                 ndim = len(np.ravel(layer.scale))
-                if layer.name in DERIVED_SCALE_LAYERS:
+                if is_render_layer(layer):
                     # Its scale is derived from the layer beneath it, so it is
                     # only carried along - but it still has to be labelled. A
                     # single layer left in pixels makes the units inconsistent
@@ -6314,6 +6481,7 @@ class LocalizationTrackingWidget(QWidget):
         self.render_overlay()
         self._refresh_render_tab()
         self._update_status_header()
+        self._update_render_population_label()
 
     def _on_metric_filter_toggled(self, key):
         box = self._metric_filter_boxes.get(key)
@@ -7103,6 +7271,9 @@ class LocalizationTrackingWidget(QWidget):
                 "grouping_label": self.render_grouping_box.currentText(),
                 "window_step_frames": self.render_step_box.value(),
                 "add_layer_to_viewer": self.render_add_layer_box.isChecked(),
+                "layer_name": self.render_layer_name_edit.text(),
+                "population_split_p": self.render_population_p_box.value(),
+                "dynamics_selection": self._render_population_label(),
                 "write_png_snapshot": self.render_png_box.isChecked(),
                 "image_save_format": self.render_image_format_box.currentData(),
                 "movie_save_format": self.render_movie_format_box.currentData(),
