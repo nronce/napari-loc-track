@@ -175,6 +175,8 @@ METRIC_LABELS = {
     "net": "End-to-end displacement (µm)",
     "straightness": "Straightness (end-to-end / path)",
     "duration": "Trajectory duration (s)",
+    "motion": "Motion ratio (spread / localization error)",
+    "pstatic": "p (consistent with static)",
     # Colouring only: time needs no computing and has no bounds to filter on, so
     # it is absent from METRIC_CACHE_ATTR and from the histogram/bounds machinery.
     "time": "Frame first seen",
@@ -185,11 +187,20 @@ METRIC_CACHE_ATTR = {
     "net": "_track_net_cache",
     "straightness": "_track_straightness_cache",
     "duration": "_track_duration_cache",
+    "motion": "_track_motion_cache",
+    "pstatic": "_track_pstatic_cache",
 }
+
+# A p-value has no lower limit worth plotting: a trajectory that is obviously
+# moving returns something like 1e-200, and a log axis running that far spends
+# every decade but the last on nothing. Below this floor the answer is the same
+# either way - it moved - so the value is clamped rather than plotted honestly.
+P_STATIC_FLOOR = 1e-10
 # Every metric that is computed per trajectory and can be histogrammed, coloured
 # by and bounded. "time" is deliberately absent: it colours but has nothing to
 # compute and nothing to filter on.
-COMPUTED_METRICS = ("D", "distance", "net", "straightness", "duration")
+COMPUTED_METRICS = ("D", "distance", "net", "straightness", "duration",
+                    "motion", "pstatic")
 # The metric view boxes mirror the bound boxes when "follow filter" is on, so
 # they need at least the precision of the finest of those (D, at six) or a small
 # bound is silently rounded to zero on the way across.
@@ -444,6 +455,14 @@ SETTINGS_SPEC = (
     (("straightness_bounds", "max"), "straight_max_box"),
     (("duration_bounds_s", "min"), "dur_min_box"),
     (("duration_bounds_s", "max"), "dur_max_box"),
+    (("immobility", "fallback_precision_nm"), "immobility_sigma_box"),
+    (("immobility", "precision_calibration"), "immobility_calibration_box"),
+    (("motion_ratio_bounds", "min"), "motion_min_box"),
+    (("motion_ratio_bounds", "max"), "motion_max_box"),
+    (("p_static_bounds", "min"), "pstatic_min_box"),
+    (("p_static_bounds", "max"), "pstatic_max_box"),
+    (("dynamics_filter", "motion"), "motion_filter_box"),
+    (("dynamics_filter", "pstatic"), "pstatic_filter_box"),
     (("dynamics_filter", "D"), "d_filter_box"),
     (("dynamics_filter", "distance"), "distance_filter_box"),
     (("dynamics_filter", "net"), "net_filter_box"),
@@ -1220,6 +1239,75 @@ def _compute_d_worker(tracks_df, max_lagtime, fps, mpp, cancel=None):
     return d_map, msd_map
 
 
+def immobility_statistic(x, y, sigma):
+    """Test a trajectory against the hypothesis that it never moved.
+
+    A static emitter is a completely specified statistical object: every
+    position it reports is its true position plus localization error, and that
+    error is measured for each spot by the same fit that produced the position.
+    So the scatter of a trajectory about its own centre, with each residual
+    divided by its own uncertainty, is a weighted residual sum of squares of
+    Gaussians about their fitted mean - which is chi-squared with 2(N-1) degrees
+    of freedom, exactly, for every N. Two of the 2N coordinates are spent
+    estimating the centre, one per spatial dimension; nothing else is estimated.
+
+    Returns (T, dof). `x`, `y` and `sigma` must share a unit; the statistic is
+    dimensionless, so pixels and nanometres both work as long as they agree.
+
+    Unlike a diffusion coefficient this costs one pass and no fit, and unlike a
+    diffusion coefficient it is well behaved on the trajectories that matter
+    here - the short ones, where the MSD slope is at its least reliable.
+    """
+    x = np.asarray(x, float)
+    y = np.asarray(y, float)
+    sigma = np.asarray(sigma, float)
+    good = np.isfinite(x) & np.isfinite(y) & np.isfinite(sigma) & (sigma > 0)
+    if good.sum() < 2:
+        # One point cannot scatter, and a missing precision cannot be guessed.
+        return float("nan"), 0
+    x, y, sigma = x[good], y[good], sigma[good]
+
+    # Precision weights: the maximum-likelihood centre lets a well-measured spot
+    # pull harder than a dim one. Weighting matters more than it looks - photon
+    # count varies several-fold between spots, and treating a 15 nm and a 45 nm
+    # localization as equally informative both loses power and breaks the null.
+    weight = 1.0 / sigma ** 2
+    total = weight.sum()
+    x_bar = float((x * weight).sum() / total)
+    y_bar = float((y * weight).sum() / total)
+    T = float((weight * ((x - x_bar) ** 2 + (y - y_bar) ** 2)).sum())
+    return T, 2 * (len(x) - 1)
+
+
+def immobility_maps(tracks_df, sigma_column):
+    """Motion ratio and p(static) per trajectory, or ({}, {}) with no precision.
+
+    The ratio is the effect size - the trajectory's spread as a multiple of the
+    spread localization error alone would produce, so 1 means "moved exactly as
+    much as a stationary molecule would appear to". The p-value is the
+    significance, and the two answer different questions: the ratio does not
+    depend on how long the trajectory was watched, while the p-value does, which
+    is what lets a long trajectory certify a smaller motion than a short one.
+    """
+    if not sigma_column or sigma_column not in tracks_df.columns:
+        return {}, {}
+    from scipy import stats
+
+    motion_map, pstatic_map = {}, {}
+    for pid, group in tracks_df.groupby("particle"):
+        T, dof = immobility_statistic(
+            group["x"].to_numpy(float), group["y"].to_numpy(float),
+            group[sigma_column].to_numpy(float))
+        if dof <= 0 or not np.isfinite(T):
+            continue
+        motion_map[pid] = T / dof
+        pstatic_map[pid] = max(float(stats.chi2.sf(T, dof)), P_STATIC_FLOOR)
+    return motion_map, pstatic_map
+
+
+SIGMA_COLUMN = "_sigma"
+
+
 @thread_worker
 def _fit_free_metrics_worker(tracks_df, pixel_size, fps):
     """Per-trajectory quantities that need no model fitted to them.
@@ -1257,7 +1345,13 @@ def _fit_free_metrics_worker(tracks_df, pixel_size, fps):
         straightness_map[pid] = net / path if path > 0 else float("nan")
         span = int(group["frame"].max() - group["frame"].min()) + 1
         duration_map[pid] = span / fps_safe
-    return distance_map, net_map, straightness_map, duration_map
+    motion_map, pstatic_map = immobility_maps(tracks_df, SIGMA_COLUMN)
+    # A dict rather than a tuple: there are six of these now, and a positional
+    # unpack that has to be corrected everywhere each time one is added is a
+    # standing invitation to swap two of them silently.
+    return {"distance": distance_map, "net": net_map,
+            "straightness": straightness_map, "duration": duration_map,
+            "motion": motion_map, "pstatic": pstatic_map}
 
 
 class PandasTableModel(QAbstractTableModel):
@@ -1332,8 +1426,12 @@ class LocalizationTrackingWidget(QWidget):
         # magnitude across a population; on a linear axis nearly every
         # trajectory lands in the first bin. Straightness is a ratio in [0, 1]
         # and duration is bounded by the acquisition, so both stay linear.
+        # The motion ratio spans decades between a bound molecule and a fast one,
+        # and a p-value spans every decade it has; straightness is a ratio in
+        # [0,1] and duration is bounded by the acquisition, so both stay linear.
         self._metric_use_log = {"D": True, "distance": True, "net": True,
-                                "straightness": False, "duration": False}
+                                "straightness": False, "duration": False,
+                                "motion": True, "pstatic": True}
         self._default_bounds = {}
         self.filter_controls = {}
         self._roi_updating = False
@@ -1343,6 +1441,8 @@ class LocalizationTrackingWidget(QWidget):
         self._track_net_cache = None
         self._track_straightness_cache = None
         self._track_duration_cache = None
+        self._track_motion_cache = None
+        self._track_pstatic_cache = None
         self._all_tracks_particle_ids = []
         self._load_worker_ref = None
         self._link_worker_ref = None
@@ -1446,6 +1546,7 @@ class LocalizationTrackingWidget(QWidget):
         self._update_track_filter_label()
         self._update_link_cutoff_label()
         self._update_status_header()
+        self._update_immobility_status()
 
     def _build_status_header(self):
         """A one-line summary of where the data stands, visible from every tab.
@@ -2969,6 +3070,105 @@ class LocalizationTrackingWidget(QWidget):
         second.textChanged.connect(copy(second, first))
         second.setText(first.text())
 
+    def _build_immobility_group(self):
+        """Did this molecule move at all? Asked without fitting anything.
+
+        A static emitter is a fully specified object: its reported positions are
+        its true position plus localization error, and that error is measured
+        per spot by the localization fit itself. So the scatter of a trajectory,
+        in units of its own precision, is chi-squared with 2(N-1) degrees of
+        freedom under "this never moved" - exactly, at every trajectory length.
+
+        This is the same question a small D is usually asked to answer, but it
+        is asked directly. It costs one pass instead of a per-trajectory
+        regression, it is at its best on the short trajectories where the MSD
+        slope is at its worst, and it returns a probability rather than a number
+        that has to be thresholded by eye.
+        """
+        group = QGroupBox("Immobility test (spread against localization error)")
+        group.setToolTip(
+            "Tests each trajectory against the hypothesis that the molecule "
+            "never moved and every displacement was localization error.\n\n"
+            "Filtering to p > 0.05 leaves the molecules that are immobile within "
+            "your precision - render those and you have a super-resolved image "
+            "of the bound population. Filtering to p < 0.05 leaves the ones that "
+            "genuinely moved."
+        )
+        layout = QVBoxLayout(group)
+
+        precision_row = QHBoxLayout()
+        precision_row.addWidget(QLabel("Fallback precision"))
+        self.immobility_sigma_box = QDoubleSpinBox()
+        self.immobility_sigma_box.setRange(0.1, 10000.0)
+        self.immobility_sigma_box.setDecimals(1)
+        self.immobility_sigma_box.setValue(25.0)
+        self.immobility_sigma_box.setSuffix(" nm")
+        self.immobility_sigma_box.setToolTip(
+            "Used only when the localization table has no uncertainty column. "
+            "A single precision for every spot is a worse assumption than it "
+            "looks: photon count varies several-fold between molecules, and "
+            "averaging over that inflates the false-positive rate."
+        )
+        precision_row.addWidget(self.immobility_sigma_box)
+        precision_row.addWidget(QLabel("× calibration"))
+        self.immobility_calibration_box = QDoubleSpinBox()
+        self.immobility_calibration_box.setRange(0.05, 20.0)
+        self.immobility_calibration_box.setDecimals(3)
+        self.immobility_calibration_box.setValue(1.0)
+        self.immobility_calibration_box.setToolTip(
+            "Scales the reported precision before testing.\n\n"
+            "The one assumption this test makes from outside itself is that the "
+            "reported uncertainty is the true localization error - and most "
+            "fitters report a Cramér-Rao bound, which is a lower bound. A 20% "
+            "underestimate makes half of a genuinely immobile population look "
+            "mobile.\n\n"
+            "It is checkable: over molecules you believe are immobile the median "
+            "motion ratio must be 1.00. If it reads 1.41, set this to 1.19."
+        )
+        adaptive_steps(self.immobility_calibration_box)
+        precision_row.addWidget(self.immobility_calibration_box)
+        precision_row.addStretch(1)
+        layout.addLayout(precision_row)
+
+        self.immobility_status_label = QLabel()
+        self.immobility_status_label.setWordWrap(True)
+        self.immobility_status_label.setProperty("role", "note")
+        layout.addWidget(self.immobility_status_label)
+
+        for key, title, low, high, decimals in (
+            ("motion", "Motion ratio — 1.0 is a molecule that did not move", 0.0, 1e6, 4),
+            ("pstatic", "p (consistent with static) — filter to p > 0.05 for the "
+                        "immobile population", 0.0, 1.0, 6),
+        ):
+            sub = QGroupBox(title)
+            sub_layout = QVBoxLayout(sub)
+            bounds_row = QHBoxLayout()
+            bounds_row.addWidget(QLabel("Min"))
+            min_box = QDoubleSpinBox()
+            min_box.setRange(low, high)
+            min_box.setDecimals(decimals)
+            bounds_row.addWidget(min_box)
+            bounds_row.addWidget(QLabel("Max"))
+            max_box = QDoubleSpinBox()
+            max_box.setRange(low, high)
+            max_box.setDecimals(decimals)
+            max_box.setValue(1.0 if key == "pstatic" else 1000.0)
+            adaptive_steps(min_box, max_box)
+            bounds_row.addWidget(max_box)
+            bounds_row.addWidget(self._make_metric_filter_box(key))
+            sub_layout.addLayout(bounds_row)
+            self._metric_bound_boxes[key] = (min_box, max_box)
+            setattr(self, f"{key}_min_box", min_box)
+            setattr(self, f"{key}_max_box", max_box)
+            sub_layout.addWidget(self._make_metric_histogram(key))
+            min_box.valueChanged.connect(lambda _v, k=key: self._on_metric_bounds_changed(k))
+            max_box.valueChanged.connect(lambda _v, k=key: self._on_metric_bounds_changed(k))
+            layout.addWidget(sub)
+
+        self.immobility_sigma_box.valueChanged.connect(self._on_immobility_settings_changed)
+        self.immobility_calibration_box.valueChanged.connect(self._on_immobility_settings_changed)
+        return group
+
     def _make_metric_filter_box(self, key):
         """The tick box that turns a metric's range from a colour scale into a
         selection.
@@ -3383,6 +3583,8 @@ class LocalizationTrackingWidget(QWidget):
         self.dur_max_box.valueChanged.connect(lambda _v: self._on_metric_bounds_changed("duration"))
         layout.addWidget(dur_group)
 
+        layout.addWidget(self._build_immobility_group())
+
         # --- Coloring ---
         color_group = QGroupBox("Trajectory coloring")
         color_layout = QFormLayout(color_group)
@@ -3398,7 +3600,10 @@ class LocalizationTrackingWidget(QWidget):
         self.color_metric_box.addItems([
             "D (diffusion coefficient)", "Distance travelled",
             "End-to-end displacement", "Straightness (directed vs diffusive)",
-            "Track duration", "Time (frame first seen)",
+            "Track duration",
+            "Motion ratio (moved vs its own precision)",
+            "p (consistent with static)",
+            "Time (frame first seen)",
         ])
         color_layout.addRow("Metric", self.color_metric_box)
         self.d_colormap_box = QComboBox()
@@ -5262,6 +5467,8 @@ class LocalizationTrackingWidget(QWidget):
         self._track_net_cache = None
         self._track_straightness_cache = None
         self._track_duration_cache = None
+        self._track_motion_cache = None
+        self._track_pstatic_cache = None
         self.compute_d_button.setEnabled(False)
         self._remove_layer(TRACKS_LAYER_NAME)
         self._remove_layer(ALL_TRACKS_LAYER_NAME)
@@ -5715,35 +5922,139 @@ class LocalizationTrackingWidget(QWidget):
         if self.color_trajectories_box.isChecked():
             self.render_overlay()
 
+    def _sigma_source(self):
+        """Where the localization precision for the immobility test comes from.
+
+        Returns (label, per-row array in camera pixels, is_measured). Measured
+        per-spot precision is strongly preferred: it is what makes the null
+        exact, and a single average σ over a table whose precision varies
+        three-fold inflates the false-positive rate from 5% to about 15%.
+        """
+        calibration = max(self.immobility_calibration_box.value(), 1e-6)
+        pixel_size = max(self.pixel_size_box.value(), 1e-9)
+        if self.tracks is None or self.tracks.empty:
+            return "no trajectories", None, False
+
+        measured = self._track_sigma_nm()
+        if measured is not None:
+            column = self.column_map.get("uncertainty")
+            return (f"per localization, from '{column}'",
+                    measured * calibration / pixel_size, True)
+        fixed = self.immobility_sigma_box.value()
+        return (f"fixed {fixed:.1f} nm (no uncertainty column in this table)",
+                np.full(len(self.tracks), fixed * calibration / pixel_size), False)
+
+    def _track_sigma_nm(self):
+        """The reported uncertainty of each trajectory point, in nm, or None.
+
+        Matched back from the localization table rather than carried through the
+        linker, for the same reason `_localization_particles` is: trajectories
+        are as often read back from a previous run's CSV as linked here, and the
+        join works for both.
+        """
+        column = self.column_map.get("uncertainty")
+        df = self.df_filtered
+        if not column or df is None or df.empty or column not in df.columns:
+            return None
+        x_col = self._resolve_column("x")
+        y_col = self._resolve_column("y")
+        frame_col = self._resolve_column("frame")
+        if not (x_col and y_col and frame_col):
+            return None
+
+        pixel_size = max(self.pixel_size_box.value(), 1e-9)
+        known = pd.DataFrame({
+            "frame": df[frame_col].to_numpy(np.int64) + self._frame_offset(),
+            "x": np.round(df[x_col].to_numpy(float) / pixel_size, LOC_MATCH_DECIMALS),
+            "y": np.round(df[y_col].to_numpy(float) / pixel_size, LOC_MATCH_DECIMALS),
+            SIGMA_COLUMN: df[column].to_numpy(float),
+        }).drop_duplicates(subset=["frame", "x", "y"])
+        wanted = pd.DataFrame({
+            "frame": self.tracks["frame"].to_numpy(np.int64),
+            "x": np.round(self.tracks["x"].to_numpy(float), LOC_MATCH_DECIMALS),
+            "y": np.round(self.tracks["y"].to_numpy(float), LOC_MATCH_DECIMALS),
+        })
+        merged = wanted.merge(known, on=["frame", "x", "y"], how="left", sort=False)
+        sigma = merged[SIGMA_COLUMN].to_numpy(float)
+        # A join that matched almost nothing means these trajectories do not
+        # belong to this table; a fixed precision is the honest fallback.
+        return sigma if np.isfinite(sigma).mean() > 0.5 else None
+
+    def _update_immobility_status(self):
+        """Say which precision is in use, and whether it looks calibrated."""
+        if not hasattr(self, "immobility_status_label"):
+            return
+        label, _sigma, measured = self._sigma_source()
+        lines = [f"Localization precision: {label}."]
+        if not measured and self.tracks is not None and not self.tracks.empty:
+            lines.append("Add an uncertainty column to the localizations for a "
+                         "per-spot precision - it is what makes the test exact.")
+        ratios = np.array(list((self._track_motion_cache or {}).values()), float)
+        ratios = ratios[np.isfinite(ratios)]
+        if ratios.size:
+            # The calibration check reads off the *immobile* population, so the
+            # useful statistic is the low end rather than the median: on a mixed
+            # sample the median is pulled up by molecules that really did move,
+            # and reporting that as a precision error would be wrong.
+            median = float(np.median(ratios))
+            floor = float(np.percentile(ratios, 10))
+            lines.append(
+                f"Motion ratio over {ratios.size} trajectories: median {median:.2f}, "
+                f"10th percentile {floor:.2f}.")
+            lines.append(
+                "The calibration check is on the immobile end: whichever of these "
+                "corresponds to molecules you believe are stationary should read "
+                f"1.00. At {floor:.2f} the reported precision would be low by "
+                f"{100 * (np.sqrt(max(floor, 1e-9)) - 1):.0f}%, correctable by "
+                f"setting the calibration to {np.sqrt(max(floor, 1e-9)):.2f}.")
+        self.immobility_status_label.setText(" ".join(lines))
+
+    def _on_immobility_settings_changed(self, *_args):
+        """Precision or calibration moved, so the test has to be run again."""
+        if self.tracks is None or self.tracks.empty:
+            self._update_immobility_status()
+            return
+        self._start_fit_free_metrics_worker()
+
     def _start_fit_free_metrics_worker(self):
         # Fit-free (distance travelled, duration) but still a full pass over
         # every trajectory - background it too so linking/auto-loading a
         # large trajectories file doesn't freeze the UI while it runs.
         if self.tracks is None or self.tracks.empty:
             return
-        worker = _fit_free_metrics_worker(self.tracks, self.pixel_size_box.value(), self.fps_box.value())
+        # The immobility test needs a precision per trajectory point. Attaching
+        # it as a column keeps the worker's input self-contained.
+        tracks = self.tracks
+        _label, sigma_px, _measured = self._sigma_source()
+        if sigma_px is not None and len(sigma_px) == len(tracks):
+            tracks = tracks.assign(**{SIGMA_COLUMN: sigma_px})
+        worker = _fit_free_metrics_worker(tracks, self.pixel_size_box.value(), self.fps_box.value())
         worker.returned.connect(self._on_fit_free_metrics_finished)
         worker.errored.connect(lambda exc: self.log(f"Distance/duration computation failed: {exc}"))
         self._metrics_worker_ref = worker
         worker.start()
 
     def _on_fit_free_metrics_finished(self, result):
-        distance_map, net_map, straightness_map, duration_map = result
-        self._track_distance_cache = distance_map
-        self._track_net_cache = net_map
-        self._track_straightness_cache = straightness_map
-        self._track_duration_cache = duration_map
+        for key, values in result.items():
+            setattr(self, METRIC_CACHE_ATTR[key], values)
         self._invalidate_track_filter()
-        for key, values in (("distance", distance_map), ("net", net_map),
-                            ("straightness", straightness_map),
-                            ("duration", duration_map)):
+        for key, values in result.items():
             self._set_metric_default_bounds(key, values)
             self._set_metric_view_default(key, values)
             self._draw_metric_histogram(key)
         self.log(
             f"Computed distance, end-to-end displacement, straightness and "
-            f"duration for {len(distance_map)} trajectories"
+            f"duration for {len(result['distance'])} trajectories"
         )
+        if result.get("motion"):
+            moving = sum(1 for p in result["pstatic"].values() if p < 0.05)
+            self.log(f"Immobility test: {len(result['motion']) - moving} of "
+                     f"{len(result['motion'])} trajectories are consistent with "
+                     f"a static emitter (p > 0.05)")
+        elif self.tracks is not None and not self.tracks.empty:
+            self.log("Immobility test skipped: no localization precision available "
+                     "for these trajectories.")
+        self._update_immobility_status()
 
     def _set_metric_default_bounds(self, key, cache):
         boxes = self._metric_bound_boxes.get(key)
@@ -5787,6 +6098,10 @@ class LocalizationTrackingWidget(QWidget):
             return "net"
         if choice.startswith("Straightness"):
             return "straightness"
+        if choice.startswith("Motion ratio"):
+            return "motion"
+        if choice.startswith("p ("):
+            return "pstatic"
         if choice.startswith("Time"):
             return "time"
         return "duration"
@@ -6635,6 +6950,8 @@ class LocalizationTrackingWidget(QWidget):
         net_map = self._track_net_cache or {}
         straightness_map = self._track_straightness_cache or {}
         duration_map = self._track_duration_cache or {}
+        motion_map = self._track_motion_cache or {}
+        pstatic_map = self._track_pstatic_cache or {}
         return pd.DataFrame([
             {
                 "particle": pid,
@@ -6643,6 +6960,8 @@ class LocalizationTrackingWidget(QWidget):
                 "net_displacement_um": net_map.get(pid),
                 "straightness": straightness_map.get(pid),
                 "duration_s": duration_map.get(pid),
+                "motion_ratio": motion_map.get(pid),
+                "p_static": pstatic_map.get(pid),
             }
             for pid in particle_ids
         ])
@@ -6759,6 +7078,17 @@ class LocalizationTrackingWidget(QWidget):
             "straightness_bounds": {
                 "min": self.straight_min_box.value(), "max": self.straight_max_box.value()},
             "duration_bounds_s": {"min": self.dur_min_box.value(), "max": self.dur_max_box.value()},
+            "immobility": {
+                "fallback_precision_nm": self.immobility_sigma_box.value(),
+                "precision_calibration": self.immobility_calibration_box.value(),
+                "precision_source": self._sigma_source()[0],
+                "n_consistent_with_static": sum(
+                    1 for p in (self._track_pstatic_cache or {}).values() if p >= 0.05),
+            },
+            "motion_ratio_bounds": {"min": self.motion_min_box.value(),
+                                    "max": self.motion_max_box.value()},
+            "p_static_bounds": {"min": self.pstatic_min_box.value(),
+                                "max": self.pstatic_max_box.value()},
             # Which ranges were selecting rather than only colouring. Recorded
             # beside the bounds themselves, which are already here under
             # "diffusion", "distance_bounds_um" and the rest.

@@ -348,7 +348,8 @@ def test_a_filter_on_a_metric_computed_later_picks_it_up():
     widget.distance_filter_box.setChecked(True)
     assert widget._passing_particles() == set()
 
-    widget._on_fit_free_metrics_finished((
-        dict.fromkeys(range(5), 1.0), dict.fromkeys(range(5), 1.0),
-        dict.fromkeys(range(5), 1.0), dict.fromkeys(range(5), 1.0)))
+    widget._on_fit_free_metrics_finished(
+        {key: dict.fromkeys(range(5), 1.0)
+         for key in ("distance", "net", "straightness", "duration",
+                     "motion", "pstatic")})
     assert widget._passing_particles() == set(range(5))

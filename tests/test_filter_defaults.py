@@ -44,7 +44,9 @@ def test_distance_is_reported_in_microns():
         }
     )
     worker = widget._fit_free_metrics_worker(tracks, pixel_size_nm, 100.0)
-    distance_map, net_map, straightness_map, _duration_map = worker.work()
+    result = worker.work()
+    distance_map, net_map, straightness_map = (
+        result["distance"], result["net"], result["straightness"])
 
     expected_um = n_steps * pixel_size_nm / 1000.0  # 10 px * 100 nm = 1 um
     assert distance_map[0] == pytest.approx(expected_um)

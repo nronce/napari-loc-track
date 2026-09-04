@@ -1,0 +1,309 @@
+"""Did this molecule move at all? Asked without fitting anything.
+
+A static emitter is a completely specified statistical object: every position
+it reports is its true position plus localization error, and that error is
+measured per spot by the same fit that produced the position. So the scatter of
+a trajectory in units of its own precision is chi-squared with 2(N-1) degrees of
+freedom under "this never moved" - exactly, at every trajectory length.
+
+That is the same question a small diffusion coefficient is usually asked to
+answer, but asked directly: one pass instead of a per-trajectory regression, at
+its best on exactly the short trajectories where the MSD slope is at its worst,
+and returning a probability instead of a number to be thresholded by eye.
+
+The tests that matter here are the calibration ones. A test whose stated null
+distribution is not its actual null distribution is worse than no test, because
+its p-values look meaningful.
+"""
+import os
+
+os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+
+import numpy as np
+import pandas as pd
+import pytest
+
+widget_mod = pytest.importorskip(
+    "napari_loc_track.widget", reason="needs the napari/Qt/trackpy stack"
+)
+stats = pytest.importorskip("scipy.stats")
+
+from test_render_widget import _pump_until  # noqa: E402
+from test_widget_interaction import ensure_qapp  # noqa: E402
+
+PIXEL_SIZE_NM = 100.0
+FPS = 32.0
+_WIDGETS = []
+
+
+# --- the statistic itself -----------------------------------------------------
+
+
+def test_a_trajectory_that_never_moved_scores_its_degrees_of_freedom():
+    """T is a sum of 2(N-1) squared standard normals, so it averages 2(N-1)."""
+    rng = np.random.default_rng(0)
+    n, sigma = 12, 25.0
+    totals = []
+    for _ in range(4000):
+        xy = rng.normal(0, sigma, (n, 2))
+        T, dof = widget_mod.immobility_statistic(xy[:, 0], xy[:, 1],
+                                                 np.full(n, sigma))
+        assert dof == 2 * (n - 1)
+        totals.append(T)
+    assert np.mean(totals) == pytest.approx(2 * (n - 1), rel=0.03)
+
+
+@pytest.mark.parametrize("n", [3, 5, 20, 60])
+def test_the_null_holds_at_every_trajectory_length(n):
+    """Exact, not asymptotic: the false-positive rate must be 5% at every N."""
+    rng = np.random.default_rng(n)
+    sigma = 25.0
+    p = []
+    for _ in range(4000):
+        xy = rng.normal(0, sigma, (n, 2))
+        T, dof = widget_mod.immobility_statistic(xy[:, 0], xy[:, 1], np.full(n, sigma))
+        p.append(stats.chi2.sf(T, dof))
+    assert (np.array(p) < 0.05).mean() == pytest.approx(0.05, abs=0.015)
+
+
+def test_heterogeneous_precision_must_be_weighted_not_averaged():
+    """Photon count varies several-fold between spots, so precision does too.
+
+    Substituting one average sigma breaks the null - the residuals stop being
+    identically distributed - and the test starts calling static molecules
+    mobile at three times the rate it claims.
+    """
+    rng = np.random.default_rng(3)
+    n = 30
+    weighted, averaged = [], []
+    for _ in range(4000):
+        sigma = rng.uniform(15, 45, n)
+        xy = rng.normal(0, 1, (n, 2)) * sigma[:, None]
+        T, dof = widget_mod.immobility_statistic(xy[:, 0], xy[:, 1], sigma)
+        weighted.append(stats.chi2.sf(T, dof))
+        T2, dof2 = widget_mod.immobility_statistic(
+            xy[:, 0], xy[:, 1], np.full(n, sigma.mean()))
+        averaged.append(stats.chi2.sf(T2, dof2))
+    assert (np.array(weighted) < 0.05).mean() == pytest.approx(0.05, abs=0.015)
+    assert (np.array(averaged) < 0.05).mean() > 0.10
+
+
+def test_a_moving_molecule_is_detected():
+    rng = np.random.default_rng(5)
+    n, sigma, step = 20, 25.0, 80.0
+    caught = 0
+    for _ in range(2000):
+        true = np.cumsum(rng.normal(0, step, (n, 2)), axis=0)
+        xy = true + rng.normal(0, sigma, (n, 2))
+        T, dof = widget_mod.immobility_statistic(xy[:, 0], xy[:, 1], np.full(n, sigma))
+        caught += stats.chi2.sf(T, dof) < 0.05
+    assert caught / 2000 > 0.95
+
+
+def test_the_statistic_does_not_care_what_unit_it_is_given():
+    """Dimensionless by construction - pixels and nanometres must agree."""
+    rng = np.random.default_rng(7)
+    xy = rng.normal(0, 25.0, (15, 2))
+    sigma = np.full(15, 25.0)
+    T_nm, dof_nm = widget_mod.immobility_statistic(xy[:, 0], xy[:, 1], sigma)
+    T_px, dof_px = widget_mod.immobility_statistic(
+        xy[:, 0] / 100.0, xy[:, 1] / 100.0, sigma / 100.0)
+    assert T_px == pytest.approx(T_nm)
+    assert dof_px == dof_nm
+
+
+def test_a_single_point_cannot_scatter():
+    T, dof = widget_mod.immobility_statistic([1.0], [2.0], [25.0])
+    assert dof == 0 and np.isnan(T)
+
+
+def test_localizations_without_a_precision_are_dropped_not_guessed():
+    """A missing uncertainty is not a licence to invent one."""
+    x = [0.0, 1.0, 2.0, 3.0]
+    y = [0.0, 0.0, 0.0, 0.0]
+    sigma = [25.0, np.nan, 25.0, 0.0]        # one missing, one non-positive
+    T, dof = widget_mod.immobility_statistic(x, y, sigma)
+    assert dof == 2 * (2 - 1)                # two usable points remain
+
+
+# --- through the widget -------------------------------------------------------
+
+
+def _widget():
+    from napari.components import ViewerModel
+
+    ensure_qapp()
+    widget = widget_mod.LocalizationTrackingWidget(ViewerModel())
+    _WIDGETS.append(widget)
+    widget.pixel_size_box.setValue(PIXEL_SIZE_NM)
+    widget.fps_box.setValue(FPS)
+    return widget
+
+
+def _population(n_static=20, n_moving=20, n_points=15, step_nm=120.0,
+                sigma_range=(15.0, 45.0), with_uncertainty=True, seed=0):
+    """Localizations and their trajectories, half immobile and half diffusing."""
+    rng = np.random.default_rng(seed)
+    rows, tracks = [], []
+    for pid in range(n_static + n_moving):
+        step = 0.0 if pid < n_static else step_nm
+        true = np.cumsum(rng.normal(0, step, (n_points, 2)), axis=0)
+        true += [4000.0 * (pid % 8), 4000.0 * (pid // 8)]
+        sigma = rng.uniform(*sigma_range, n_points)
+        seen = true + rng.normal(0, 1, (n_points, 2)) * sigma[:, None]
+        for frame, (point, s) in enumerate(zip(seen, sigma)):
+            row = {"frame": frame, "x [nm]": point[0], "y [nm]": point[1],
+                   "sigma [nm]": 150.0, "intensity [photon]": 900.0}
+            if with_uncertainty:
+                row["uncertainty [nm]"] = s
+            rows.append(row)
+            tracks.append({"particle": pid, "frame": frame,
+                           "x": point[0] / PIXEL_SIZE_NM, "y": point[1] / PIXEL_SIZE_NM})
+    return pd.DataFrame(rows), pd.DataFrame(tracks)
+
+
+def _analysed(**kwargs):
+    widget = _widget()
+    locs, tracks = _population(**kwargs)
+    widget._ingest_localization_dataframe(locs, "loaded", True)
+    widget.tracks = tracks
+    widget._invalidate_track_filter()
+    widget._start_fit_free_metrics_worker()
+    assert _pump_until(lambda: widget._track_distance_cache is not None), \
+        "the metrics never finished"
+    return widget
+
+
+def test_the_precision_is_taken_per_spot_from_the_localization_table():
+    widget = _analysed()
+    label, sigma_px, measured = widget._sigma_source()
+    assert measured is True
+    assert "uncertainty [nm]" in label
+    assert len(sigma_px) == len(widget.tracks)
+    # nm converted to camera pixels, and genuinely varying spot to spot
+    assert sigma_px.min() == pytest.approx(15.0 / PIXEL_SIZE_NM, abs=0.02)
+    assert sigma_px.std() > 0
+
+
+def test_a_table_without_uncertainties_falls_back_and_says_so():
+    widget = _analysed(with_uncertainty=False)
+    label, sigma_px, measured = widget._sigma_source()
+    assert measured is False
+    assert "no uncertainty column" in label
+    assert np.allclose(sigma_px, widget.immobility_sigma_box.value() / PIXEL_SIZE_NM)
+    assert "Add an uncertainty column" in widget.immobility_status_label.text()
+
+
+def test_immobile_molecules_land_on_a_motion_ratio_of_one():
+    """The calibration check: this is what says the precision is trustworthy."""
+    widget = _analysed(n_static=200, n_moving=0)
+    ratios = np.array([widget._track_motion_cache[pid] for pid in range(200)])
+    assert np.median(ratios) == pytest.approx(1.0, abs=0.12)
+
+
+def test_the_two_populations_separate():
+    widget = _analysed(n_static=60, n_moving=60)
+    p = widget._track_pstatic_cache
+    static_called = sum(1 for pid in range(60) if p[pid] > 0.05)
+    moving_called = sum(1 for pid in range(60, 120) if p[pid] < 0.05)
+    assert static_called >= 54          # ~5% false positives expected
+    assert moving_called >= 54
+
+
+def test_the_p_value_is_floored_so_a_log_axis_stays_readable():
+    """An obviously mobile molecule returns something like 1e-200, and a log
+    axis running that far spends every decade but the last on nothing."""
+    widget = _analysed(n_static=0, n_moving=20, step_nm=2000.0)
+    assert min(widget._track_pstatic_cache.values()) >= widget_mod.P_STATIC_FLOOR
+
+
+def test_the_calibration_factor_scales_the_reported_precision():
+    """The one assumption from outside the test, and the knob that fixes it."""
+    widget = _analysed(n_static=100, n_moving=0)
+    before = np.median(list(widget._track_motion_cache.values()))
+
+    widget.immobility_calibration_box.setValue(2.0)
+    assert _pump_until(
+        lambda: np.median(list(widget._track_motion_cache.values())) < before * 0.5)
+    after = np.median(list(widget._track_motion_cache.values()))
+    # sigma doubled, and the statistic divides by sigma squared
+    assert after == pytest.approx(before / 4.0, rel=0.05)
+
+
+def test_both_metrics_reach_the_histograms_bounds_and_colouring():
+    widget = _analysed()
+    for key, choice in (("motion", "Motion ratio (moved vs its own precision)"),
+                        ("pstatic", "p (consistent with static)")):
+        assert key in widget._metric_hist_widgets
+        assert key in widget._metric_bound_boxes
+        assert key in widget._metric_filter_boxes
+        widget.color_metric_box.setCurrentText(choice)
+        assert widget._current_metric_key() == key
+
+
+def test_both_reach_the_exported_metrics_table():
+    widget = _analysed()
+    frame = widget._track_metrics_frame()
+    assert "motion_ratio" in frame.columns
+    assert "p_static" in frame.columns
+    assert frame["motion_ratio"].notna().all()
+
+
+# --- the point of it: the structural half of the acquisition -------------------
+
+
+def test_filtering_to_p_above_five_percent_renders_the_immobile_population():
+    """Structural PALM is the p > 0.05 subset of a live-cell acquisition, and
+    sptPALM is the rest. This is that cut, made once, on one dataset."""
+    widget = _analysed(n_static=40, n_moving=40)
+    everything = widget._render_positions_px()[0].size
+
+    widget.pstatic_min_box.setValue(0.05)
+    widget.pstatic_max_box.setValue(1.0)
+    widget.pstatic_filter_box.setChecked(True)
+
+    immobile = widget._render_positions_px()[0].size
+    assert immobile == pytest.approx(everything / 2, rel=0.2)
+    kept = set(widget._displayed_tracks()["particle"])
+    assert len(kept & set(range(40))) >= 36        # nearly all the static ones
+    assert len(kept & set(range(40, 80))) <= 4     # and almost no moving ones
+
+
+def test_the_complementary_cut_renders_the_mobile_population():
+    widget = _analysed(n_static=40, n_moving=40)
+    widget.pstatic_min_box.setValue(0.0)
+    widget.pstatic_max_box.setValue(0.05)
+    widget.pstatic_filter_box.setChecked(True)
+
+    kept = set(widget._displayed_tracks()["particle"])
+    assert len(kept & set(range(40, 80))) >= 36
+    assert len(kept & set(range(40))) <= 4
+
+
+def test_filtering_on_the_motion_ratio_works_the_same_way():
+    widget = _analysed(n_static=40, n_moving=40)
+    widget.motion_min_box.setValue(0.0)
+    widget.motion_max_box.setValue(1.5)
+    widget.motion_filter_box.setChecked(True)
+    kept = set(widget._displayed_tracks()["particle"])
+    assert len(kept & set(range(40))) > len(kept & set(range(40, 80)))
+
+
+def test_the_settings_survive_a_round_trip():
+    widget = _analysed()
+    widget.immobility_calibration_box.setValue(1.19)
+    widget.immobility_sigma_box.setValue(31.0)
+    widget.pstatic_min_box.setValue(0.05)
+    widget.pstatic_filter_box.setChecked(True)
+    metadata = widget._collect_metadata(None)
+
+    assert metadata["immobility"]["precision_calibration"] == pytest.approx(1.19)
+    assert "uncertainty" in metadata["immobility"]["precision_source"]
+    assert metadata["dynamics_filter"]["pstatic"] is True
+
+    restored = _widget()
+    restored.apply_settings(metadata)
+    assert restored.immobility_calibration_box.value() == pytest.approx(1.19)
+    assert restored.immobility_sigma_box.value() == pytest.approx(31.0)
+    assert restored.pstatic_min_box.value() == pytest.approx(0.05)
+    assert restored.pstatic_filter_box.isChecked()
