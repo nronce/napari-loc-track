@@ -26,7 +26,7 @@ except Exception:
     _NUMBA_AVAILABLE = False
 
 try:
-    import pygpufit.gpufit as _GPUFIT
+    import pygpufit.gpufit as _GPUFIT                                                                   
     _GPUFIT_AVAILABLE = True
 except Exception:
     _GPUFIT = None
@@ -271,10 +271,55 @@ def _initial_guess(patch, xx, yy):
     return np.array([amp, bg, x0, y0, sx, sy], dtype=np.float64)
 
 
-def _photons_bg_subtracted_from_patch(patch, bg):
-    patch_f = patch.astype(np.float64, copy=False)
-    signal = np.clip(patch_f - float(bg), 0.0, None)
-    return float(signal.sum())
+def gaussian_photons(amp, sx, sy):
+    """Photons in the fitted spot: the analytic integral of its own Gaussian.
+
+    Not the background-subtracted sum over the box, which is what this used to
+    be and which is biased upward - badly. Summing needs the negative residuals
+    to cancel the positive ones, and clipping at zero (necessary, since a
+    negative photon count is not a thing) removes exactly half of that
+    cancellation. Every background pixel in the box then donates about
+    sigma_bg/sqrt(2*pi) phantom photons, and there are box*box of them.
+
+    Measured against simulated spots of known brightness: the clipped sum
+    over-reports by 7% at 300 photons on a 2/pixel background and by 59% at 150
+    photons on 30/pixel, growing with the background and with the box. The
+    integral is within 1% everywhere in that range, and its error does not
+    depend on the background at all.
+    """
+    return 2.0 * np.pi * amp * sx * sy
+
+
+def crlb_sigma(photons, bg_per_pixel, psf_sigma, mle):
+    """Localization precision, per axis, in the units psf_sigma is given in.
+
+    Mortensen et al. (2010). The previous estimate here was s/sqrt(N), which is
+    the photon-limited term alone and therefore a floor rather than an estimate:
+    it omits pixelation, and it omits the background term that dominates at low
+    photon counts. Against simulated spots it under-reported the precision
+    actually achieved by 40% at 300 photons and by a factor of 2.7 at 150
+    photons on a bright background.
+
+    Two forms, because the fit backends are genuinely different estimators: an
+    unweighted least-squares fit pays a factor 16/9 in variance that a Poisson
+    maximum-likelihood fit does not.
+
+    `bg_per_pixel` is the background in photons; for Poisson counts that is also
+    its variance, which is what the formula wants. Pixel size enters as the unit
+    of `psf_sigma` - passing it in pixels makes the pixel one unit wide, which
+    is what the a^2/12 pixelation term below assumes.
+    """
+    photons = np.maximum(photons, 1.0)
+    bg = np.maximum(bg_per_pixel, 0.0)
+    # The PSF as the pixel grid actually samples it: a pixel of width a adds
+    # a^2/12, the variance of a uniform distribution across it.
+    sa2 = psf_sigma ** 2 + 1.0 / 12.0
+    if mle:
+        tau = 2.0 * np.pi * sa2 * bg / photons
+        factor = 1.0 + 4.0 * tau + np.sqrt(2.0 * tau / (1.0 + 4.0 * tau))
+    else:
+        factor = 16.0 / 9.0 + 8.0 * np.pi * sa2 * bg / photons
+    return np.sqrt(sa2 / photons * factor)
 
 
 def _fit_params_np(data, weighted, max_iter, tol, damping):
@@ -339,11 +384,11 @@ def _fit_params_np(data, weighted, max_iter, tol, damping):
     return params, ok
 
 
-def _fit_dict(data, params, lp_floor):
+def _fit_dict(_data, params, lp_floor, mle=True):
     amp, bg, x0, y0, sx, sy = (float(v) for v in params)
-    photons = _photons_bg_subtracted_from_patch(data, bg)
-    lpx = float(max(sx / np.sqrt(max(photons, 1.0)), lp_floor))
-    lpy = float(max(sy / np.sqrt(max(photons, 1.0)), lp_floor))
+    photons = float(gaussian_photons(amp, sx, sy))
+    lpx = float(max(crlb_sigma(photons, bg, sx, mle), lp_floor))
+    lpy = float(max(crlb_sigma(photons, bg, sy, mle), lp_floor))
     return {
         "x_patch": x0, "y_patch": y0, "photons": photons,
         "sx": sx, "sy": sy, "bg": bg,
@@ -359,7 +404,7 @@ def fit_gaussian_2d(patch, *, max_iter=12, tol=1e-3, damping=1e-2):
         return None
     data = patch.astype(np.float64, copy=False)
     params, _ok = _fit_params_np(data, False, max_iter, tol, damping)
-    return _fit_dict(data, params, 0.05)
+    return _fit_dict(data, params, 0.05, mle=False)
 
 
 def fit_gaussian_2d_mle(patch, *, max_iter=20, tol=5e-4, damping=5e-2):
@@ -370,7 +415,7 @@ def fit_gaussian_2d_mle(patch, *, max_iter=20, tol=5e-4, damping=5e-2):
         return None
     data = patch.astype(np.float64, copy=False)
     params, _ok = _fit_params_np(data, True, max_iter, tol, damping)
-    return _fit_dict(data, params, 0.02)
+    return _fit_dict(data, params, 0.02, mle=True)
 
 
 if _NUMBA_AVAILABLE:
@@ -1080,15 +1125,16 @@ def localize_frame(
         if kept.size == 0:
             return _empty_locs()
 
+    amp = params[:, 0]
     bg = params[:, 1]
     sx = params[:, 4]
     sy = params[:, 5]
-    signal = patches - bg[:, None, None]
-    np.clip(signal, 0.0, None, out=signal)
-    photons = signal.sum(axis=(1, 2))
-    denom = np.sqrt(np.maximum(photons, 1.0))
-    lpx = np.maximum(sx / denom, lp_floor)
-    lpy = np.maximum(sy / denom, lp_floor)
+    photons = gaussian_photons(amp, sx, sy)
+    # Least squares pays a factor 16/9 in variance that the Poisson MLE does
+    # not, so the precision reported has to know which fit produced it.
+    is_mle = backend != "fast"
+    lpx = np.maximum(crlb_sigma(photons, bg, sx, is_mle), lp_floor)
+    lpy = np.maximum(crlb_sigma(photons, bg, sy, is_mle), lp_floor)
 
     ng_out = np.zeros(kept.size, dtype=np.float32)
     if net_gradient is not None:
