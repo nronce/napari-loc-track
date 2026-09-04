@@ -168,3 +168,76 @@ def test_a_zero_msd_point_does_not_break_the_log_plot():
     assert axes.get_yscale() == "log"
     drawn = np.concatenate([line.get_ydata() for line in axes.lines])
     assert (drawn > 0).all(), "a non-positive value reached a log axis"
+
+
+# --- the other half of the fit -------------------------------------------------
+#
+# MSD = 4*D*tau + 4*sigma^2. The slope was being reported and the intercept
+# thrown away, even though it is a second estimate of the localization precision
+# by a completely different route from the spot fit - which makes the two
+# together a calibration with no free parameters.
+
+
+def test_the_intercept_recovers_the_localization_precision():
+    """4*sigma^2 is the intercept, so sqrt(intercept)/2 is sigma."""
+    sigma_um = 0.025                      # 25 nm
+    assert widget_mod.msd_sigma_nm(4 * sigma_um ** 2) == pytest.approx(25.0)
+
+
+def test_a_negative_intercept_reports_nothing_rather_than_a_number():
+    """Motion blur subtracts from the intercept and can take it below zero.
+    A fast molecule has no precision to report here, and inventing one - by
+    taking the root of a negative, or clamping to zero - would be worse."""
+    assert np.isnan(widget_mod.msd_sigma_nm(-0.001))
+    assert np.isnan(widget_mod.msd_sigma_nm(0.0))
+    assert np.isnan(widget_mod.msd_sigma_nm(float("nan")))
+
+
+def test_the_precision_from_the_intercept_is_reported_per_trajectory():
+    import pandas as pd
+
+    widget = make_widget()
+    widget.pixel_size_box.setValue(100.0)
+    widget.tracks = pd.DataFrame({
+        "particle": [0] * 6 + [1] * 6,
+        "frame": list(range(6)) * 2,
+        "x": [0.0, 1.0, 2.0, 3.0, 4.0, 5.0] * 2,
+        "y": [0.0] * 12,
+    })
+    widget._track_diffusion_cache = {0: 0.5, 1: 0.5}
+    widget._track_msd_cache = {
+        0: (None, None, 2.0, 4 * 0.025 ** 2, 0.1),      # sigma = 25 nm
+        1: (None, None, 2.0, -0.004, 0.1),              # blurred past zero
+    }
+    sigmas = widget._msd_sigma_map()
+    assert sigmas[0] == pytest.approx(25.0)
+    assert np.isnan(sigmas[1])
+
+    frame = widget._track_metrics_frame()
+    assert "sigma_from_msd_nm" in frame.columns
+    assert frame.loc[frame["particle"] == 0, "sigma_from_msd_nm"].iloc[0] == \
+        pytest.approx(25.0)
+
+
+def test_the_two_precisions_are_reported_against_each_other():
+    """The point of surfacing it: the spot fit and the MSD intercept measure the
+    same thing, so their ratio is the calibration the immobility test needs."""
+    import pandas as pd
+
+    widget = make_widget()
+    widget.pixel_size_box.setValue(100.0)
+    widget.tracks = pd.DataFrame({
+        "particle": [0] * 6, "frame": list(range(6)),
+        "x": [0.0] * 6, "y": [0.0] * 6,
+    })
+    widget._track_msd_cache = {0: (None, None, 2.0, 4 * 0.030 ** 2, 0.1)}
+    widget._update_msd_sigma_label()
+    text = widget.msd_sigma_label.text()
+    assert "30.0 nm" in text
+    assert "Ratio" in text
+
+
+def test_it_says_so_before_d_has_been_computed():
+    widget = make_widget()
+    widget._update_msd_sigma_label()
+    assert "Compute D" in widget.msd_sigma_label.text()

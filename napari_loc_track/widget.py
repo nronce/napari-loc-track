@@ -1206,6 +1206,28 @@ def fit_msd_slope(tau, msd):
     return float(slope), float(intercept), error
 
 
+def msd_sigma_nm(intercept_um2):
+    """The localization precision the MSD intercept implies, per axis, in nm.
+
+    In two dimensions MSD(tau) = 4*D*tau + 4*sigma^2, so the intercept is four
+    times the squared precision and sqrt(intercept)/2 recovers it. This is a
+    second, completely independent estimate of the same quantity the spot fitter
+    reports: one comes from the shape of a single spot, the other from how much
+    a trajectory jitters. Where they disagree, something is wrong with one of
+    them, and the ratio is the correction the immobility test needs.
+
+    Two things bias it low and both matter. Motion blur subtracts 8*R*D*dt from
+    the intercept (R = 1/6 for continuous illumination), so a fast molecule can
+    even produce a negative one - which is why this is read off the slow end of
+    the population. And the intercept is extrapolated from a handful of
+    correlated MSD points, so it is noisy per trajectory and only worth
+    believing in aggregate.
+    """
+    if not np.isfinite(intercept_um2) or intercept_um2 <= 0:
+        return float("nan")
+    return float(np.sqrt(intercept_um2) / 2.0 * 1000.0)
+
+
 @thread_worker
 def _compute_d_worker(tracks_df, max_lagtime, fps, mpp, cancel=None):
     # MSD is computed independently per trajectory, so running tp.imsd on
@@ -3464,6 +3486,14 @@ class LocalizationTrackingWidget(QWidget):
         self.msd_canvas = FigureCanvas(self.msd_figure)
         self.msd_canvas.setMinimumHeight(240)
         msd_sub_layout.addWidget(self.msd_canvas)
+        # The intercept is fitted anyway - MSD = 4*D*tau + 4*sigma^2 - so the
+        # localization precision it implies is free, and it is an estimate of
+        # the same quantity the spot fitter reports by an entirely different
+        # route. Reporting only the slope threw half the fit away.
+        self.msd_sigma_label = QLabel()
+        self.msd_sigma_label.setWordWrap(True)
+        self.msd_sigma_label.setProperty("role", "note")
+        msd_sub_layout.addWidget(self.msd_sigma_label)
         d_layout.addWidget(msd_sub)
         layout.addWidget(d_group)
 
@@ -5919,6 +5949,11 @@ class LocalizationTrackingWidget(QWidget):
         self._set_metric_view_default("D", d_map)
         self._draw_metric_histogram("D")
         self._draw_msd_validation()
+        self._update_msd_sigma_label()
+        sigmas = [s for s in self._msd_sigma_map().values() if np.isfinite(s)]
+        if sigmas:
+            self.log(f"MSD intercept implies a localization precision of "
+                     f"{np.median(sigmas):.1f} nm (median of {len(sigmas)} trajectories)")
         if self.color_trajectories_box.isChecked():
             self.render_overlay()
 
@@ -6771,6 +6806,47 @@ class LocalizationTrackingWidget(QWidget):
             return f"#{pid} D={D:.3g} µm²/s"
         return f"#{pid} D={D:.3g}±{slope_error / 4.0:.2g} µm²/s"
 
+    def _msd_sigma_map(self):
+        """Precision from the MSD intercept, per trajectory, in nm."""
+        return {pid: msd_sigma_nm(fit[3])
+                for pid, fit in (self._track_msd_cache or {}).items()
+                if len(fit) > 3}
+
+    def _update_msd_sigma_label(self):
+        """Cross-check the two precisions against each other.
+
+        The spot fit and the MSD intercept measure the same thing by completely
+        different routes, so their ratio is a calibration with no free
+        parameters - and it is exactly the factor the immobility test needs when
+        the reported uncertainty is a Cramer-Rao bound rather than the error
+        actually achieved.
+        """
+        if not hasattr(self, "msd_sigma_label"):
+            return
+        sigmas = np.array([s for s in self._msd_sigma_map().values() if np.isfinite(s)])
+        if not sigmas.size:
+            self.msd_sigma_label.setText(
+                "Compute D to read the localization precision off the MSD intercept.")
+            return
+        from_msd = float(np.median(sigmas))
+        total = len(self._track_msd_cache or {})
+        text = [f"MSD intercept implies σ = {from_msd:.1f} nm "
+                f"(median of {sigmas.size} of {total} trajectories; the rest have a "
+                f"negative intercept, which motion blur alone can produce)."]
+
+        _label, sigma_px, measured = self._sigma_source()
+        if sigma_px is not None and len(sigma_px):
+            reported = float(np.median(sigma_px)) * self.pixel_size_box.value()
+            ratio = from_msd / max(reported, 1e-9)
+            text.append(f"The localization fit reports {reported:.1f} nm"
+                        + ("" if measured else " (fallback value)") + ".")
+            text.append(
+                f"Ratio {ratio:.2f}. These measure the same quantity by different "
+                "routes, so on a population dominated by slow molecules this is "
+                "the calibration factor for the immobility test - motion blur "
+                "biases the intercept low, so read it off the slow end.")
+        self.msd_sigma_label.setText(" ".join(text))
+
     def _draw_msd_validation(self):
         figure = self.msd_figure
         figure.clear()
@@ -6952,6 +7028,7 @@ class LocalizationTrackingWidget(QWidget):
         duration_map = self._track_duration_cache or {}
         motion_map = self._track_motion_cache or {}
         pstatic_map = self._track_pstatic_cache or {}
+        sigma_msd_map = self._msd_sigma_map()
         return pd.DataFrame([
             {
                 "particle": pid,
@@ -6962,6 +7039,7 @@ class LocalizationTrackingWidget(QWidget):
                 "duration_s": duration_map.get(pid),
                 "motion_ratio": motion_map.get(pid),
                 "p_static": pstatic_map.get(pid),
+                "sigma_from_msd_nm": sigma_msd_map.get(pid),
             }
             for pid in particle_ids
         ])
@@ -7071,6 +7149,12 @@ class LocalizationTrackingWidget(QWidget):
                 "d_max": self.d_max_box.value(),
                 "n_tracks_with_D": len(self._track_diffusion_cache or {}),
                 "msd_validation_sample_count": self.msd_sample_box.value(),
+                # The other half of the same fit: MSD = 4*D*tau + 4*sigma^2.
+                "localization_precision_from_msd_nm": (
+                    float(np.median([s for s in self._msd_sigma_map().values()
+                                     if np.isfinite(s)]))
+                    if any(np.isfinite(s) for s in self._msd_sigma_map().values())
+                    else None),
             },
             "distance_bounds_um": {"min": self.dist_min_box.value(), "max": self.dist_max_box.value()},
             "net_displacement_bounds_um": {

@@ -36,6 +36,14 @@ OFFSET_ADU = 100.0
 GAIN_ADU_PER_PHOTON = 1.0  # 1:1 so photon counts can be read straight off
 READ_NOISE_E = 1.6         # sCMOS, per pixel per frame
 BACKGROUND_PHOTONS = 20.0  # per pixel per frame, HiLo-like
+# Structure on top of that flat level, as a fraction of it. A real HiLo
+# background is neither flat nor steady: the illumination falls off across the
+# field, out-of-focus material drifts through it, and the lamp is not perfectly
+# stable frame to frame. All three make the fitted background per spot vary,
+# which is what the localization precision is most sensitive to.
+BACKGROUND_GRADIENT = 0.0   # peak-to-edge illumination falloff
+BACKGROUND_BLOBS = 0        # out-of-focus blobs drifting through the field
+BACKGROUND_FLICKER = 0.0    # frame-to-frame std, as a fraction of the level
 
 # --- fluorophores --------------------------------------------------------
 PSF_SIGMA_NM = 130.0       # what a 1.45 NA objective delivers in practice
@@ -110,7 +118,8 @@ def build(seed=20260904):
     print(f"{len(rows)} localizations from {len(truth)} molecules")
 
     # Background, shot noise, read noise, offset - in that order, as a camera does.
-    stack += BACKGROUND_PHOTONS
+    bg_stack = _background_field(rng)
+    stack += bg_stack
     stack = rng.poisson(stack).astype(np.float32)
     stack += rng.normal(0.0, READ_NOISE_E, stack.shape).astype(np.float32)
     stack = stack * GAIN_ADU_PER_PHOTON + OFFSET_ADU
@@ -119,8 +128,14 @@ def build(seed=20260904):
     locs = pd.DataFrame(rows, columns=["frame", "particle", "x_px", "y_px", "photons"])
     locs["x [nm]"] = locs["x_px"] * PIXEL_NM
     locs["y [nm]"] = locs["y_px"] * PIXEL_NM
+    # The precision to expect uses the background each spot actually sat on,
+    # not the nominal level - with a structured background they differ.
+    bg_here = bg_stack[locs["frame"].to_numpy(),
+                       np.clip(locs["y_px"].to_numpy().astype(int), 0, SIZE - 1),
+                       np.clip(locs["x_px"].to_numpy().astype(int), 0, SIZE - 1)]
+    locs["background [photons/px]"] = bg_here
     locs["expected_precision [nm]"] = crlb_nm(
-        locs["photons"].to_numpy(), BACKGROUND_PHOTONS, PSF_SIGMA_NM)
+        locs["photons"].to_numpy(), bg_here, PSF_SIGMA_NM)
 
     tracks = pd.DataFrame(truth, columns=[
         "particle", "is_mobile", "D_true_um2_per_s", "n_frames_on", "mean_photons"])
@@ -128,6 +143,46 @@ def build(seed=20260904):
     counts = locs.groupby("particle").size().rename("n_localizations")
     tracks = tracks.merge(counts, on="particle")
     return stack, locs, tracks
+
+
+def _background_field(rng):
+    """The background each frame sits on: a level, a falloff, drifting blobs.
+
+    Returned as photons per pixel, broadcast over the whole stack. A flat
+    background is the easy case and hides the failure that matters - a
+    background that varies between spots makes the localization precision vary
+    with it, which is exactly what a single averaged sigma cannot represent.
+    """
+    yy, xx = np.mgrid[0:SIZE, 0:SIZE].astype(np.float32)
+    field = np.ones((SIZE, SIZE), np.float32)
+
+    if BACKGROUND_GRADIENT:
+        # Illumination falling off from the centre, as HiLo does.
+        r2 = ((yy - SIZE / 2) ** 2 + (xx - SIZE / 2) ** 2) / (SIZE / 2) ** 2
+        field *= 1.0 - BACKGROUND_GRADIENT * np.clip(r2, 0.0, 1.0)
+
+    frames = np.ones(N_FRAMES, np.float32)
+    if BACKGROUND_FLICKER:
+        # A slow wander rather than white noise: lamp drift and focus breathing
+        # are correlated frame to frame, which is harder to average away.
+        walk = np.cumsum(rng.normal(0.0, BACKGROUND_FLICKER, N_FRAMES))
+        walk -= walk.mean()
+        frames = np.clip(1.0 + walk / max(np.std(walk), 1e-9) * BACKGROUND_FLICKER,
+                         0.2, None).astype(np.float32)
+
+    stack = (BACKGROUND_PHOTONS * field[None, :, :] * frames[:, None, None])
+
+    for _ in range(BACKGROUND_BLOBS):
+        # Out-of-focus material: broad, dim, and crossing the field slowly.
+        width = rng.uniform(SIZE / 12, SIZE / 5)
+        amp = BACKGROUND_PHOTONS * rng.uniform(0.4, 1.2)
+        x0, y0 = rng.uniform(0, SIZE, 2)
+        vx, vy = rng.normal(0, SIZE / (3 * N_FRAMES), 2)
+        for f in range(0, N_FRAMES, 20):          # blobs move slowly; step in 20s
+            cx, cy = x0 + vx * f, y0 + vy * f
+            blob = amp * np.exp(-((yy - cy) ** 2 + (xx - cx) ** 2) / (2 * width ** 2))
+            stack[f:f + 20] += blob[None, :, :].astype(np.float32)
+    return stack
 
 
 def _draw(plane, x, y, photons, sigma_px, half=6):
@@ -184,6 +239,25 @@ def write_micromanager_sidecar(path, n_frames):
 
 
 def main():
+    import argparse
+
+    global STEM, PHOTON_MODE, BACKGROUND_PHOTONS, BACKGROUND_GRADIENT
+    global BACKGROUND_BLOBS, BACKGROUND_FLICKER
+    ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument("--stem", default=STEM)
+    ap.add_argument("--photons", type=float, default=PHOTON_MODE)
+    ap.add_argument("--background", type=float, default=BACKGROUND_PHOTONS)
+    ap.add_argument("--gradient", type=float, default=BACKGROUND_GRADIENT)
+    ap.add_argument("--blobs", type=int, default=BACKGROUND_BLOBS)
+    ap.add_argument("--flicker", type=float, default=BACKGROUND_FLICKER)
+    args = ap.parse_args()
+    STEM = args.stem
+    PHOTON_MODE = args.photons
+    BACKGROUND_PHOTONS = args.background
+    BACKGROUND_GRADIENT = args.gradient
+    BACKGROUND_BLOBS = args.blobs
+    BACKGROUND_FLICKER = args.flicker
+
     OUT.mkdir(parents=True, exist_ok=True)
     stack, locs, tracks = build()
 
@@ -236,7 +310,10 @@ CAMERA
   offset                {OFFSET_ADU:.0f} ADU     (in the metadata; should autofill)
   gain                  {GAIN_ADU_PER_PHOTON} ADU/photon   <- set this, the default is right
   read noise            {READ_NOISE_E} e- rms
-  background            {BACKGROUND_PHOTONS:.0f} photons/pixel/frame
+  background            {BACKGROUND_PHOTONS:.0f} photons/pixel/frame nominal
+                        gradient {BACKGROUND_GRADIENT:.0%} centre-to-edge,
+                        {BACKGROUND_BLOBS} drifting out-of-focus blobs,
+                        {BACKGROUND_FLICKER:.0%} frame-to-frame wander
 
 FLUOROPHORES
   PSF sigma             {PSF_SIGMA_NM} nm  ({PSF_SIGMA_NM / PIXEL_NM:.2f} px)
