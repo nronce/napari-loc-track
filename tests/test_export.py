@@ -147,7 +147,10 @@ def test_export_analysis_hands_off_to_a_worker(tmp_path):
 
     assert _pump_until(lambda: widget._export_worker_ref is None), "export never finished"
 
-    folder = tmp_path / "analysis"
+    # One dated folder per run, so a second export never overwrites the first.
+    runs = [d for d in (tmp_path / "analysis").iterdir() if d.is_dir()]
+    assert len(runs) == 1 and runs[0].name.endswith("_export")
+    folder = runs[0]
     assert (folder / "data" / "localizations_filtered.csv").exists()
     assert (folder / "data" / "trajectories.csv").exists()
     assert (folder / "data" / "track_metrics.csv").exists()

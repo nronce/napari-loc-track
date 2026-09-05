@@ -181,8 +181,19 @@ LOCS_FILENAME_PATTERNS = ["locs.csv", "{stem}_locs.csv", "{stem}-locs.csv", "{st
 TRAJ_FILENAME_PATTERNS = [
     "trajectories.csv", "{stem}_trajectories.csv", "{stem}_tracks.csv", "{stem}-tracks.csv",
 ]
-LOCS_ANALYSIS_SUBPATH = "data/localizations_filtered.csv"
-TRAJ_ANALYSIS_SUBPATH = "data/trajectories.csv"
+LOCS_ANALYSIS_SUBPATH = ("data/localizations_filtered.csv", "data/localizations.csv")
+TRAJ_ANALYSIS_SUBPATH = ("data/trajectories.csv",)
+
+# Every run - a fit, an export - lands in its own dated folder under this one,
+# beside the data it came from. Runs are never merged and never overwritten:
+# two fits of the same stack with different thresholds are two results, and
+# which came first is part of the answer.
+ANALYSIS_ROOT = "analysis"
+# Sortable by construction, so "newest" is a string comparison and the folder
+# listing is already in order. Seconds, because re-fitting after changing one
+# threshold takes less than a minute.
+RUN_STAMP_FORMAT = "%Y-%m-%d_%H%M%S"
+LOCS_RUN_FILENAME = "localizations.csv"
 
 METRIC_LABELS = {
     "D": "Diffusion coefficient D (µm²/s)",
@@ -1561,6 +1572,7 @@ class LocalizationTrackingWidget(QWidget):
         # ordinary load from one step of a restore.
         self._session_restore = None
         self._session_save_worker_ref = None
+        self._autosave_worker_ref = None
         self.setup_ui()
 
     # ------------------------------------------------------------------
@@ -2531,6 +2543,19 @@ class LocalizationTrackingWidget(QWidget):
         det_buttons.addWidget(self.loc_detect_button)
         det_buttons.addWidget(self.loc_detect_cancel_button)
         det_layout.addRow("", det_buttons)
+        self.loc_autosave_box = QCheckBox(
+            "Save every fit to a dated folder beside the data")
+        self.loc_autosave_box.setChecked(True)
+        self.loc_autosave_box.setToolTip(
+            "After each fit, write its localizations and the complete settings "
+            "to analysis/<date>_localization/ next to the image.\n\n"
+            "Runs are never merged or overwritten: re-fitting after changing a "
+            "threshold leaves both results side by side, and the timestamps say "
+            "which was which. The table written is the fit's own output, before "
+            "filtering - filters are recorded in the metadata and can be "
+            "re-applied, but a discarded localization cannot be recovered."
+        )
+        det_layout.addRow("", self.loc_autosave_box)
         self.loc_show_candidates_box = QCheckBox("Show detection candidates on the image")
         self.loc_show_candidates_box.setChecked(True)
         self.loc_show_candidates_box.stateChanged.connect(lambda _c: self._update_loc2d_candidate_overlay())
@@ -4097,23 +4122,49 @@ class LocalizationTrackingWidget(QWidget):
                 return candidate
 
         if analysis_relative_path:
-            numbered_dirs = []
-            for d in folder.glob("analysis*"):
+            relatives = ((analysis_relative_path,)
+                         if isinstance(analysis_relative_path, str)
+                         else tuple(analysis_relative_path))
+            for run_dir in self._analysis_run_dirs(folder):
+                for relative in relatives:
+                    candidate = run_dir / relative
+                    if candidate.is_file():
+                        return candidate
+        return None
+
+    @staticmethod
+    def _analysis_run_dirs(folder):
+        """Every run folder beside `folder`, most recent first.
+
+        Two layouts, because analyses made before runs were dated should still
+        be found: the dated ones under analysis/, and the older numbered
+        analysis, analysis_2, analysis_3 siblings. Dated runs come first - if
+        both exist, the dated ones are the newer scheme and so the newer work.
+        """
+        runs = []
+        root = Path(folder) / ANALYSIS_ROOT
+        try:
+            if root.is_dir():
+                # The stamp format sorts lexicographically, so this is by date.
+                runs.extend(sorted((d for d in root.iterdir() if d.is_dir()),
+                                   key=lambda d: d.name, reverse=True))
+        except OSError:
+            pass
+
+        numbered = []
+        try:
+            for d in Path(folder).glob("analysis*"):
                 if not d.is_dir():
                     continue
-                suffix = d.name[len("analysis"):]
+                suffix = d.name[len(ANALYSIS_ROOT):]
                 if suffix == "":
-                    num = 1
+                    numbered.append((1, d))
                 elif suffix.startswith("_") and suffix[1:].isdigit():
-                    num = int(suffix[1:])
-                else:
-                    continue
-                numbered_dirs.append((num, d))
-            for _, d in sorted(numbered_dirs, key=lambda t: -t[0]):
-                candidate = d / analysis_relative_path
-                if candidate.is_file():
-                    return candidate
-        return None
+                    numbered.append((int(suffix[1:]), d))
+        except OSError:
+            pass
+        runs.extend(d for _n, d in sorted(numbered, key=lambda t: -t[0]))
+        return runs
 
     def _try_autoload_trajectories(self, base_path):
         if self._session_restore is not None:
@@ -4471,6 +4522,47 @@ class LocalizationTrackingWidget(QWidget):
             f"Fitted {n} localizations from the loaded image stack (in-app 2D localization)",
             frame_is_zero_indexed=True,
         )
+        # After the ingest, so the metadata written alongside describes the data
+        # that is actually loaded rather than the state just before it arrived.
+        self._autosave_localization_run(df)
+
+    def _autosave_localization_run(self, df):
+        """Write this fit to a dated folder of its own, beside the data.
+
+        A fit is expensive and its result is easy to lose: the next one replaces
+        it in memory, and the settings that produced it live only in the
+        controls until something writes them down. Every run therefore gets its
+        own folder with the localizations and the complete settings, and no run
+        is ever overwritten by a later one - re-fitting after changing a single
+        threshold leaves both results side by side, with the timestamps saying
+        which was which.
+
+        The table saved is the fit's own output, before any filtering: filters
+        are recorded in the metadata and can be re-applied, but a discarded
+        localization cannot be recovered from a filtered table.
+        """
+        if not self.loc_autosave_box.isChecked():
+            return
+        try:
+            folder = self._make_analysis_folder(self._analysis_base_dir(), "localization")
+            folder.mkdir(parents=True, exist_ok=True)
+            metadata = self._collect_metadata(self.csv_edit.text().strip() or None)
+        except Exception as exc:
+            self.log(f"Could not start the automatic save of this fit: {exc}")
+            return
+
+        self.log(f"Saving this fit to {folder}...")
+        worker = _export_worker(folder, [(LOCS_RUN_FILENAME, df)], metadata, None)
+        worker.returned.connect(
+            lambda result: self.log(f"Fit saved to {result}")
+            if result is not CANCELLED else None)
+        worker.errored.connect(lambda exc: self.log(f"Could not save this fit: {exc}"))
+        worker.finished.connect(self._on_autosave_worker_finished)
+        self._autosave_worker_ref = worker
+        worker.start()
+
+    def _on_autosave_worker_finished(self):
+        self._autosave_worker_ref = None
 
     # ------------------------------------------------------------------
     # Render (SMLM): reconstructing an image from the localizations
@@ -7105,18 +7197,7 @@ class LocalizationTrackingWidget(QWidget):
         self.export_button.setEnabled(False)
         try:
             csv_path = self.csv_edit.text().strip()
-            image_path = self.image_edit.text().strip()
-            # Prefer the locs CSV's folder, then the image's (e.g. after an
-            # in-app 2D localization run where no CSV was ever loaded) - only
-            # fall back to the current working directory if neither is known,
-            # so exports don't end up outside the data folder.
-            if csv_path:
-                base_dir = Path(csv_path).parent
-            elif image_path:
-                base_dir = Path(image_path).parent
-            else:
-                base_dir = Path.cwd()
-            folder = self._make_analysis_folder(base_dir)
+            folder = self._make_analysis_folder(self._analysis_base_dir(), "export")
             folder.mkdir(parents=True, exist_ok=True)
 
             # The figures belong to Qt canvases, so they have to be rendered
@@ -7172,14 +7253,40 @@ class LocalizationTrackingWidget(QWidget):
             return
         self.log(f"Export complete: {result}")
 
-    def _make_analysis_folder(self, base_dir):
-        candidate = base_dir / "analysis"
-        if not candidate.exists():
-            return candidate
+    def _analysis_base_dir(self):
+        """The folder results go beside: the data's, not the plugin's.
+
+        Prefer the localization CSV's folder, then the image's - an in-app fit
+        has no CSV - and only fall back to the working directory if neither is
+        known, so results never end up outside the dataset they describe.
+        """
+        csv_path = self.csv_edit.text().strip()
+        image_path = self.image_edit.text().strip()
+        if csv_path:
+            return Path(csv_path).parent
+        if image_path:
+            return Path(image_path).parent
+        return Path.cwd()
+
+    def _make_analysis_folder(self, base_dir, kind="export"):
+        """A folder of its own for this run, stamped with when it happened.
+
+        Runs used to be numbered - analysis, analysis_2, analysis_3 - which kept
+        them from overwriting each other but said nothing about when any of them
+        happened or which came from which settings. A timestamp answers both,
+        and sorts.
+
+        The suffix only appears if two runs land in the same second, which takes
+        deliberate effort but is exactly when losing one would be worst.
+        """
+        root = Path(base_dir) / ANALYSIS_ROOT
+        stamp = datetime.now().strftime(RUN_STAMP_FORMAT)
+        candidate = root / f"{stamp}_{kind}"
         i = 2
-        while (base_dir / f"analysis_{i}").exists():
+        while candidate.exists():
+            candidate = root / f"{stamp}_{kind}_{i}"
             i += 1
-        return base_dir / f"analysis_{i}"
+        return candidate
 
     @staticmethod
     def _safe_filename(name):
@@ -7257,6 +7364,12 @@ class LocalizationTrackingWidget(QWidget):
             "exported_at": datetime.now().isoformat(timespec="seconds"),
             "software": {"napari_version": napari_version, "trackpy_version": trackpy_version},
             "source_csv": csv_path or None,
+            # Which run this is and what it was for, so a folder full of them
+            # can be read without opening every file to tell them apart.
+            "run": {
+                "stamp": datetime.now().strftime(RUN_STAMP_FORMAT),
+                "analysis_root": str(self._analysis_base_dir() / ANALYSIS_ROOT),
+            },
             "source_image": self.image_edit.text().strip() or None,
             "pixel_size_nm_per_px": self.pixel_size_box.value(),
             "frame_number_shift": int(self._frame_shift),
