@@ -99,6 +99,14 @@ DEFAULT_D_COLORMAP = "coolwarm"
 D_COLORMAP_CHOICES = ["coolwarm", "cool", "spring", "autumn", "bwr", "viridis"]
 
 DEFAULT_HIST_HEIGHT = 190
+
+# Every plot in the plugin answers to one size, because these end up in talks
+# and a figure that is the right shape is most of what makes one look
+# deliberate. Width 0 means "fill the panel", which is the behaviour these had
+# before and stays the default; anything else pins it, so a screenshot has the
+# aspect ratio you chose rather than the one the window happened to have.
+PLOT_WIDTH_FILL = 0
+PLOT_SIZE_LIMITS = (240, 3000, 120, 1600)   # min/max width, min/max height
 HIST_HEIGHT_STEP = 50
 MIN_HIST_HEIGHT = 110
 MAX_HIST_HEIGHT = 600
@@ -529,6 +537,8 @@ SETTINGS_SPEC = (
     (("rendering", "active_track_line_width"), "line_width_box"),
     (("rendering", "static_track_line_width"), "all_tracks_line_width_box"),
     (("rendering", "persist_completed_tracks"), "persist_tracks_box"),
+    (("rendering", "plot_width_px"), "plot_width_box"),
+    (("rendering", "plot_height_px"), "plot_height_box"),
 )
 
 
@@ -1587,6 +1597,9 @@ class LocalizationTrackingWidget(QWidget):
         self._session_restore = None
         self._session_save_worker_ref = None
         self._autosave_worker_ref = None
+        # Every matplotlib canvas, so one size control can reach all of them
+        # without each having to be found by name.
+        self._plot_canvases = []
         self.setup_ui()
 
     # ------------------------------------------------------------------
@@ -1638,6 +1651,7 @@ class LocalizationTrackingWidget(QWidget):
         self._update_link_cutoff_label()
         self._update_status_header()
         self._update_immobility_status()
+        self._apply_plot_size()
 
     def _build_status_header(self):
         """A one-line summary of where the data stands, visible from every tab.
@@ -2613,6 +2627,7 @@ class LocalizationTrackingWidget(QWidget):
         det_layout.addRow("", self.loc_detect_progress)
         self.loc_counts_figure = Figure(figsize=(5, 2.2))
         self.loc_counts_canvas = FigureCanvas(self.loc_counts_figure)
+        self._plot_canvases.append(self.loc_counts_canvas)
         self.loc_counts_canvas.setMinimumHeight(200)
         det_layout.addRow("", self.loc_counts_canvas)
         layout.addWidget(det_group)
@@ -3608,6 +3623,7 @@ class LocalizationTrackingWidget(QWidget):
         msd_sub_layout = QVBoxLayout(msd_sub)
         self.msd_figure = Figure(figsize=(5, 2.8))
         self.msd_canvas = FigureCanvas(self.msd_figure)
+        self._plot_canvases.append(self.msd_canvas)
         self.msd_canvas.setMinimumHeight(240)
         msd_sub_layout.addWidget(self.msd_canvas)
         # The intercept is fitted anyway - MSD = 4*D*tau + 4*sigma^2 - so the
@@ -3777,6 +3793,9 @@ class LocalizationTrackingWidget(QWidget):
         apply_row.addWidget(self.apply_display_button)
         apply_row.addStretch(1)
         color_layout.addRow("", apply_row)
+        # Applies to every plot in the plugin, not only the ones on this tab -
+        # the filter histograms and the MSD validation follow it too.
+        color_layout.addRow("Plot size", self._build_plot_size_row())
         layout.addWidget(color_group)
 
         self.color_trajectories_box.stateChanged.connect(self._on_color_mode_changed)
@@ -5713,6 +5732,12 @@ class LocalizationTrackingWidget(QWidget):
         self.filter_controls = {}
         self._default_bounds = {}
         self._hist_widgets = {}
+        # The canvases these held are being destroyed; drop them before the new
+        # ones are appended, or the list grows a dead entry per load.
+        self._plot_canvases = [c for c in self._plot_canvases
+                               if c is getattr(self, "msd_canvas", None)
+                               or c is getattr(self, "loc_counts_canvas", None)
+                               or c in {s["canvas"] for s in self._metric_hist_widgets.values()}]
 
         if self.df is None:
             self.filter_layout.addWidget(QLabel("Load data to see filters"), 0, 0)
@@ -5771,6 +5796,10 @@ class LocalizationTrackingWidget(QWidget):
             if grid_col >= 2:
                 grid_col = 0
                 grid_row += 1
+
+        # These histograms are rebuilt for every new table, so the chosen size
+        # has to be re-applied or it silently reverts on the next load.
+        self._apply_plot_size()
 
         # Settings loaded before the data they belong to: now that the controls
         # exist, apply whatever those bounds match.
@@ -6908,6 +6937,7 @@ class LocalizationTrackingWidget(QWidget):
 
         figure = Figure(figsize=(5, 2.4))
         canvas = FigureCanvas(figure)
+        self._plot_canvases.append(canvas)
         canvas.setMinimumHeight(220)
         layout.addWidget(canvas)
 
@@ -7566,6 +7596,8 @@ class LocalizationTrackingWidget(QWidget):
                 "active_track_line_width": self.line_width_box.value(),
                 "static_track_line_width": self.all_tracks_line_width_box.value(),
                 "persist_completed_tracks": self.persist_tracks_box.isChecked(),
+                "plot_width_px": self.plot_width_box.value(),
+                "plot_height_px": self.plot_height_box.value(),
             },
             "filter_histogram_display": {
                 col: {
@@ -7938,6 +7970,7 @@ class LocalizationTrackingWidget(QWidget):
 
         figure = Figure(figsize=(4.2, DEFAULT_HIST_HEIGHT / 100))
         canvas = FigureCanvas(figure)
+        self._plot_canvases.append(canvas)
         canvas.setMinimumHeight(DEFAULT_HIST_HEIGHT)
         canvas.setMaximumHeight(DEFAULT_HIST_HEIGHT)
         canvas.setMinimumWidth(260)
@@ -7970,6 +8003,80 @@ class LocalizationTrackingWidget(QWidget):
 
         self._draw_histogram(column)
         return container
+
+    def _build_plot_size_row(self):
+        """One size for every plot in the plugin.
+
+        These end up in talks, and a figure that is the right shape is most of
+        what makes one look deliberate - but resizing a dozen of them by hand is
+        exactly the effort nobody spends. So it is one control, applied live, and
+        saved with the run.
+        """
+        row = QHBoxLayout()
+        min_w, max_w, min_h, max_h = PLOT_SIZE_LIMITS
+        row.addWidget(QLabel("Width"))
+        self.plot_width_box = QSpinBox()
+        self.plot_width_box.setRange(0, max_w)
+        self.plot_width_box.setValue(PLOT_WIDTH_FILL)
+        self.plot_width_box.setSpecialValueText("fill")   # 0 reads as "fill"
+        self.plot_width_box.setSingleStep(20)
+        self.plot_width_box.setSuffix(" px")
+        self.plot_width_box.setToolTip(
+            f"Width of every plot. Leave at 'fill' and they stretch to the panel "
+            f"as they always have; set a width ({min_w}-{max_w} px) and they hold "
+            "it, so a screenshot has the aspect ratio you chose rather than the "
+            "one the window happened to have."
+        )
+        row.addWidget(self.plot_width_box)
+        row.addWidget(QLabel("Height"))
+        self.plot_height_box = QSpinBox()
+        self.plot_height_box.setRange(min_h, max_h)
+        self.plot_height_box.setValue(DEFAULT_HIST_HEIGHT)
+        self.plot_height_box.setSingleStep(20)
+        self.plot_height_box.setSuffix(" px")
+        row.addWidget(self.plot_height_box)
+        for preset, width, height in (("16:9", 960, 540), ("4:3", 800, 600),
+                                      ("Wide", 1200, 400)):
+            button = QPushButton(preset)
+            button.setProperty("secondary", True)
+            button.setToolTip(f"{width} x {height} px")
+            button.clicked.connect(
+                lambda _c, w=width, h=height: self._set_plot_size(w, h))
+            row.addWidget(button)
+        row.addStretch(1)
+        self.plot_width_box.valueChanged.connect(lambda _v: self._apply_plot_size())
+        self.plot_height_box.valueChanged.connect(lambda _v: self._apply_plot_size())
+        return row
+
+    def _set_plot_size(self, width, height):
+        self.plot_width_box.setValue(int(width))
+        self.plot_height_box.setValue(int(height))
+
+    def _apply_plot_size(self):
+        """Push the chosen size onto every canvas, and redraw so labels re-fit."""
+        if not hasattr(self, "plot_width_box"):
+            return  # a canvas built before the control that sizes them
+        width = int(self.plot_width_box.value())
+        height = int(self.plot_height_box.value())
+        for canvas in list(self._plot_canvases):
+            try:
+                if width > PLOT_WIDTH_FILL:
+                    canvas.setFixedWidth(width)
+                else:
+                    # Back to filling the panel: undo the pin in both directions,
+                    # or the canvas keeps whatever width it was last given.
+                    canvas.setMinimumWidth(0)
+                    canvas.setMaximumWidth(16777215)
+                canvas.setFixedHeight(height)
+                canvas.updateGeometry()
+                canvas.draw_idle()
+            except RuntimeError:
+                # Its Qt object is gone - a filter panel rebuilt for new data.
+                self._plot_canvases.remove(canvas)
+        # The per-column height buttons work from this as their baseline, so a
+        # plot nudged by hand starts from the size everything else is now.
+        for state in self._hist_widgets.values():
+            state["height"] = height
 
     def _resize_histogram(self, column, delta):
         state = self._hist_widgets.get(column)

@@ -338,3 +338,64 @@ def test_the_detection_plot_themes_itself_when_drawn():
     # and it is drawn in the accent, not matplotlib's default blue
     line = widget.loc_counts_figure.axes[0].lines[0]
     assert line.get_color().lower() == widget_mod.ACCENT
+
+
+# --- plot size ----------------------------------------------------------------
+#
+# These plots end up in talks, and a figure that is the right shape is most of
+# what makes one look deliberate - but resizing a dozen by hand is exactly the
+# effort nobody spends. One control, applied live, saved with the run.
+
+
+def _canvas_sizes(widget):
+    return sorted({(c.width() if c.maximumWidth() < 16777215 else 0, c.height())
+                   for c in widget._plot_canvases})
+
+
+def test_one_control_sizes_every_plot():
+    widget = _loaded(400)
+    assert len(widget._plot_canvases) > 5      # filters, metrics, MSD, counts
+    widget._set_plot_size(960, 540)
+    assert _canvas_sizes(widget) == [(960, 540)]
+
+
+def test_the_default_leaves_them_filling_the_panel():
+    """Width 0 reads as 'fill' and is what these did before there was a control."""
+    widget = _loaded(400)
+    assert widget.plot_width_box.value() == widget_mod.PLOT_WIDTH_FILL
+    assert all(width == 0 for width, _height in _canvas_sizes(widget))
+
+
+def test_going_back_to_fill_releases_the_pinned_width():
+    widget = _loaded(400)
+    widget._set_plot_size(1200, 400)
+    assert _canvas_sizes(widget) == [(1200, 400)]
+
+    widget.plot_width_box.setValue(widget_mod.PLOT_WIDTH_FILL)
+    assert _canvas_sizes(widget) == [(0, 400)]
+
+
+def test_the_size_survives_loading_new_data():
+    """The filter histograms are rebuilt per table, so the size has to be
+    re-applied or it silently reverts on the next load."""
+    widget = _loaded(400)
+    widget._set_plot_size(1200, 400)
+    before = len(widget._plot_canvases)
+
+    widget._ingest_localization_dataframe(_locs(300), "reloaded", True)
+    assert _canvas_sizes(widget) == [(1200, 400)]
+    # and the dead canvases went with the panel that held them
+    assert len(widget._plot_canvases) == before
+
+
+def test_the_size_is_saved_with_the_run():
+    widget = _loaded(200)
+    widget._set_plot_size(1200, 400)
+    metadata = widget._collect_metadata(None)
+    assert metadata["rendering"]["plot_width_px"] == 1200
+    assert metadata["rendering"]["plot_height_px"] == 400
+
+    restored = make_widget()
+    restored.apply_settings(metadata)
+    assert restored.plot_width_box.value() == 1200
+    assert restored.plot_height_box.value() == 400
