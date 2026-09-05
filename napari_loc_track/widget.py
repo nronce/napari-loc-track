@@ -490,6 +490,7 @@ SETTINGS_SPEC = (
     (("smlm_rendering", "write_png_snapshot"), "render_png_box"),
     (("smlm_rendering", "image_save_format"), "render_image_format_box"),
     (("smlm_rendering", "movie_save_format"), "render_movie_format_box"),
+    (("smlm_rendering", "movie_save_stride"), "movie_stride_box"),
     (("smlm_rendering", "composite", "reconstruction"), "render_composite_base_box"),
     (("smlm_rendering", "composite", "localizations"), "render_composite_locs_box"),
     (("smlm_rendering", "composite", "localization_color"), "render_locs_color_box"),
@@ -3074,6 +3075,43 @@ class LocalizationTrackingWidget(QWidget):
         movie_row.addWidget(self.render_save_movie_button)
         buttons_layout.addLayout(movie_row)
 
+        # A reconstruction movie is usually far longer than anything you would
+        # show, and with a sliding window most of its frames are the same
+        # picture again. Both are chosen here rather than by re-rendering.
+        range_row = QHBoxLayout()
+        range_row.addWidget(QLabel("Frames"))
+        self.movie_first_box = QSpinBox()
+        self.movie_first_box.setRange(0, 0)
+        self.movie_first_box.setToolTip("First rendered frame to write.")
+        range_row.addWidget(self.movie_first_box)
+        range_row.addWidget(QLabel("to"))
+        self.movie_last_box = QSpinBox()
+        self.movie_last_box.setRange(0, 0)
+        self.movie_last_box.setToolTip("Last rendered frame to write, inclusive.")
+        range_row.addWidget(self.movie_last_box)
+        range_row.addWidget(QLabel("every"))
+        self.movie_stride_box = QSpinBox()
+        self.movie_stride_box.setRange(1, 10000)
+        self.movie_stride_box.setValue(1)
+        self.movie_stride_box.setToolTip(
+            "Keep every Nth rendered frame.\n\n"
+            "With a sliding window, consecutive frames overlap by most of their "
+            "raw frames and carry almost the same localizations - the line below "
+            "says by how much, and which stride makes them independent. The "
+            "frame interval written into the TIFF is multiplied by this, so the "
+            "movie still plays at the right speed."
+        )
+        range_row.addWidget(self.movie_stride_box)
+        range_row.addStretch(1)
+        buttons_layout.addLayout(range_row)
+
+        self.movie_save_label = QLabel("Render a movie first.")
+        self.movie_save_label.setWordWrap(True)
+        self.movie_save_label.setProperty("role", "note")
+        buttons_layout.addWidget(self.movie_save_label)
+        for box in (self.movie_first_box, self.movie_last_box, self.movie_stride_box):
+            box.valueChanged.connect(lambda _v: self._update_movie_save_label())
+
         self.render_save_status = QLabel("Nothing rendered yet.")
         self.render_save_status.setWordWrap(True)
         self.render_save_status.setProperty("role", "note")
@@ -5113,6 +5151,9 @@ class LocalizationTrackingWidget(QWidget):
         else:
             self._render_movie, self._render_movie_info = result, info
             self.render_save_movie_button.setEnabled(True)
+            # A new movie has a new length, so the save range follows it rather
+            # than keeping bounds that belonged to the previous one.
+            self._sync_movie_save_range()
         self._update_save_tab()
 
         if self.render_add_layer_box.isChecked():
@@ -5346,6 +5387,9 @@ class LocalizationTrackingWidget(QWidget):
             button.setEnabled(self._render_image is not None)
         for button in (self.render_save_movie_button,):
             button.setEnabled(self._render_movie is not None)
+        for box in (self.movie_first_box, self.movie_last_box, self.movie_stride_box):
+            box.setEnabled(self._render_movie is not None)
+        self._update_movie_save_label()
         self.render_save_status.setText(
             "Ready to save: " + ", ".join(ready) if ready else "Nothing rendered yet.")
 
@@ -5730,10 +5774,85 @@ class LocalizationTrackingWidget(QWidget):
                 )
         return "cyan"
 
+    def _movie_save_slice(self, n_frames):
+        """(first, last, stride) for saving, clamped to what was rendered."""
+        first = int(np.clip(self.movie_first_box.value(), 0, max(n_frames - 1, 0)))
+        last = int(np.clip(self.movie_last_box.value(), first, max(n_frames - 1, 0)))
+        return first, last, max(1, int(self.movie_stride_box.value()))
+
+    def _sync_movie_save_range(self):
+        """Follow the render: a new movie resets the range to all of it."""
+        if not hasattr(self, "movie_first_box"):
+            return
+        n_frames = 0 if self._render_movie is None else int(self._render_movie.shape[0])
+        for box in (self.movie_first_box, self.movie_last_box):
+            box.blockSignals(True)
+            box.setRange(0, max(n_frames - 1, 0))
+            box.blockSignals(False)
+        self.movie_last_box.blockSignals(True)
+        self.movie_last_box.setValue(max(n_frames - 1, 0))
+        self.movie_first_box.setValue(0)
+        self.movie_last_box.blockSignals(False)
+        self._update_movie_save_label()
+
+    def _update_movie_save_label(self):
+        """Say how many frames will be written, and how redundant they are.
+
+        A sliding-window reconstruction advances by `window_step_frames` raw
+        frames while each output frame covers `frames_per_group` of them, so
+        consecutive frames share most of their localizations. Saving every one
+        of them writes a great deal of the same picture over and over; the
+        overlap is spelled out here because it is what tells you the stride to
+        use.
+        """
+        if not hasattr(self, "movie_save_label"):
+            return
+        if self._render_movie is None:
+            self.movie_save_label.setText("Render a movie first.")
+            return
+        n_frames = int(self._render_movie.shape[0])
+        first, last, stride = self._movie_save_slice(n_frames)
+        kept = len(range(first, last + 1, stride))
+        per_frame = self._render_movie[0].nbytes if n_frames else 0
+        parts = [f"Saving {kept} of {n_frames} frames "
+                 f"(~{kept * per_frame / 1e6:.0f} MB of {n_frames * per_frame / 1e6:.0f})."]
+
+        info = self._render_movie_info or {}
+        window = int(info.get("frames_per_group") or 0)
+        step = int(info.get("window_step_frames") or 0)
+        if window and step and step < window:
+            overlap = 100.0 * (window - step) / window
+            independent = int(np.ceil(window / step))
+            parts.append(
+                f"Consecutive frames share {overlap:.0f}% of their raw frames "
+                f"({window}-frame window advancing {step}); every {independent}"
+                f"{'st' if independent == 1 else 'th'} frame is independent.")
+        self.movie_save_label.setText(" ".join(parts))
+
+    def _apply_movie_save_range(self, image, info):
+        """Cut the rendered movie down to what was asked for, and say so."""
+        n_frames = int(image.shape[0])
+        first, last, stride = self._movie_save_slice(n_frames)
+        if (first, last, stride) == (0, n_frames - 1, 1):
+            return image, info
+        image = image[first:last + 1:stride]
+        info = dict(info)
+        info["saved_frame_range"] = [first, last, stride]
+        info["n_frames_saved"] = int(image.shape[0])
+        # The frames written are `stride` apart, so each one now spans that much
+        # more time. A viewer told otherwise plays the clip at the wrong speed.
+        if info.get("frame_interval_s"):
+            info["frame_interval_s"] = info["frame_interval_s"] * stride
+        self.log(f"Saving frames {first}-{last} every {stride}: "
+                 f"{image.shape[0]} of {n_frames}")
+        return image, info
+
     def _save_render(self, kind, image, info, force_format=None):
         if image is None or info is None:
             self.log(f"Render the {kind} first")
             return
+        if kind == "movie":
+            image, info = self._apply_movie_save_range(image, info)
         path, _ = QFileDialog.getSaveFileName(
             self, f"Save rendered {kind}", self._default_render_path(kind, info, force_format),
             "TIFF files (*.tif *.tiff)",
@@ -7609,6 +7728,7 @@ class LocalizationTrackingWidget(QWidget):
                 "write_png_snapshot": self.render_png_box.isChecked(),
                 "image_save_format": self.render_image_format_box.currentData(),
                 "movie_save_format": self.render_movie_format_box.currentData(),
+                "movie_save_stride": self.movie_stride_box.value(),
                 "composite": {
                     "reconstruction": self.render_composite_base_box.isChecked(),
                     "localizations": self.render_composite_locs_box.isChecked(),

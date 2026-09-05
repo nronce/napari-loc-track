@@ -237,3 +237,102 @@ def test_the_layer_name_and_threshold_survive_a_round_trip():
     restored.apply_settings(metadata)
     assert restored.render_layer_name_edit.text() == "smlm_render_mobile"
     assert restored.render_population_p_box.value() == pytest.approx(0.01)
+
+
+# --- saving part of a movie ----------------------------------------------------
+#
+# A reconstruction movie is usually far longer than anything you would show, and
+# with a sliding window most of its frames are the same picture again: a
+# 100-frame window advancing 10 leaves consecutive frames sharing 90% of their
+# raw frames. Both the clip and the stride are chosen at save time rather than
+# by re-rendering.
+
+
+def _with_movie(n_frames=40, window=100, step=10, interval=0.313):
+    widget = _widget()
+    widget._render_movie = np.zeros((n_frames, 64, 64), np.float32)
+    widget._render_movie_info = {
+        "frames_per_group": window, "window_step_frames": step,
+        "mode_label": "Gaussian", "frame_interval_s": interval,
+        "super_resolved_pixel_size_nm": 20.0,
+    }
+    widget._sync_movie_save_range()
+    return widget
+
+
+def test_the_range_starts_as_the_whole_movie():
+    widget = _with_movie(40)
+    assert (widget.movie_first_box.value(), widget.movie_last_box.value()) == (0, 39)
+    assert widget.movie_last_box.maximum() == 39
+    assert "Saving 40 of 40 frames" in widget.movie_save_label.text()
+
+
+def test_a_new_render_resets_the_range_rather_than_keeping_stale_bounds():
+    widget = _with_movie(40)
+    widget.movie_first_box.setValue(10)
+    widget.movie_last_box.setValue(30)
+
+    widget._render_movie = np.zeros((7, 64, 64), np.float32)
+    widget._sync_movie_save_range()
+    assert (widget.movie_first_box.value(), widget.movie_last_box.value()) == (0, 6)
+
+
+def test_only_the_chosen_frames_are_written():
+    widget = _with_movie(40)
+    widget.movie_first_box.setValue(5)
+    widget.movie_last_box.setValue(24)
+    widget.movie_stride_box.setValue(10)
+
+    image, info = widget._apply_movie_save_range(
+        widget._render_movie, widget._render_movie_info)
+    assert image.shape[0] == 2                       # frames 5 and 15
+    assert info["saved_frame_range"] == [5, 24, 10]
+    assert info["n_frames_saved"] == 2
+
+
+def test_the_stride_stretches_the_frame_interval_written_to_the_file():
+    """Every tenth frame still spans ten frames of time - a viewer told
+    otherwise plays the clip ten times too fast."""
+    widget = _with_movie(40, interval=0.313)
+    widget.movie_stride_box.setValue(10)
+    _image, info = widget._apply_movie_save_range(
+        widget._render_movie, widget._render_movie_info)
+    assert info["frame_interval_s"] == pytest.approx(3.13)
+
+
+def test_saving_all_of_it_changes_nothing():
+    widget = _with_movie(40)
+    image, info = widget._apply_movie_save_range(
+        widget._render_movie, widget._render_movie_info)
+    assert image is widget._render_movie
+    assert "saved_frame_range" not in info
+
+
+def test_the_panel_says_how_redundant_the_frames_are():
+    """The number that tells you which stride to use."""
+    widget = _with_movie(40, window=100, step=10)
+    text = widget.movie_save_label.text()
+    assert "share 90% of their raw frames" in text
+    assert "every 10th frame is independent" in text
+
+
+def test_independent_blocks_get_no_redundancy_warning():
+    widget = _with_movie(40, window=50, step=50)
+    assert "share" not in widget.movie_save_label.text()
+
+
+def test_the_label_follows_the_boxes():
+    widget = _with_movie(40)
+    widget.movie_stride_box.setValue(4)
+    assert "Saving 10 of 40 frames" in widget.movie_save_label.text()
+
+
+def test_the_stride_survives_a_round_trip():
+    widget = _with_movie(40)
+    widget.movie_stride_box.setValue(7)
+    metadata = widget._collect_metadata(None)
+    assert metadata["smlm_rendering"]["movie_save_stride"] == 7
+
+    restored = _widget()
+    restored.apply_settings(metadata)
+    assert restored.movie_stride_box.value() == 7
