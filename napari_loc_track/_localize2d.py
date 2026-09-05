@@ -1047,9 +1047,21 @@ def _extract_patches(frame, yc, xc, box):
     return np.ascontiguousarray(patches, dtype=np.float64)
 
 
-def _apply_camera_calibration(patches, camera_offset_adu, camera_gain_adu_per_photon):
-    """(patches - offset) / gain, clipped at 0, in place."""
-    gain = float(camera_gain_adu_per_photon)
+def _apply_camera_calibration(patches, camera_offset_adu, camera_gain_adu_per_electron):
+    """(patches - offset) / gain, clipped at 0, in place.
+
+    The result is photo*electrons*, not photons - they differ by the quantum
+    efficiency, which is not known here and is not needed. Electrons are the
+    right quantity anyway: the Poisson statistics the MLE fit and the
+    Cramer-Rao bound both assume hold for the charge the sensor collected, not
+    for the photons that arrived and were mostly not detected.
+
+    Everything downstream calls the result "photons" - the exported column is
+    still `intensity [photon]` - which is the field's usual shorthand and is
+    left alone so existing tables keep loading. Divide by the QE to get real
+    photons if that is what a calculation needs.
+    """
+    gain = float(camera_gain_adu_per_electron)
     if not np.isfinite(gain) or gain <= _EPS:
         gain = 1.0
     patches -= float(camera_offset_adu)
@@ -1080,7 +1092,7 @@ def localize_frame(
     net_gradient=None,
     fit_backend="fast",
     camera_offset_adu=100.0,
-    camera_gain_adu_per_photon=1.0,
+    camera_gain_adu_per_electron=1.0,
 ):
     """Sub-pixel Gaussian localization for candidate detections in one frame."""
     box = int(box)
@@ -1101,7 +1113,7 @@ def localize_frame(
 
     # One gather of the candidate windows, converted once - never the full frame.
     patches = _extract_patches(frame, yc[kept], xc[kept], box)
-    _apply_camera_calibration(patches, camera_offset_adu, camera_gain_adu_per_photon)
+    _apply_camera_calibration(patches, camera_offset_adu, camera_gain_adu_per_electron)
 
     backend = str(fit_backend)
     if backend == "gpu" and _GPUFIT_AVAILABLE:

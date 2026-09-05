@@ -231,6 +231,13 @@ FILTER_BOUND_DECIMALS = 6
 # is a float round-trip. Four decimals of a pixel is well under a nanometre.
 LOC_MATCH_DECIMALS = 4
 
+# Counts the sensor reports per photoelectron. Not 1.0: a gain of 1 says the
+# camera is photon-counting, which almost none are, and every photon count and
+# every localization precision derived from one is scaled by whatever the real
+# figure is. Read it off the camera's specification - this default is the sCMOS
+# on the microscope this plugin was written for.
+DEFAULT_GAIN_ADU_PER_ELECTRON = 1.3
+
 
 def bound_to_box_precision(value, decimals, upward):
     """A bound rounded *outwards* to what a spin box can hold.
@@ -416,7 +423,7 @@ def infer_column_map(columns):
 SETTINGS_SPEC = (
     (("pixel_size_nm_per_px",), "pixel_size_box"),
     (("preprocessing", "time_bin_frames"), "bin_factor_box"),
-    (("localization_2d", "gain_adu_per_photon"), "loc_gain_box"),
+    (("localization_2d", "gain_adu_per_electron"), "loc_gain_box"),
     (("localization_2d", "offset_adu"), "loc_offset_box"),
     (("localization_2d", "box_size_px"), "loc_box_size"),
     (("localization_2d", "min_net_gradient"), "loc_min_ng_box"),
@@ -661,6 +668,15 @@ def settings_from_metadata(metadata):
                 if isinstance(legacy.get(key), (int, float)):
                     values[attr] = float(legacy[key]) / 1000.0
             notes.append("converted distance bounds from nm to µm")
+
+    # The gain used to be recorded as ADU per photon, which is what it was
+    # called rather than what it was: the division has always produced
+    # photoelectrons. Same number, so it restores unchanged.
+    if "loc_gain_box" not in values:
+        found, legacy = _dig(metadata, ("localization_2d", "gain_adu_per_photon"))
+        if found and isinstance(legacy, (int, float)):
+            values["loc_gain_box"] = float(legacy)
+            notes.append("camera gain read from the older 'per photon' key")
 
     # Acquisition timing used to live under "diffusion" and now lives under
     # "linking"; read either, preferring the current location. Frame rate and
@@ -941,7 +957,7 @@ def _fit_worker(stack, candidates, box, backend, offset, gain, cancel=None):
             net_gradient=ng,
             fit_backend=backend,
             camera_offset_adu=offset,
-            camera_gain_adu_per_photon=gain,
+            camera_gain_adu_per_electron=gain,
         )
         done += 1
         pct = int(100 * done / max(n_with_candidates, 1))
@@ -2456,13 +2472,20 @@ class LocalizationTrackingWidget(QWidget):
         self.loc_gain_box = QDoubleSpinBox()
         self.loc_gain_box.setRange(0.01, 1000.0)
         self.loc_gain_box.setDecimals(3)
-        self.loc_gain_box.setValue(1.0)
+        self.loc_gain_box.setValue(DEFAULT_GAIN_ADU_PER_ELECTRON)
         self.loc_gain_box.setToolTip(
-            "Camera gain, used to convert counts to photons before fitting. "
-            "The MLE fit assumes photon statistics, so a wrong gain biases the "
-            "photon counts and the uncertainties derived from them."
+            "Camera gain: how many counts the sensor reports per photoelectron. "
+            "(ADU - offset) / gain is what gets fitted.\n\n"
+            "Electrons, not photons - they differ by the quantum efficiency, "
+            "which is not needed here. Electrons are the right quantity anyway: "
+            "the Poisson statistics the fit and the reported precision both "
+            "assume hold for the charge collected, not for the photons that "
+            "arrived and were mostly not detected.\n\n"
+            "A wrong gain scales every photon count and every localization "
+            "precision derived from it, so it is worth reading off the camera's "
+            "own specification rather than leaving at a default."
         )
-        cam_layout.addRow("Gain (ADU/photon)", self.loc_gain_box)
+        cam_layout.addRow("Gain (ADU/e⁻)", self.loc_gain_box)
         self.loc_offset_box = QDoubleSpinBox()
         # Wide enough to hold a time-binned baseline: N summed frames carry N
         # baselines, and the old ceiling of 20000 clipped that silently from
@@ -7247,7 +7270,7 @@ class LocalizationTrackingWidget(QWidget):
                 col: {"min": lo.value(), "max": hi.value()} for col, (lo, hi) in self.filter_controls.items()
             },
             "localization_2d": {
-                "gain_adu_per_photon": self.loc_gain_box.value(),
+                "gain_adu_per_electron": self.loc_gain_box.value(),
                 "offset_adu": self.loc_offset_box.value(),
                 "box_size_px": self._loc2d_box_size(),
                 "min_net_gradient": self.loc_min_ng_box.value(),

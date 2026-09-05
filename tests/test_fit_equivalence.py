@@ -146,7 +146,7 @@ def test_localize_frame_matches_per_patch_fits():
 
     locs = loc.localize_frame(
         frame, y, x, BOX, frame_number=3, net_gradient=ng, fit_backend="fast",
-        camera_offset_adu=100.0, camera_gain_adu_per_photon=2.0,
+        camera_offset_adu=100.0, camera_gain_adu_per_electron=2.0,
     )
 
     assert locs["x"].size == ys.size

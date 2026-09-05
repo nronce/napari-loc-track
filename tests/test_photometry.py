@@ -52,7 +52,7 @@ def _localized(n_photons, bg, n_spots=600, seed=0, backend="mle"):
         out = localize.localize_frame(
             image, np.array([c]), np.array([c]), BOX, frame_number=0,
             fit_backend=backend, camera_offset_adu=OFFSET,
-            camera_gain_adu_per_photon=GAIN)
+            camera_gain_adu_per_electron=GAIN)
         if out["x"].size == 0:
             continue
         photons.append(float(out["photons"][0]))
@@ -148,3 +148,48 @@ def test_pixelation_is_included():
 def test_a_background_free_bright_spot_approaches_the_photon_limit():
     sigma = localize.crlb_sigma(10000.0, 0.0, 1.0, mle=True)
     assert sigma == pytest.approx(np.sqrt((1.0 + 1.0 / 12.0) / 10000.0), rel=1e-6)
+
+
+# --- the gain, and what it converts to ----------------------------------------
+#
+# (ADU - offset) / gain yields photoELECTRONS, not photons - they differ by the
+# quantum efficiency, which is neither known here nor needed. Electrons are the
+# right quantity anyway: the Poisson statistics the fit and the Cramer-Rao bound
+# both assume hold for the charge collected, not for the photons that arrived
+# and were mostly not detected.
+
+
+def test_the_gain_scales_the_photon_count_it_divides_by():
+    rng = np.random.default_rng(11)
+    n_true, bg = 400, 5.0
+    counted = {}
+    for gain in (1.0, 1.3, 2.0):
+        totals = []
+        for _ in range(300):
+            image, c = _spot(n_true, bg, rng)
+            # re-express the same frame on a camera with this gain
+            scaled = ((image - OFFSET) * gain + OFFSET).astype(np.float32)
+            out = localize.localize_frame(
+                scaled, np.array([c]), np.array([c]), BOX, frame_number=0,
+                fit_backend="mle", camera_offset_adu=OFFSET,
+                camera_gain_adu_per_electron=gain)
+            if out["x"].size:
+                totals.append(float(out["photons"][0]))
+        counted[gain] = np.median(totals)
+    # dividing by the gain the frame was scaled by recovers the same count
+    for gain, value in counted.items():
+        assert value == pytest.approx(n_true, rel=0.06), gain
+
+
+def test_getting_the_gain_wrong_scales_the_count_by_exactly_that_factor():
+    """Which is why the default matters: a gain of 1 on a 1.3 ADU/e- camera
+    reports 1.3x the electrons that were actually collected."""
+    rng = np.random.default_rng(12)
+    image, c = _spot(400, 5.0, rng)
+    right = localize.localize_frame(
+        image, np.array([c]), np.array([c]), BOX, frame_number=0,
+        fit_backend="mle", camera_offset_adu=OFFSET, camera_gain_adu_per_electron=1.3)
+    wrong = localize.localize_frame(
+        image, np.array([c]), np.array([c]), BOX, frame_number=0,
+        fit_backend="mle", camera_offset_adu=OFFSET, camera_gain_adu_per_electron=1.0)
+    assert float(wrong["photons"][0]) / float(right["photons"][0]) == pytest.approx(1.3, rel=0.02)

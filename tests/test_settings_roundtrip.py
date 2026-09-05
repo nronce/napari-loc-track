@@ -279,3 +279,36 @@ def test_histogram_view_is_restored_only_when_decoupled(widget):
     })
     assert state["follow_box"].isChecked()
     assert state["view_max_box"].value() == pytest.approx(2.0)
+
+
+# --- camera gain ---------------------------------------------------------------
+
+
+def test_the_gain_defaults_to_the_camera_rather_than_to_one():
+    """A gain of 1 says the camera is photon-counting, which almost none are,
+    and every photon count and localization precision is scaled by whatever the
+    real figure is."""
+    widget = make_widget()
+    assert widget.loc_gain_box.value() == pytest.approx(1.3)
+    assert widget_mod.DEFAULT_GAIN_ADU_PER_ELECTRON == 1.3
+
+
+def test_the_gain_is_recorded_in_electrons():
+    widget = make_widget()
+    widget.loc_gain_box.setValue(2.4)
+    metadata = widget._collect_metadata(None)
+    assert metadata["localization_2d"]["gain_adu_per_electron"] == pytest.approx(2.4)
+
+    restored = make_widget()
+    restored.apply_settings(metadata)
+    assert restored.loc_gain_box.value() == pytest.approx(2.4)
+
+
+def test_a_run_recorded_under_the_old_per_photon_key_still_restores():
+    """Same number, differently named - the division always produced electrons."""
+    widget = make_widget()
+    applied, _skipped, notes = widget.apply_settings(
+        {"localization_2d": {"gain_adu_per_photon": 1.85}})
+    assert widget.loc_gain_box.value() == pytest.approx(1.85)
+    assert "loc_gain_box" in applied
+    assert any("per photon" in note for note in notes)

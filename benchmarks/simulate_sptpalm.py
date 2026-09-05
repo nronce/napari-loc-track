@@ -33,7 +33,10 @@ DT = INTERVAL_MS / 1000.0
 
 # --- camera --------------------------------------------------------------
 OFFSET_ADU = 100.0
-GAIN_ADU_PER_PHOTON = 1.0  # 1:1 so photon counts can be read straight off
+# Counts per photoelectron. The plugin's default, so a dataset written with it
+# needs no camera settings changed before localizing - which is the point of
+# having a default that matches a real sensor rather than a photon counter.
+GAIN_ADU_PER_ELECTRON = 1.3
 READ_NOISE_E = 1.6         # sCMOS, per pixel per frame
 BACKGROUND_PHOTONS = 20.0  # per pixel per frame, HiLo-like
 # Structure on top of that flat level, as a fraction of it. A real HiLo
@@ -122,7 +125,7 @@ def build(seed=20260904):
     stack += bg_stack
     stack = rng.poisson(stack).astype(np.float32)
     stack += rng.normal(0.0, READ_NOISE_E, stack.shape).astype(np.float32)
-    stack = stack * GAIN_ADU_PER_PHOTON + OFFSET_ADU
+    stack = stack * GAIN_ADU_PER_ELECTRON + OFFSET_ADU
     stack = np.clip(stack, 0, 65535).astype(np.uint16)
 
     locs = pd.DataFrame(rows, columns=["frame", "particle", "x_px", "y_px", "photons"])
@@ -242,7 +245,7 @@ def main():
     import argparse
 
     global STEM, PHOTON_MODE, BACKGROUND_PHOTONS, BACKGROUND_GRADIENT
-    global BACKGROUND_BLOBS, BACKGROUND_FLICKER
+    global BACKGROUND_BLOBS, BACKGROUND_FLICKER, GAIN_ADU_PER_ELECTRON
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--stem", default=STEM)
     ap.add_argument("--photons", type=float, default=PHOTON_MODE)
@@ -250,6 +253,7 @@ def main():
     ap.add_argument("--gradient", type=float, default=BACKGROUND_GRADIENT)
     ap.add_argument("--blobs", type=int, default=BACKGROUND_BLOBS)
     ap.add_argument("--flicker", type=float, default=BACKGROUND_FLICKER)
+    ap.add_argument("--gain", type=float, default=GAIN_ADU_PER_ELECTRON)
     args = ap.parse_args()
     STEM = args.stem
     PHOTON_MODE = args.photons
@@ -257,6 +261,7 @@ def main():
     BACKGROUND_GRADIENT = args.gradient
     BACKGROUND_BLOBS = args.blobs
     BACKGROUND_FLICKER = args.flicker
+    GAIN_ADU_PER_ELECTRON = args.gain
 
     OUT.mkdir(parents=True, exist_ok=True)
     stack, locs, tracks = build()
@@ -308,7 +313,7 @@ ACQUISITION
 
 CAMERA
   offset                {OFFSET_ADU:.0f} ADU     (in the metadata; should autofill)
-  gain                  {GAIN_ADU_PER_PHOTON} ADU/photon   <- set this, the default is right
+  gain                  {GAIN_ADU_PER_ELECTRON} ADU/e-   (the plugin's default; leave it)
   read noise            {READ_NOISE_E} e- rms
   background            {BACKGROUND_PHOTONS:.0f} photons/pixel/frame nominal
                         gradient {BACKGROUND_GRADIENT:.0%} centre-to-edge,
