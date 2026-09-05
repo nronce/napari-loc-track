@@ -312,3 +312,31 @@ def test_a_run_recorded_under_the_old_per_photon_key_still_restores():
     assert widget.loc_gain_box.value() == pytest.approx(1.85)
     assert "loc_gain_box" in applied
     assert any("per photon" in note for note in notes)
+
+
+# --- restoring a run must not move the instrument silently ---------------------
+
+
+def test_restoring_a_run_names_the_instrument_settings_it_changed():
+    """Loading data next to a previous run restores that run's settings - which
+    is right, since the localizations were computed with them - but a corrected
+    calibration being reverted by opening a folder has to be visible."""
+    widget = make_widget()
+    widget.loc_gain_box.setValue(1.3)
+    widget.pixel_size_box.setValue(161.0)
+
+    _applied, _skipped, notes = widget.apply_settings({
+        "pixel_size_nm_per_px": 108.0,
+        "localization_2d": {"gain_adu_per_electron": 1.0},
+    })
+    joined = " | ".join(notes)
+    assert "Camera gain 1.3" in joined and "1 ADU" in joined
+    assert "Pixel size 161.0 nm/px -> 108.0 nm/px" in joined
+
+
+def test_settings_that_did_not_move_are_not_announced():
+    widget = make_widget()
+    widget.loc_gain_box.setValue(1.3)
+    _applied, _skipped, notes = widget.apply_settings(
+        {"localization_2d": {"gain_adu_per_electron": 1.3}})
+    assert not any("Camera gain" in note for note in notes)

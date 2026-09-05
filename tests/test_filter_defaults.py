@@ -104,3 +104,86 @@ def test_the_default_filter_keeps_every_localization_it_was_built_from():
     w._ingest_localization_dataframe(frame, "loaded", True)
     w.apply_filters()
     assert len(w.df_filtered) == n
+
+
+# --- what the histograms show -------------------------------------------------
+#
+# Two distributions per column: everything loaded, pale, and what survives the
+# filters, solid. Drawing only the first meant tightening a bound on sigma
+# changed nothing visible in the intensity histogram beside it - and the
+# coupling between columns is the reason to have these plots at all.
+
+
+def _filtered_widget():
+    import os
+
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    import sys
+    from pathlib import Path
+
+    import pandas as pd
+
+    sys.path.insert(0, str(Path(__file__).parent))
+    from test_widget_interaction import make_widget
+
+    rng = np.random.default_rng(0)
+    n = 400
+    frame = pd.DataFrame({
+        "frame": rng.integers(0, 10, n),
+        "x [nm]": rng.uniform(0, 1e4, n),
+        "y [nm]": rng.uniform(0, 1e4, n),
+        "sigma [nm]": rng.uniform(80, 400, n),
+        "intensity [photon]": rng.uniform(100, 3000, n),
+    })
+    w = make_widget()
+    w._ingest_localization_dataframe(frame, "loaded", True)
+    return w
+
+
+def _bar_totals(widget, column):
+    """(all localizations, surviving localizations) as drawn."""
+    axes = widget._hist_widgets[column]["figure"].axes[0]
+    return [sum(patch.get_height() for patch in group) for group in axes.containers]
+
+
+def test_both_distributions_are_drawn():
+    widget = _filtered_widget()
+    totals = _bar_totals(widget, "intensity [photon]")
+    assert len(totals) == 2
+    assert totals[0] == totals[1] == 400      # nothing filtered yet
+
+
+def test_filtering_one_column_changes_the_histogram_of_another():
+    """The bug this fixes: cutting on sigma left every other plot untouched."""
+    widget = _filtered_widget()
+    _lower, upper = widget.filter_controls["sigma [nm]"]
+    upper.setValue(200.0)
+    widget.apply_filters()
+
+    everything, kept = _bar_totals(widget, "intensity [photon]")
+    assert everything == 400                  # the pale distribution stays put
+    assert kept == len(widget.df_filtered)
+    assert kept < everything
+
+
+def test_the_title_says_how_many_survived():
+    widget = _filtered_widget()
+    assert widget._hist_widgets["intensity [photon]"]["figure"].axes[0].get_title() \
+        == "intensity [photon]"
+
+    _lower, upper = widget.filter_controls["sigma [nm]"]
+    upper.setValue(200.0)
+    widget.apply_filters()
+    title = widget._hist_widgets["intensity [photon]"]["figure"].axes[0].get_title()
+    assert title == f"intensity [photon]   {len(widget.df_filtered)} / 400"
+
+
+def test_widening_the_filter_again_brings_the_bars_back():
+    widget = _filtered_widget()
+    _lower, upper = widget.filter_controls["sigma [nm]"]
+    upper.setValue(200.0)
+    widget.apply_filters()
+    assert _bar_totals(widget, "intensity [photon]")[1] < 400
+
+    widget.reset_filters()
+    assert _bar_totals(widget, "intensity [photon]")[1] == 400

@@ -249,6 +249,20 @@ LOC_MATCH_DECIMALS = 4
 # on the microscope this plugin was written for.
 DEFAULT_GAIN_ADU_PER_ELECTRON = 1.3
 
+# The settings that describe the instrument rather than a choice about the
+# analysis. Restoring a previous run moves these along with everything else -
+# correctly, since the loaded localizations were computed with them - but doing
+# it silently means a corrected calibration can be reverted by opening a folder,
+# and nothing on screen says so. Every one of these that a restore changes is
+# named in the log.
+INSTRUMENT_SETTINGS = (
+    ("pixel_size_box", "Pixel size", "{:.1f} nm/px"),
+    ("loc_gain_box", "Camera gain", "{:.3g} ADU/e⁻"),
+    ("loc_offset_box", "Camera offset", "{:.0f} ADU"),
+    ("fps_box", "Frame rate", "{:.3f} fps"),
+    ("bin_factor_box", "Time binning", "{:.0f} raw frames"),
+)
+
 
 def bound_to_box_precision(value, decimals, upward):
     """A bound rounded *outwards* to what a spin box can hold.
@@ -2038,6 +2052,11 @@ class LocalizationTrackingWidget(QWidget):
         """Apply a metadata dict to the controls. Returns (applied, skipped, notes)."""
         values, notes = settings_from_metadata(metadata)
         applied, skipped = [], []
+        # Read before anything moves, compared after, so the log can say which
+        # instrument parameters this file changed and what they were before.
+        before = {attr: getattr(self, attr).value()
+                  for attr, _label, _fmt in INSTRUMENT_SETTINGS
+                  if hasattr(self, attr)}
 
         # The frame shift is plugin state rather than a control, so it is
         # applied directly instead of being pushed into a widget.
@@ -2089,6 +2108,15 @@ class LocalizationTrackingWidget(QWidget):
                 self._update_time_bin_label()
                 if self._raw_image is not None:
                     self._rebin_loaded_stack(factor)
+
+        for attr, label, template in INSTRUMENT_SETTINGS:
+            if attr not in before:
+                continue
+            after = getattr(self, attr).value()
+            if abs(after - before[attr]) <= 1e-9:
+                continue
+            notes.append(f"{label} {template.format(before[attr])} -> "
+                         f"{template.format(after)}, as that run recorded it")
 
         # One refresh at the end rather than one per control.
         self.apply_filters()
@@ -7927,6 +7955,15 @@ class LocalizationTrackingWidget(QWidget):
         if not state or self.df is None:
             return
         values = self.df[column].dropna().to_numpy(float)
+        # Two distributions, not one: everything loaded, and what survives the
+        # filters. Drawing only the first meant tightening a bound on sigma
+        # changed nothing visible in the intensity histogram beside it - and the
+        # coupling between columns is exactly what these plots are for.
+        if (self.df_filtered is not None and not self.df_filtered.empty
+                and column in self.df_filtered.columns):
+            kept = self.df_filtered[column].dropna().to_numpy(float)
+        else:
+            kept = values if self.df_filtered is None else values[:0]
         figure = state["figure"]
         figure.clear()
         figure.patch.set_facecolor(FILTER_HIST_BG)
@@ -7942,20 +7979,27 @@ class LocalizationTrackingWidget(QWidget):
 
         if column == intensity_col:
             lo = max(view_lo, 1e-9)
-            positive = values[values > 0]
-            shown = positive[(positive >= lo) & (positive <= view_hi)]
-            if len(shown):
-                bins = np.logspace(np.log10(lo), np.log10(view_hi), n_bins + 1)
-                ax.hist(shown, bins=bins, color=FILTER_HIST_BAR, alpha=0.9)
+            bins = np.logspace(np.log10(lo), np.log10(view_hi), n_bins + 1)
+            in_view = lambda a: a[(a > 0) & (a >= lo) & (a <= view_hi)]  # noqa: E731
             ax.set_xscale("log")
             ax.set_xlim(lo, view_hi)
         else:
-            shown = values[(values >= view_lo) & (values <= view_hi)]
-            if len(shown):
-                ax.hist(shown, bins=n_bins, range=(view_lo, view_hi), color=FILTER_HIST_BAR, alpha=0.9)
+            bins = np.linspace(view_lo, view_hi, n_bins + 1)
+            in_view = lambda a: a[(a >= view_lo) & (a <= view_hi)]  # noqa: E731
             ax.set_xlim(view_lo, view_hi)
 
-        ax.set_title(column, fontsize=9, color=FILTER_HIST_FG)
+        # Same bin edges for both, so the pale bars read as "what the filters
+        # removed" rather than as a second, differently-binned distribution.
+        all_shown, kept_shown = in_view(values), in_view(kept)
+        if len(all_shown):
+            ax.hist(all_shown, bins=bins, color=FILTER_HIST_BAR, alpha=0.28)
+        if len(kept_shown):
+            ax.hist(kept_shown, bins=bins, color=FILTER_HIST_BAR, alpha=0.95)
+
+        title = column
+        if len(kept) != len(values):
+            title = f"{column}   {len(kept)} / {len(values)}"
+        ax.set_title(title, fontsize=9, color=FILTER_HIST_FG)
         ax.tick_params(labelsize=7, colors=FILTER_HIST_FG)
         for spine in ax.spines.values():
             spine.set_color(FILTER_HIST_FG)
@@ -7992,8 +8036,16 @@ class LocalizationTrackingWidget(QWidget):
         state["canvas"].draw_idle()
 
     def _refresh_histogram_bounds(self):
+        """Redraw every filter histogram against the surviving localizations.
+
+        A full redraw rather than only moving the bound lines: the bars have to
+        move too, or filtering one column leaves every other distribution
+        looking untouched. Called from `apply_filters`, which runs on a button
+        press or the release of a dragged bound - never per keystroke - so the
+        cost of re-binning each column is paid once per deliberate action.
+        """
         for column in self._hist_widgets:
-            self._sync_histogram_lines(column)
+            self._draw_histogram(column)
 
     def _on_hist_press(self, column, event):
         state = self._hist_widgets.get(column)
