@@ -307,3 +307,136 @@ def test_the_settings_survive_a_round_trip():
     assert restored.immobility_sigma_box.value() == pytest.approx(31.0)
     assert restored.pstatic_min_box.value() == pytest.approx(0.05)
     assert restored.pstatic_filter_box.isChecked()
+
+
+# --- what the trajectory could have seen ---------------------------------------
+#
+# "Not significantly moving" is not "static". The false-positive rate of the
+# test has no length bias at all - 5% at N = 3 and at N = 100 - but its *power*
+# is dominated by length: at D = 0.005 um2/s a genuinely moving molecule is
+# missed 87% of the time at N = 3 and 1% of the time at N = 30. Tightening the
+# threshold does not help; it raises the floor for every length by about the
+# same factor. The only honest fix is to report the floor.
+
+
+@pytest.mark.parametrize("n,expected", [
+    (3, 0.0288), (5, 0.0120), (8, 0.0056), (15, 0.0021), (30, 0.0007), (100, 0.00012),
+])
+def test_the_floor_matches_the_power_actually_achieved(n, expected):
+    """Checked against a bisection on simulated trajectories: the D detected in
+    half of them, at sigma = 25 nm and a 31.3 ms frame interval."""
+    floor = widget_mod.detectable_diffusion(n, 25.0, 0.0313, 0.05) / 1e6
+    assert floor == pytest.approx(expected, rel=0.15)
+
+
+def test_the_floor_falls_steeply_with_trajectory_length():
+    """Roughly forty-fold from three points to thirty - which is the whole
+    reason a bare 'immobile' verdict is misleading on short tracks."""
+    short = widget_mod.detectable_diffusion(3, 25.0, 0.0313, 0.05)
+    long = widget_mod.detectable_diffusion(30, 25.0, 0.0313, 0.05)
+    assert short / long == pytest.approx(33.0, rel=0.25)
+
+
+def test_a_tighter_threshold_raises_the_floor_but_does_not_flatten_it():
+    """The two effects are nearly orthogonal, which is why the threshold cannot
+    be used to fix the length bias: tightening it raises every length together.
+
+    Measured as the two changes side by side - how far the floor itself moves
+    against how far the *ratio* between lengths moves.
+    """
+    floors = {}
+    for alpha in (0.05, 0.001):
+        floors[alpha] = {n: widget_mod.detectable_diffusion(n, 25.0, 0.0313, alpha)
+                         for n in (3, 30)}
+    floor_change = floors[0.001][30] / floors[0.05][30]
+    ratio_change = ((floors[0.001][3] / floors[0.001][30])
+                    / (floors[0.05][3] / floors[0.05][30]))
+    assert floor_change > 2.0          # the floor really does move
+    assert ratio_change < floor_change / 1.5   # the length dependence barely does
+
+
+def test_a_worse_precision_raises_the_floor_as_the_square():
+    a = widget_mod.detectable_diffusion(15, 20.0, 0.0313, 0.05)
+    b = widget_mod.detectable_diffusion(15, 40.0, 0.0313, 0.05)
+    assert b / a == pytest.approx(4.0, rel=0.01)
+
+
+def test_two_points_have_no_rate_to_report():
+    assert widget_mod.detectable_diffusion(2, 25.0, 0.0313, 0.05) == float("inf")
+    assert widget_mod.detectable_diffusion(10, 0.0, 0.0313, 0.05) == float("inf")
+
+
+def test_the_floor_is_reported_per_trajectory():
+    widget = _analysed(n_static=20, n_moving=0)
+    floors = widget._track_dmin_cache
+    assert len(floors) == 20
+    assert all(np.isfinite(v) and v > 0 for v in floors.values())
+    # 15 points at 15-45 nm precision and ~32 fps lands in this range
+    assert 1e-4 < np.median(list(floors.values())) < 1e-1
+
+
+def test_a_shorter_trajectory_reports_a_higher_floor():
+    """The comparison that makes the length bias legible in the data itself."""
+    import pandas as pd
+
+    widget = _widget()
+    rng = np.random.default_rng(4)
+    rows, tracks = [], []
+    for pid, n in ((0, 5), (1, 40)):
+        xy = rng.normal(0, 25.0, (n, 2)) + [2000.0 * pid, 2000.0]
+        for frame, point in enumerate(xy):
+            rows.append({"frame": frame, "x [nm]": point[0], "y [nm]": point[1],
+                         "uncertainty [nm]": 25.0, "sigma [nm]": 150.0,
+                         "intensity [photon]": 900.0})
+            tracks.append({"particle": pid, "frame": frame,
+                           "x": point[0] / PIXEL_SIZE_NM, "y": point[1] / PIXEL_SIZE_NM})
+    widget._ingest_localization_dataframe(pd.DataFrame(rows), "loaded", True)
+    widget.tracks = pd.DataFrame(tracks)
+    widget._invalidate_track_filter()
+    widget._start_fit_free_metrics_worker()
+    assert _pump_until(lambda: widget._track_dmin_cache)
+
+    assert widget._track_dmin_cache[0] > 10 * widget._track_dmin_cache[1]
+
+
+def test_the_significance_box_moves_the_floor():
+    widget = _analysed(n_static=20, n_moving=0)
+    loose = np.median(list(widget._track_dmin_cache.values()))
+    widget.immobility_alpha_box.setValue(0.001)
+    assert _pump_until(
+        lambda: np.median(list(widget._track_dmin_cache.values())) > loose * 1.2)
+    assert np.median(list(widget._track_dmin_cache.values())) > loose
+
+
+def test_it_is_a_metric_like_the_others():
+    widget = _analysed()
+    assert "dmin" in widget._metric_hist_widgets
+    assert "dmin" in widget._metric_bound_boxes
+    assert "dmin" in widget._metric_filter_boxes
+    widget.color_metric_box.setCurrentText("Smallest detectable D")
+    assert widget._current_metric_key() == "dmin"
+
+
+def test_it_can_select_the_trajectories_with_enough_power():
+    """The point of having it as a filter: keep only trajectories that could
+    have ruled out the D you care about."""
+    widget = _analysed(n_static=30, n_moving=30)
+    widget.dmin_min_box.setValue(0.0)
+    widget.dmin_max_box.setValue(np.median(list(widget._track_dmin_cache.values())))
+    widget.dmin_filter_box.setChecked(True)
+    kept = widget._displayed_tracks()["particle"].nunique()
+    assert 0 < kept < 60
+
+
+def test_it_reaches_the_metrics_table():
+    widget = _analysed()
+    frame = widget._track_metrics_frame()
+    assert "d_detectable_um2_per_s" in frame.columns
+    assert frame["d_detectable_um2_per_s"].notna().all()
+
+
+def test_the_panel_says_what_immobile_is_worth():
+    widget = _analysed(n_static=20, n_moving=0)
+    text = widget.immobility_status_label.text()
+    assert "Detection floor" in text
+    assert "too short or too imprecise" in text

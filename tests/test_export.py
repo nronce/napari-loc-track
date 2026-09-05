@@ -171,7 +171,7 @@ def test_track_metrics_frame_has_one_row_per_trajectory():
     assert list(frame.columns) == [
         "particle", "D_um2_per_s", "distance_um",
         "net_displacement_um", "straightness", "duration_s",
-        "motion_ratio", "p_static", "sigma_from_msd_nm",
+        "motion_ratio", "p_static", "d_detectable_um2_per_s", "sigma_from_msd_nm",
     ]
     assert frame.loc[frame["particle"] == 0, "D_um2_per_s"].iloc[0] == pytest.approx(0.5)
     assert pd.isna(frame.loc[frame["particle"] == 1, "D_um2_per_s"].iloc[0])
