@@ -340,3 +340,54 @@ def test_settings_that_did_not_move_are_not_announced():
     _applied, _skipped, notes = widget.apply_settings(
         {"localization_2d": {"gain_adu_per_electron": 1.3}})
     assert not any("Camera gain" in note for note in notes)
+
+
+def test_opening_data_beside_a_previous_run_leaves_the_microscope_alone():
+    """Nobody asked for those settings - opening data merely found them next to
+    it. Pixel size on this setup is measured by hand and cannot be derived from
+    metadata, so an older run is as likely to hold a stale value as a good one,
+    and silently undoing a calibration is worse than leaving a control the user
+    deliberately set."""
+    widget = make_widget()
+    widget.loc_gain_box.setValue(1.3)
+    widget.pixel_size_box.setValue(161.0)
+    widget.loc_min_ng_box.setValue(800.0)
+
+    _applied, _skipped, notes = widget.apply_settings(
+        {"pixel_size_nm_per_px": 108.0,
+         "localization_2d": {"gain_adu_per_electron": 1.0, "min_net_gradient": 750.0}},
+        include_instrument=False)
+
+    assert widget.loc_gain_box.value() == pytest.approx(1.3)
+    assert widget.pixel_size_box.value() == pytest.approx(161.0)
+    # the analysis settings still come across - that is the point of restoring
+    assert widget.loc_min_ng_box.value() == pytest.approx(750.0)
+    joined = " | ".join(notes)
+    assert "yours is 161.0 nm/px and was left alone" in joined
+    assert "yours is 1.3 ADU" in joined
+
+
+def test_a_disagreement_is_only_reported_when_there_is_one():
+    widget = make_widget()
+    widget.pixel_size_box.setValue(161.0)
+    _applied, _skipped, notes = widget.apply_settings(
+        {"pixel_size_nm_per_px": 161.0}, include_instrument=False)
+    assert not any("left alone" in note for note in notes)
+
+
+def test_asking_for_a_run_explicitly_still_restores_all_of_it(tmp_path):
+    """The other path: the user pressed 'Load settings from a previous
+    analysis', so every setting including the instrument is what they asked
+    for."""
+    import json
+
+    widget = make_widget()
+    widget.loc_gain_box.setValue(1.3)
+    path = tmp_path / "metadata.json"
+    path.write_text(json.dumps(
+        {"pixel_size_nm_per_px": 108.0,
+         "localization_2d": {"gain_adu_per_electron": 1.0}}), encoding="utf-8")
+
+    widget.load_settings_from_metadata(str(path))
+    assert widget.loc_gain_box.value() == pytest.approx(1.0)
+    assert widget.pixel_size_box.value() == pytest.approx(108.0)

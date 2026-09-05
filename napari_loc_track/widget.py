@@ -2048,8 +2048,14 @@ class LocalizationTrackingWidget(QWidget):
             self.log(f"Session {plan['name']} restored.")
         self._update_status_header()
 
-    def apply_settings(self, metadata):
-        """Apply a metadata dict to the controls. Returns (applied, skipped, notes)."""
+    def apply_settings(self, metadata, include_instrument=True):
+        """Apply a metadata dict to the controls. Returns (applied, skipped, notes).
+
+        `include_instrument` is False when the settings were not asked for -
+        when opening data happens to find a previous run beside it. See
+        `_restore_previous_run_settings` for why the microscope is left alone
+        on that path.
+        """
         values, notes = settings_from_metadata(metadata)
         applied, skipped = [], []
         # Read before anything moves, compared after, so the log can say which
@@ -2057,6 +2063,19 @@ class LocalizationTrackingWidget(QWidget):
         before = {attr: getattr(self, attr).value()
                   for attr, _label, _fmt in INSTRUMENT_SETTINGS
                   if hasattr(self, attr)}
+        if not include_instrument:
+            for attr, label, template in INSTRUMENT_SETTINGS:
+                if attr not in values or attr not in before:
+                    continue
+                recorded = values.pop(attr)
+                try:
+                    differs = abs(float(recorded) - before[attr]) > 1e-9
+                except (TypeError, ValueError):
+                    differs = False
+                if differs:
+                    notes.append(
+                        f"that run used {label.lower()} {template.format(float(recorded))}; "
+                        f"yours is {template.format(before[attr])} and was left alone")
 
         # The frame shift is plugin state rather than a control, so it is
         # applied directly instead of being pushed into a widget.
@@ -4102,14 +4121,25 @@ class LocalizationTrackingWidget(QWidget):
                      "binning - re-run detection and fitting before trusting them.")
 
     def _restore_previous_run_settings(self, locs_path):
-        """Restore the settings of the run that produced an auto-loaded table.
+        """Restore the analysis settings of the run that produced a table found
+        beside the data - but not the microscope.
 
         An auto-loaded table is usually a *filtered* export, so loading it
         without its parameters puts data on screen that the controls actively
-        misdescribe: bounds that were applied showing as wide open, a pixel size
-        that is not the one those coordinates were computed with. The point of
-        picking the table up automatically is to carry on where that run left
-        off, and that only holds if the controls come with it.
+        misdescribe: bounds that were applied showing as wide open, a colour
+        scale that belongs to a different metric. Picking the table up
+        automatically is meant to carry on where that run left off, and that
+        only holds if the controls come with it.
+
+        The instrument is the exception, and stays where the user put it. Pixel
+        size, gain, offset and frame rate describe the microscope, not a choice
+        about the analysis: on this setup the pixel size cannot be derived from
+        the metadata at all and is measured by hand, so an older run is as
+        likely to hold a stale value as a correct one. Nobody asked for these
+        settings - opening data merely found them - and silently undoing a
+        calibration is a worse failure than leaving a control the user set. A
+        disagreement is reported instead, which is the part actually worth
+        knowing.
         """
         locs_path = Path(locs_path)
         # The exporter writes metadata.json at the root of the analysis folder
@@ -4127,12 +4157,15 @@ class LocalizationTrackingWidget(QWidget):
             except Exception as exc:
                 self.log(f"Found {candidate.name} from that run but could not read it: {exc}")
                 return
-            applied, _skipped, notes = self.apply_settings(metadata)
+            applied, _skipped, notes = self.apply_settings(
+                metadata, include_instrument=False)
             exported = metadata.get("exported_at")
             self.log(
-                f"Restored {len(applied)} settings from that run's {candidate.name}"
+                f"Restored {len(applied)} analysis settings from that run's "
+                f"{candidate.name}"
                 + (f", exported {exported}" if exported else "")
-                + " - the controls now describe the data being shown."
+                + " - the pixel size, gain, offset and frame rate are yours and "
+                "were left as they are."
             )
             for note in notes:
                 self.log(f"  note: {note}")

@@ -69,12 +69,11 @@ def test_the_localizations_of_the_previous_run_are_found(tmp_path):
     assert "Auto-detected and loaded" in widget.log_box.toPlainText()
 
 
-def test_the_parameters_of_that_run_come_with_it(tmp_path):
+def test_the_analysis_parameters_of_that_run_come_with_it(tmp_path):
     _previous_run(tmp_path)
     widget = make_widget()
     _load_stack_beside(widget, tmp_path)
 
-    assert widget.pixel_size_box.value() == pytest.approx(108.5)
     assert widget.loc_box_size.value() == 9
     assert widget.loc_min_ng_box.value() == 4321
     assert widget.search_box.value() == pytest.approx(777.0)
@@ -125,7 +124,21 @@ def test_metadata_beside_the_table_is_found_too(tmp_path):
 
     widget = make_widget()
     _load_stack_beside(widget, tmp_path)
-    assert widget.pixel_size_box.value() == pytest.approx(108.5)
+    assert widget.loc_min_ng_box.value() == 4321
+
+
+def test_the_microscope_is_not_restored_from_a_run_nobody_asked_for(tmp_path):
+    """Opening data found this run beside it; that is not a request to change
+    the pixel size, which on this setup is measured by hand and cannot be
+    derived from the metadata at all. The disagreement is reported instead."""
+    _previous_run(tmp_path)
+    widget = make_widget()
+    widget.pixel_size_box.setValue(161.0)
+    _load_stack_beside(widget, tmp_path)
+
+    assert widget.pixel_size_box.value() == pytest.approx(161.0)
+    assert "108.5" in widget.log_box.toPlainText()
+    assert "left alone" in widget.log_box.toPlainText()
 
 
 def test_unreadable_metadata_does_not_stop_the_data_loading(tmp_path):
