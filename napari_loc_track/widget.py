@@ -98,7 +98,12 @@ TRACK_PALETTE = [
 DEFAULT_D_COLORMAP = "coolwarm"
 D_COLORMAP_CHOICES = ["coolwarm", "cool", "spring", "autumn", "bwr", "viridis"]
 
-DEFAULT_HIST_HEIGHT = 190
+# Governs every plot in the plugin, not only the filter histograms. Tall enough
+# that a histogram's bars have room to differ from one another and a log axis has
+# somewhere to put its decades - at 190 the plots were legible but cramped, and
+# a figure lifted out for a slide came out the wrong proportions before the
+# shape control had been touched.
+DEFAULT_PLOT_HEIGHT = 420
 
 # Every plot in the plugin answers to one size, because these end up in talks
 # and a figure that is the right shape is most of what makes one look
@@ -4109,6 +4114,9 @@ class LocalizationTrackingWidget(QWidget):
         # the tests that stand in for a worker) still hand over four values.
         df, image, how, acquisition = result[:4]
         self._raw_image = result[4] if len(result) > 4 else image
+        # A different stack is a different analysis, even before any
+        # localizations arrive from it.
+        self._start_new_output_folders()
         # Loading can outrun the debounce on the binning box: the stack has just
         # been opened at the new factor, so the baseline and frame rate move with
         # it here rather than waiting for a timer that would then find the factor
@@ -4464,6 +4472,12 @@ class LocalizationTrackingWidget(QWidget):
         self.df = df
         self.df_filtered = self.df.copy()
         self.column_map = infer_column_map(self.df.columns)
+        # New localizations are a new analysis, so its outputs start a folder of
+        # their own. Without this the figures folder was chosen once per session
+        # and every later run wrote into the first one's - so a second fit's
+        # graphs landed among the first's, describing different data under
+        # neighbouring filenames.
+        self._start_new_output_folders()
         self.tracks = None
         self._invalidate_track_filter()
         self._track_diffusion_cache = None
@@ -8306,18 +8320,18 @@ class LocalizationTrackingWidget(QWidget):
         view_min_box.setValue(default_lo)
         view_max_box.setValue(default_hi)
 
-        figure = Figure(figsize=(4.2, DEFAULT_HIST_HEIGHT / 100))
+        figure = Figure(figsize=(4.2, DEFAULT_PLOT_HEIGHT / 100))
         canvas = FigureCanvas(figure)
         self._plot_canvases.append(canvas)
-        canvas.setMinimumHeight(DEFAULT_HIST_HEIGHT)
-        canvas.setMaximumHeight(DEFAULT_HIST_HEIGHT)
+        canvas.setMinimumHeight(DEFAULT_PLOT_HEIGHT)
+        canvas.setMaximumHeight(DEFAULT_PLOT_HEIGHT)
         canvas.setMinimumWidth(260)
         layout.addWidget(canvas)
 
         state = {
             "figure": figure,
             "canvas": canvas,
-            "height": DEFAULT_HIST_HEIGHT,
+            "height": DEFAULT_PLOT_HEIGHT,
             "bins_box": bins_box,
             "view_min_box": view_min_box,
             "view_max_box": view_max_box,
@@ -8342,6 +8356,18 @@ class LocalizationTrackingWidget(QWidget):
     # ------------------------------------------------------------------
     # Lifting a single graph out for a slide
     # ------------------------------------------------------------------
+    def _start_new_output_folders(self):
+        """Forget the folders this session was collecting outputs into.
+
+        Both are remembered so that several things saved from one analysis land
+        together - an image and a movie from the same render, a set of graphs for
+        one figure. That is only right while the analysis is the same one; the
+        moment the data changes they have to be given up, or the next run's
+        outputs are filed under the previous run's timestamp.
+        """
+        self._render_save_folder = None
+        self._figure_save_folder = None
+
     def _figure_save_dir(self):
         """One dated folder per session for the graphs lifted out of the panel.
 
@@ -8422,7 +8448,7 @@ class LocalizationTrackingWidget(QWidget):
         row.addWidget(QLabel("Height"))
         self.plot_height_box = QSpinBox()
         self.plot_height_box.setRange(min_h, max_h)
-        self.plot_height_box.setValue(DEFAULT_HIST_HEIGHT)
+        self.plot_height_box.setValue(DEFAULT_PLOT_HEIGHT)
         self.plot_height_box.setSingleStep(20)
         self.plot_height_box.setSuffix(" px")
         row.addWidget(self.plot_height_box)

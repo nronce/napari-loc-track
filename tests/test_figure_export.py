@@ -104,7 +104,9 @@ def test_the_background_is_transparent(tmp_path):
     pixels = np.array(Image.open(_saved(widget)))
     assert pixels.shape[2] == 4, "no alpha channel"
     assert pixels[0, 0, 3] == 0, "the corner is not transparent"
-    assert (pixels[..., 3] == 0).mean() > 0.2, "hardly any of it is transparent"
+    # A margin's worth, whatever the plot's proportions - the point is that the
+    # ground shows through, not that any particular fraction of it does.
+    assert (pixels[..., 3] == 0).mean() > 0.05, "hardly any of it is transparent"
 
 
 def test_the_graph_itself_is_actually_drawn(tmp_path):
@@ -152,3 +154,43 @@ def test_an_unwritable_destination_is_reported_not_raised(tmp_path, monkeypatch)
     widget.log_box.clear()
     assert _saved(widget) is None
     assert "Could not save that graph" in widget.log_box.toPlainText()
+
+
+# --- one folder per analysis, not one per session -----------------------------
+
+
+def test_a_second_analysis_does_not_write_into_the_first_ones_folder(tmp_path):
+    """The folder is remembered so that a set of graphs from one analysis lands
+    together. That is only right while the analysis is the same one - it used to
+    be chosen once per session, so every later run filed its graphs under the
+    first run's timestamp, describing different data under neighbouring names."""
+    widget = _loaded(tmp_path)
+    first = _saved(widget, name="sigma").parent
+
+    # a second fit, or a second table loaded - either is a new analysis
+    widget._ingest_localization_dataframe(
+        pd.DataFrame({
+            "frame": [0, 1, 2, 3], "x [nm]": [0.0, 1, 2, 3], "y [nm]": [0.0, 1, 2, 3],
+            "sigma [nm]": [120.0] * 4, "intensity [photon]": [900.0] * 4,
+        }), "refitted", True)
+    second = _saved(widget, name="sigma").parent
+
+    assert second != first
+    assert sorted(p.name for p in first.iterdir()) == ["sigma.png"]
+    assert sorted(p.name for p in second.iterdir()) == ["sigma.png"]
+
+
+def test_graphs_from_one_analysis_still_land_together(tmp_path):
+    widget = _loaded(tmp_path)
+    a = _saved(widget, name="one")
+    b = _saved(widget, "intensity [photon]", name="two")
+    assert a.parent == b.parent
+
+
+def test_loading_a_different_stack_also_starts_a_new_folder(tmp_path):
+    widget = _loaded(tmp_path)
+    first = _saved(widget, name="sigma").parent
+
+    widget._on_load_finished((None, None, "decoded", None, None), "", "")
+    widget._ingest_localization_dataframe(widget.df, "reloaded", True)
+    assert _saved(widget, name="sigma").parent != first
