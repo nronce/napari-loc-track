@@ -106,6 +106,9 @@ DEFAULT_HIST_HEIGHT = 190
 # before and stays the default; anything else pins it, so a screenshot has the
 # aspect ratio you chose rather than the one the window happened to have.
 PLOT_WIDTH_FILL = 0
+# Twice the screen resolution: a histogram that reads fine in a side panel is a
+# blurred rectangle once a projector has stretched it across a wall.
+FIGURE_SAVE_DPI = 200
 PLOT_SIZE_LIMITS = (240, 3000, 120, 1600)   # min/max width, min/max height
 HIST_HEIGHT_STEP = 50
 MIN_HIST_HEIGHT = 110
@@ -1668,6 +1671,8 @@ class LocalizationTrackingWidget(QWidget):
         self._autosave_worker_ref = None
         # Where this render session's files go; cleared by each new render.
         self._render_save_folder = None
+        # Where graphs lifted out for a slide collect, one folder per session.
+        self._figure_save_folder = None
         # Every matplotlib canvas, so one size control can reach all of them
         # without each having to be found by name.
         self._plot_canvases = []
@@ -2701,6 +2706,11 @@ class LocalizationTrackingWidget(QWidget):
         self._plot_canvases.append(self.loc_counts_canvas)
         self.loc_counts_canvas.setMinimumHeight(200)
         det_layout.addRow("", self.loc_counts_canvas)
+        counts_tools = QHBoxLayout()
+        counts_tools.addStretch(1)
+        counts_tools.addWidget(self._png_button(
+            lambda: self.loc_counts_figure, lambda: "detection_counts"))
+        det_layout.addRow("", counts_tools)
         layout.addWidget(det_group)
 
         fit_group = QGroupBox("Sub-pixel Gaussian fitting")
@@ -3771,6 +3781,11 @@ class LocalizationTrackingWidget(QWidget):
         # localization precision it implies is free, and it is an estimate of
         # the same quantity the spot fitter reports by an entirely different
         # route. Reporting only the slope threw half the fit away.
+        msd_tools = QHBoxLayout()
+        msd_tools.addStretch(1)
+        msd_tools.addWidget(self._png_button(
+            lambda: self.msd_figure, lambda: "msd_validation"))
+        msd_sub_layout.addLayout(msd_tools)
         self.msd_sigma_label = QLabel()
         self.msd_sigma_label.setWordWrap(True)
         self.msd_sigma_label.setProperty("role", "note")
@@ -7205,6 +7220,9 @@ class LocalizationTrackingWidget(QWidget):
             "trajectories in the viewer are shaded on the same scale."
         )
         toolbar.addWidget(log_box)
+        toolbar.addWidget(self._png_button(
+            lambda k=key: self._metric_hist_widgets[k]["figure"],
+            lambda k=key: f"{k}_histogram"))
         toolbar.addStretch(1)
         layout.addLayout(toolbar)
 
@@ -8237,6 +8255,9 @@ class LocalizationTrackingWidget(QWidget):
         toolbar.addWidget(shrink_btn)
         toolbar.addWidget(grow_btn)
         toolbar.addWidget(reset_btn)
+        toolbar.addWidget(self._png_button(
+            lambda c=column: self._hist_widgets[c]["figure"],
+            lambda c=column: f"{c}_histogram"))
         toolbar.addStretch(1)
         layout.addLayout(toolbar)
 
@@ -8303,6 +8324,65 @@ class LocalizationTrackingWidget(QWidget):
         self._draw_histogram(column)
         return container
 
+    # ------------------------------------------------------------------
+    # Lifting a single graph out for a slide
+    # ------------------------------------------------------------------
+    def _figure_save_dir(self):
+        """One dated folder per session for the graphs lifted out of the panel.
+
+        A dialog per graph is the thing that stops anyone building a figure set:
+        eight plots is eight trips through a file browser. One click writes it,
+        and they accumulate somewhere findable together.
+        """
+        folder = getattr(self, "_figure_save_folder", None)
+        if folder is None or not folder.exists():
+            folder = self._make_analysis_folder(self._analysis_base_dir(), "figures")
+            folder.mkdir(parents=True, exist_ok=True)
+            self._figure_save_folder = folder
+        return folder
+
+    def _save_figure_png(self, figure, name):
+        """Write one figure as a transparent PNG, ready to drop on a slide.
+
+        Transparent rather than black: the plots are drawn light-on-dark for
+        napari, so with the background dropped the axes, labels and data keep
+        their light colours and sit on whatever the slide provides. Saved at
+        twice the screen resolution, because a histogram that looks fine in a
+        panel is a blurred rectangle on a projector.
+        """
+        try:
+            folder = self._figure_save_dir()
+            stem = self._safe_filename(name) or "figure"
+            path = folder / f"{stem}.png"
+            i = 2
+            while path.exists():
+                path = folder / f"{stem}_{i}.png"
+                i += 1
+            figure.savefig(path, dpi=FIGURE_SAVE_DPI, transparent=True,
+                           bbox_inches="tight", pad_inches=0.05)
+        except Exception as exc:
+            self.log(f"Could not save that graph: {exc}")
+            return None
+        self.log(f"Saved {path.name} to {path.parent}")
+        return path
+
+    def _png_button(self, figure_getter, name_getter):
+        """The small button that does it, for one graph."""
+        button = QPushButton("PNG")
+        button.setProperty("secondary", True)
+        button.setMaximumWidth(44)
+        button.setToolTip(
+            "Save this graph as a PNG with a transparent background, for "
+            "dropping straight onto a dark slide.\n\n"
+            "The axes and labels are light, so they read on a dark background "
+            "and not on a white one. Written at twice screen resolution into a "
+            "dated 'figures' folder beside the data - one click, no dialog, and "
+            "they collect together."
+        )
+        button.clicked.connect(
+            lambda _c=False: self._save_figure_png(figure_getter(), name_getter()))
+        return button
+
     def _build_plot_size_row(self):
         """One size for every plot in the plugin.
 
@@ -8368,6 +8448,14 @@ class LocalizationTrackingWidget(QWidget):
                     canvas.setMaximumWidth(16777215)
                 canvas.setFixedHeight(height)
                 canvas.updateGeometry()
+                # The figure's own size is what savefig uses, and it otherwise
+                # only follows the widget on a Qt layout pass - so a graph saved
+                # for a slide would come out the shape it was before the size
+                # was chosen. Set both and they cannot disagree.
+                figure = canvas.figure
+                dpi = figure.get_dpi() or 100.0
+                pixels = width if width > PLOT_WIDTH_FILL else max(canvas.width(), 1)
+                figure.set_size_inches(pixels / dpi, height / dpi, forward=False)
                 canvas.draw_idle()
             except RuntimeError:
                 # Its Qt object is gone - a filter panel rebuilt for new data.
