@@ -171,7 +171,7 @@ def test_all_clears_the_selection_and_the_layer_name_with_it():
     assert len(widget._displayed_localizations()) == len(widget.df_filtered)
 
 
-def test_a_preset_replaces_any_other_dynamics_filter():
+def test_a_preset_replaces_any_other_behavioural_filter():
     """Two selections at once would silently intersect, and the layer name
     would then describe only half of what produced it."""
     widget = _analysed()
@@ -182,6 +182,27 @@ def test_a_preset_replaces_any_other_dynamics_filter():
     widget._set_render_population("immobile")
     active = [key for key, _low, _high in widget._active_metric_filters()]
     assert active == ["pstatic"]
+
+
+def test_a_preset_keeps_a_detection_floor_qualifier():
+    """dmin is not a competing claim about how the molecule behaved - it says
+    what the trajectory was capable of measuring - and it is the companion the
+    immobile preset needs: p > alpha alone sweeps every trajectory too short to
+    detect anything into the immobile pile."""
+    widget = _analysed()
+    widget.dmin_min_box.setValue(0.0)
+    widget.dmin_max_box.setValue(0.02)
+    widget.dmin_filter_box.setChecked(True)
+
+    widget._set_render_population("immobile")
+    active = sorted(key for key, _low, _high in widget._active_metric_filters())
+    assert active == ["dmin", "pstatic"]
+
+    # "All" means all, though - including dropping the qualifier, or the button
+    # would not do what its label says.
+    widget._set_render_population("all")
+    assert not widget.dmin_filter_box.isChecked()
+    assert widget._passing_particles() is None
 
 
 def test_the_panel_says_what_the_next_render_will_contain():

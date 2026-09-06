@@ -5195,16 +5195,26 @@ class LocalizationTrackingWidget(QWidget):
         threshold = self.render_population_p_box.value()
         boxes = self._metric_filter_boxes
         for key, box in boxes.items():
-            if key != "pstatic":
+            # "dmin" survives: it is not a competing statement about how the
+            # molecule behaved but about what its trajectory was capable of
+            # measuring, and it is the natural companion to the immobile
+            # preset - p > alpha alone puts every trajectory too short to
+            # detect anything into the immobile pile.
+            if key not in ("pstatic", "dmin"):
                 box.blockSignals(True)
                 box.setChecked(False)
                 box.blockSignals(False)
 
         pstatic = boxes.get("pstatic")
         if which == "all":
-            pstatic.blockSignals(True)
-            pstatic.setChecked(False)
-            pstatic.blockSignals(False)
+            # "All" means all: the detection-floor qualifier goes too, or the
+            # button would not do what it says.
+            for key in ("pstatic", "dmin"):
+                box = boxes.get(key)
+                if box is not None:
+                    box.blockSignals(True)
+                    box.setChecked(False)
+                    box.blockSignals(False)
             self.render_layer_name_edit.setText(RENDER_LAYER_NAME)
         else:
             if which == "immobile":
