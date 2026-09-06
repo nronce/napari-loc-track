@@ -233,7 +233,7 @@ def test_the_calibration_factor_scales_the_reported_precision():
 def test_both_metrics_reach_the_histograms_bounds_and_colouring():
     widget = _analysed()
     for key, choice in (("motion", "Motion ratio (moved vs its own precision)"),
-                        ("pstatic", "p (consistent with static)")):
+                        ("pstatic", "p_static (consistent with a static emitter)")):
         assert key in widget._metric_hist_widgets
         assert key in widget._metric_bound_boxes
         assert key in widget._metric_filter_boxes

@@ -213,7 +213,7 @@ METRIC_LABELS = {
     "straightness": "Straightness (end-to-end / path)",
     "duration": "Trajectory duration (s)",
     "motion": "Motion ratio (spread / localization error)",
-    "pstatic": "p (consistent with static)",
+    "pstatic": "p_static",
     "dmin": "Smallest detectable D (µm²/s)",
     # Colouring only: time needs no computing and has no bounds to filter on, so
     # it is absent from METRIC_CACHE_ATTR and from the histogram/bounds machinery.
@@ -235,6 +235,11 @@ METRIC_CACHE_ATTR = {
 # every decade but the last on nothing. Below this floor the answer is the same
 # either way - it moved - so the value is clamped rather than plotted honestly.
 P_STATIC_FLOOR = 1e-10
+
+# Matplotlib renders a real subscript through mathtext, which Qt labels and
+# combo entries cannot - so the axis gets p with a subscript and everything else
+# gets the plain p_static that reads the same way in a plain-text control.
+METRIC_AXIS_LABELS = {"pstatic": r"$p_\mathrm{static}$"}
 
 # The closed form for the detection floor equates the *expected* statistic to
 # the critical value, while "detected half the time" wants its median - and the
@@ -3433,8 +3438,8 @@ class LocalizationTrackingWidget(QWidget):
 
         for key, title, low, high, decimals in (
             ("motion", "Motion ratio — 1.0 is a molecule that did not move", 0.0, 1e6, 4),
-            ("pstatic", "p (consistent with static) — filter to p > 0.05 for the "
-                        "immobile population", 0.0, 1.0, 6),
+            ("pstatic", "p_static — filter to p_static > 0.05 for the immobile "
+                        "population", 0.0, 1.0, 6),
             ("dmin", "Smallest detectable D — what this trajectory could have "
                      "ruled out, µm²/s", 0.0, 1e6, 6),
         ):
@@ -3928,7 +3933,7 @@ class LocalizationTrackingWidget(QWidget):
             "End-to-end displacement", "Straightness (directed vs diffusive)",
             "Track duration",
             "Motion ratio (moved vs its own precision)",
-            "p (consistent with static)",
+            "p_static (consistent with a static emitter)",
             "Smallest detectable D",
             "Time (frame first seen)",
         ])
@@ -6793,7 +6798,7 @@ class LocalizationTrackingWidget(QWidget):
             return "straightness"
         if choice.startswith("Motion ratio"):
             return "motion"
-        if choice.startswith("p ("):
+        if choice.startswith("p_static"):
             return "pstatic"
         if choice.startswith("Smallest detectable"):
             return "dmin"
@@ -7375,7 +7380,7 @@ class LocalizationTrackingWidget(QWidget):
         state["lower_line"] = ax.axvline(lower, color=LAVENDER, linewidth=1.5)
         state["upper_line"] = ax.axvline(upper, color=LAVENDER, linewidth=1.5)
 
-        ax.set_xlabel(METRIC_LABELS[key])
+        ax.set_xlabel(METRIC_AXIS_LABELS.get(key, METRIC_LABELS[key]))
         ax.set_ylabel("Count")
         style_axes(figure, ax, title=f"{len(values)} trajectories")
         figure.tight_layout()
