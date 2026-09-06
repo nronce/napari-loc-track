@@ -35,6 +35,7 @@ from qtpy.QtWidgets import (
     QToolButton,
     QProgressBar,
     QDialog,
+    QMessageBox,
 )
 
 import matplotlib
@@ -98,12 +99,10 @@ TRACK_PALETTE = [
 DEFAULT_D_COLORMAP = "coolwarm"
 D_COLORMAP_CHOICES = ["coolwarm", "cool", "spring", "autumn", "bwr", "viridis"]
 
-# Governs every plot in the plugin, not only the filter histograms. Tall enough
-# that a histogram's bars have room to differ from one another and a log axis has
-# somewhere to put its decades - at 190 the plots were legible but cramped, and
-# a figure lifted out for a slide came out the wrong proportions before the
-# shape control had been touched.
-DEFAULT_PLOT_HEIGHT = 420
+# What the plots are on screen. This is a reading size for a side panel and
+# nothing else: the size a figure is *saved* at is chosen in the export dialog,
+# against a live preview, and never touches what is on screen.
+DEFAULT_PLOT_HEIGHT = 260
 
 # Every plot in the plugin answers to one size, because these end up in talks
 # and a figure that is the right shape is most of what makes one look
@@ -1584,6 +1583,236 @@ class PandasTableModel(QAbstractTableModel):
         return str(section)
 
 
+
+# Formats offered when a graph is lifted out. The vector ones are first because
+# a reconstruction histogram in a talk is usually projected: PDF and SVG stay
+# sharp at any size, where a PNG is fixed at whatever resolution it was written.
+FIGURE_FORMATS = (
+    ("PDF (vector)", "pdf"),
+    ("SVG (vector)", "svg"),
+    ("PNG (raster)", "png"),
+    ("TIFF (raster)", "tiff"),
+)
+
+
+class FigureExportDialog(QDialog):
+    """Choose how one graph is written out, against a live preview.
+
+    Separate from the panel's own size control on purpose. The plots on screen
+    are sized for reading in a side dock; a figure for a slide or a paper wants
+    a different shape, a larger font and often different furniture, and choosing
+    those should not disturb the thing being read. Nothing here touches the
+    panel: every preview is drawn into this dialog's own figure.
+    """
+
+    def __init__(self, parent, redraw, name, folder):
+        super().__init__(parent)
+        self.setWindowTitle(f"Save graph - {name}")
+        self._redraw = redraw
+        self._name = name
+        self._folder = folder
+        self._saved_path = None
+
+        layout = QHBoxLayout(self)
+        layout.setSpacing(12)
+
+        # --- the preview ---------------------------------------------------
+        preview_box = QVBoxLayout()
+        self.preview_figure = Figure()
+        self.preview_canvas = FigureCanvas(self.preview_figure)
+        self.preview_canvas.setMinimumSize(560, 380)
+        preview_box.addWidget(self.preview_canvas, 1)
+        self.size_label = QLabel()
+        self.size_label.setProperty("role", "note")
+        preview_box.addWidget(self.size_label)
+        layout.addLayout(preview_box, 1)
+
+        # --- the controls ---------------------------------------------------
+        controls = QVBoxLayout()
+        controls.setSpacing(8)
+        form = QFormLayout()
+        form.setLabelAlignment(Qt.AlignmentFlag.AlignRight)
+
+        self.width_box = QSpinBox()
+        self.width_box.setRange(200, 6000)
+        self.width_box.setValue(1200)
+        self.width_box.setSingleStep(50)
+        self.width_box.setSuffix(" px")
+        form.addRow("Width", self.width_box)
+
+        self.height_box = QSpinBox()
+        self.height_box.setRange(150, 6000)
+        self.height_box.setValue(750)
+        self.height_box.setSingleStep(50)
+        self.height_box.setSuffix(" px")
+        form.addRow("Height", self.height_box)
+
+        self.shape_box = QComboBox()
+        for label, ratio in PLOT_ASPECTS[1:]:
+            self.shape_box.addItem(label, ratio)
+        self.shape_box.addItem("free", None)
+        self.shape_box.setCurrentIndex(self.shape_box.count() - 1)
+        self.shape_box.setToolTip(
+            "Lock the width to the height at a fixed ratio, or leave both free.")
+        form.addRow("Shape", self.shape_box)
+
+        self.font_box = QSpinBox()
+        self.font_box.setRange(4, 48)
+        self.font_box.setValue(14)
+        self.font_box.setSuffix(" pt")
+        self.font_box.setToolTip(
+            "Body text. Ticks sit a point below, titles a point above. 14-18 "
+            "reads from the back of a room; 8-10 suits a figure panel.")
+        form.addRow("Font", self.font_box)
+
+        self.dpi_box = QSpinBox()
+        self.dpi_box.setRange(72, 1200)
+        self.dpi_box.setValue(300)
+        self.dpi_box.setSingleStep(50)
+        self.dpi_box.setToolTip(
+            "Raster resolution. Ignored by the vector formats, which have none.")
+        form.addRow("Resolution", self.dpi_box)
+
+        self.format_box = QComboBox()
+        for label, ext in FIGURE_FORMATS:
+            self.format_box.addItem(label, ext)
+        form.addRow("Format", self.format_box)
+        controls.addLayout(form)
+
+        self.transparent_box = QCheckBox("Transparent background")
+        self.transparent_box.setChecked(True)
+        self.transparent_box.setToolTip(
+            "Drop the background so the graph sits on whatever the slide "
+            "provides. The axes and labels are light, so it reads on a dark "
+            "background and not on a white one.")
+        self.errorbars_box = QCheckBox("Counting error bars (√n)")
+        self.errorbars_box.setToolTip(
+            "The only error bar a histogram of independent samples honestly "
+            "has: the Poisson counting error on each bin.")
+        self.grid_box = QCheckBox("Grid")
+        self.grid_box.setChecked(True)
+        self.bounds_box = QCheckBox("Filter bounds")
+        self.bounds_box.setChecked(True)
+        self.bounds_box.setToolTip("The shaded band and lines showing the range in use.")
+        self.title_box = QCheckBox("Title")
+        self.title_box.setChecked(True)
+        self.colorbar_box = QCheckBox("Colour bar")
+        self.colorbar_box.setChecked(True)
+        for box in (self.transparent_box, self.errorbars_box, self.grid_box,
+                    self.bounds_box, self.title_box, self.colorbar_box):
+            controls.addWidget(box)
+
+        controls.addStretch(1)
+        self.destination_label = QLabel()
+        self.destination_label.setWordWrap(True)
+        self.destination_label.setProperty("role", "note")
+        controls.addWidget(self.destination_label)
+
+        buttons = QHBoxLayout()
+        save = QPushButton("Save")
+        save.setProperty("primary", True)
+        save.clicked.connect(self._save)
+        cancel = QPushButton("Cancel")
+        cancel.setProperty("secondary", True)
+        cancel.clicked.connect(self.reject)
+        buttons.addWidget(save)
+        buttons.addWidget(cancel)
+        controls.addLayout(buttons)
+        layout.addLayout(controls)
+
+        for widget in (self.width_box, self.height_box, self.font_box):
+            widget.valueChanged.connect(self._refresh)
+        self.shape_box.currentIndexChanged.connect(self._on_shape_changed)
+        self.format_box.currentIndexChanged.connect(self._refresh)
+        for box in (self.transparent_box, self.errorbars_box, self.grid_box,
+                    self.bounds_box, self.title_box, self.colorbar_box):
+            box.stateChanged.connect(self._refresh)
+        self._refresh()
+
+    # -- options ---------------------------------------------------------
+    def options(self):
+        return {
+            "errorbars": self.errorbars_box.isChecked(),
+            "grid": self.grid_box.isChecked(),
+            "bounds": self.bounds_box.isChecked(),
+            "title": self.title_box.isChecked(),
+            "colorbar": self.colorbar_box.isChecked(),
+            "legend": True,
+        }
+
+    def _on_shape_changed(self, _index):
+        ratio = self.shape_box.currentData()
+        if ratio:
+            self.width_box.blockSignals(True)
+            self.width_box.setValue(int(round(self.height_box.value() * ratio)))
+            self.width_box.blockSignals(False)
+        self._refresh()
+
+    def _draw_into(self, figure, width, height, dpi):
+        """Render at a known pixel size, with the font this dialog asked for."""
+        previous = plot_font()
+        set_plot_font_size(self.font_box.value())
+        try:
+            figure.set_dpi(dpi)
+            figure.set_size_inches(width / dpi, height / dpi, forward=False)
+            self._redraw(figure, self.options())
+        finally:
+            set_plot_font_size(previous)
+
+    def _refresh(self):
+        ratio = self.shape_box.currentData()
+        if ratio:
+            self.width_box.blockSignals(True)
+            self.width_box.setValue(int(round(self.height_box.value() * ratio)))
+            self.width_box.blockSignals(False)
+        width, height = self.width_box.value(), self.height_box.value()
+
+        # The preview is the same figure at a smaller scale, so what is on
+        # screen is what gets written - proportions, font size relative to the
+        # frame, and everything the options changed.
+        scale = min(self.preview_canvas.width() / max(width, 1),
+                    self.preview_canvas.height() / max(height, 1), 1.0) or 1.0
+        self._draw_into(self.preview_figure, max(width * scale, 120),
+                        max(height * scale, 90), 100)
+        self.preview_canvas.draw_idle()
+
+        extension = self.format_box.currentData()
+        vector = extension in ("pdf", "svg")
+        self.dpi_box.setEnabled(not vector)
+        self.size_label.setText(
+            f"{width} × {height} px"
+            + ("  ·  vector, resolution-independent" if vector
+               else f"  ·  {self.dpi_box.value()} dpi → "
+                    f"{int(width * self.dpi_box.value() / 100)} × "
+                    f"{int(height * self.dpi_box.value() / 100)} px written"))
+        self.destination_label.setText(f"Saves into {self._folder}")
+
+    def _save(self):
+        extension = self.format_box.currentData()
+        stem = LocalizationTrackingWidget._safe_filename(self._name) or "figure"
+        path = self._folder / f"{stem}.{extension}"
+        i = 2
+        while path.exists():
+            path = self._folder / f"{stem}_{i}.{extension}"
+            i += 1
+
+        dpi = 100 if extension in ("pdf", "svg") else self.dpi_box.value()
+        figure = Figure()
+        try:
+            self._folder.mkdir(parents=True, exist_ok=True)
+            self._draw_into(figure, self.width_box.value(), self.height_box.value(), 100)
+            figure.savefig(path, dpi=dpi, transparent=self.transparent_box.isChecked(),
+                           bbox_inches="tight", pad_inches=0.05, format=extension)
+        except Exception as exc:
+            QMessageBox.warning(self, "Could not save", str(exc))
+            return
+        self._saved_path = path
+        self.accept()
+
+    def saved_path(self):
+        return self._saved_path
+
+
 class LocalizationTrackingWidget(QWidget):
     def __init__(self, viewer: napari.Viewer):
         super().__init__()
@@ -2740,7 +2969,8 @@ class LocalizationTrackingWidget(QWidget):
         counts_tools = QHBoxLayout()
         counts_tools.addStretch(1)
         counts_tools.addWidget(self._png_button(
-            lambda: self.loc_counts_figure, lambda: "detection_counts"))
+            lambda fig, opts: self._draw_loc2d_counts(fig, opts),
+            lambda: "detection_counts"))
         det_layout.addRow("", counts_tools)
         layout.addWidget(det_group)
 
@@ -3815,7 +4045,8 @@ class LocalizationTrackingWidget(QWidget):
         msd_tools = QHBoxLayout()
         msd_tools.addStretch(1)
         msd_tools.addWidget(self._png_button(
-            lambda: self.msd_figure, lambda: "msd_validation"))
+            lambda fig, opts: self._draw_msd_validation(fig, opts),
+            lambda: "msd_validation"))
         msd_sub_layout.addLayout(msd_tools)
         self.msd_sigma_label = QLabel()
         self.msd_sigma_label.setWordWrap(True)
@@ -4615,12 +4846,15 @@ class LocalizationTrackingWidget(QWidget):
         self._update_loc2d_candidate_overlay()
         self._draw_loc2d_counts()
 
-    def _draw_loc2d_counts(self):
-        figure = self.loc_counts_figure
+    def _draw_loc2d_counts(self, figure=None, opts=None):
+        export = figure is not None
+        opts = opts or {}
+        figure = figure if export else self.loc_counts_figure
         figure.clear()
         if self._loc2d_counts is None or len(self._loc2d_counts) == 0:
             figure.patch.set_facecolor(PANEL_BG)
-            self.loc_counts_canvas.draw_idle()
+            if not export:
+                self.loc_counts_canvas.draw_idle()
             return
         ax = figure.add_subplot(111)
         ax.plot(np.arange(len(self._loc2d_counts)), self._loc2d_counts,
@@ -4629,9 +4863,13 @@ class LocalizationTrackingWidget(QWidget):
                         color=ACCENT, alpha=0.18)
         ax.set_xlabel("Frame")
         ax.set_ylabel("Detections")
-        style_axes(figure, ax, title="Detections vs frame")
+        style_axes(figure, ax,
+                   title="Detections vs frame" if opts.get("title", True) else None)
+        if not opts.get("grid", True):
+            ax.grid(False)
         figure.tight_layout()
-        self.loc_counts_canvas.draw_idle()
+        if not export:
+            self.loc_counts_canvas.draw_idle()
 
     def _update_loc2d_candidate_overlay(self):
         """Show the detection candidates as squares, on every frame at once.
@@ -7261,7 +7499,7 @@ class LocalizationTrackingWidget(QWidget):
         )
         toolbar.addWidget(log_box)
         toolbar.addWidget(self._png_button(
-            lambda k=key: self._metric_hist_widgets[k]["figure"],
+            lambda fig, opts, k=key: self._draw_metric_histogram(k, fig, opts),
             lambda k=key: f"{k}_histogram"))
         toolbar.addStretch(1)
         layout.addLayout(toolbar)
@@ -7349,23 +7587,29 @@ class LocalizationTrackingWidget(QWidget):
         view_min_box.blockSignals(False)
         view_max_box.blockSignals(False)
 
-    def _draw_metric_histogram(self, key):
+    def _draw_metric_histogram(self, key, figure=None, opts=None):
+        """Draw one dynamics histogram. See `_draw_histogram` for `figure`."""
         state = self._metric_hist_widgets.get(key)
         if not state:
             return
-        figure = state["figure"]
+        export = figure is not None
+        opts = opts or {}
+        figure = figure if export else state["figure"]
         figure.clear()
-        state["lower_line"] = None
-        state["upper_line"] = None
-        state["span"] = None
+        if not export:
+            state["lower_line"] = None
+            state["upper_line"] = None
+            state["span"] = None
         cache = self._metric_cache(key)
         if not cache:
-            state["canvas"].draw_idle()
+            if not export:
+                state["canvas"].draw_idle()
             return
         values = np.asarray(list(cache.values()), float)
         values = values[np.isfinite(values)]
         if not len(values):
-            state["canvas"].draw_idle()
+            if not export:
+                state["canvas"].draw_idle()
             return
 
         ax = figure.add_subplot(111)
@@ -7397,9 +7641,13 @@ class LocalizationTrackingWidget(QWidget):
             norm = LogNorm(vmin=lo, vmax=hi) if use_log else Normalize(vmin=lo, vmax=hi)
             colors = matplotlib.colormaps[cmap_name](norm(np.clip(centers, lo, hi)))
             ax.bar(edges[:-1], counts, width=np.diff(edges), color=colors, align="edge", edgecolor="none")
-            sm = cm.ScalarMappable(norm=norm, cmap=cmap_name)
-            sm.set_array([])
-            figure.colorbar(sm, ax=ax)
+            if opts.get("errorbars"):
+                ax.errorbar(centers, counts, yerr=np.sqrt(np.maximum(counts, 0)),
+                            fmt="none", ecolor=INK, elinewidth=0.9, capsize=2, alpha=0.7)
+            if opts.get("colorbar", True):
+                sm = cm.ScalarMappable(norm=norm, cmap=cmap_name)
+                sm.set_array([])
+                figure.colorbar(sm, ax=ax)
         if use_log:
             ax.set_xscale("log")
         if view_hi <= view_lo:
@@ -7411,14 +7659,23 @@ class LocalizationTrackingWidget(QWidget):
 
         min_box, max_box = self._metric_bound_boxes[key]
         lower, upper = min_box.value(), max_box.value()
-        state["span"] = ax.axvspan(lower, upper, color=LAVENDER, alpha=0.15, zorder=0)
-        state["lower_line"] = ax.axvline(lower, color=LAVENDER, linewidth=1.5)
-        state["upper_line"] = ax.axvline(upper, color=LAVENDER, linewidth=1.5)
+        if opts.get("bounds", True):
+            span = ax.axvspan(lower, upper, color=LAVENDER, alpha=0.15, zorder=0)
+            low_line = ax.axvline(lower, color=LAVENDER, linewidth=1.5)
+            high_line = ax.axvline(upper, color=LAVENDER, linewidth=1.5)
+        else:
+            span = low_line = high_line = None
 
         ax.set_xlabel(METRIC_AXIS_LABELS.get(key, METRIC_LABELS[key]))
         ax.set_ylabel("Count")
-        style_axes(figure, ax, title=f"{len(values)} trajectories")
+        style_axes(figure, ax,
+                   title=f"{len(values)} trajectories" if opts.get("title", True) else None)
+        if not opts.get("grid", True):
+            ax.grid(False)
         figure.tight_layout()
+        if export:
+            return
+        state["span"], state["lower_line"], state["upper_line"] = span, low_line, high_line
         state["canvas"].draw_idle()
 
     def _sync_metric_hist_lines(self, key):
@@ -7552,13 +7809,16 @@ class LocalizationTrackingWidget(QWidget):
                 "biases the intercept low, so read it off the slow end.")
         self.msd_sigma_label.setText(" ".join(text))
 
-    def _draw_msd_validation(self):
-        figure = self.msd_figure
+    def _draw_msd_validation(self, figure=None, opts=None):
+        export = figure is not None
+        opts = opts or {}
+        figure = figure if export else self.msd_figure
         figure.clear()
         ax = figure.add_subplot(111)
         if not self._track_msd_cache:
             style_axes(figure, ax)
-            self.msd_canvas.draw_idle()
+            if not export:
+                self.msd_canvas.draw_idle()
             return
 
         items = sorted(
@@ -7602,12 +7862,17 @@ class LocalizationTrackingWidget(QWidget):
         ax.set_xlabel("Lag time (s)")
         ax.set_ylabel("MSD (µm²)")
         style_axes(figure, ax,
-                   title=f"MSD fit validation ({n_sample} example trajectories)")
-        legend = ax.legend(fontsize=plot_font(-2), loc="upper left", ncol=2,
-                           facecolor=PLOT_BG, edgecolor=PANEL_LINE, labelcolor=INK)
-        legend.get_frame().set_alpha(0.85)
+                   title=(f"MSD fit validation ({n_sample} example trajectories)"
+                          if opts.get("title", True) else None))
+        if opts.get("legend", True):
+            legend = ax.legend(fontsize=plot_font(-2), loc="upper left", ncol=2,
+                               facecolor=PLOT_BG, edgecolor=PANEL_LINE, labelcolor=INK)
+            legend.get_frame().set_alpha(0.85)
+        if not opts.get("grid", True):
+            ax.grid(False)
         figure.tight_layout()
-        self.msd_canvas.draw_idle()
+        if not export:
+            self.msd_canvas.draw_idle()
 
     # ------------------------------------------------------------------
     # Export: plots + data + metadata
@@ -8288,7 +8553,7 @@ class LocalizationTrackingWidget(QWidget):
         toolbar = QHBoxLayout()
         toolbar.addWidget(QLabel("Size:"))
         toolbar.addWidget(self._png_button(
-            lambda c=column: self._hist_widgets[c]["figure"],
+            lambda fig, opts, c=column: self._draw_histogram(c, fig, opts),
             lambda c=column: f"{c}_histogram"))
         toolbar.addStretch(1)
         layout.addLayout(toolbar)
@@ -8407,22 +8672,27 @@ class LocalizationTrackingWidget(QWidget):
         self.log(f"Saved {path.name} to {path.parent}")
         return path
 
-    def _png_button(self, figure_getter, name_getter):
-        """The small button that does it, for one graph."""
-        button = QPushButton("PNG")
+    def _png_button(self, redraw, name_getter):
+        """The small button that opens the export dialog, for one graph."""
+        button = QPushButton("Save…")
         button.setProperty("secondary", True)
-        button.setMaximumWidth(44)
+        button.setMaximumWidth(60)
         button.setToolTip(
-            "Save this graph as a PNG with a transparent background, for "
-            "dropping straight onto a dark slide.\n\n"
-            "The axes and labels are light, so they read on a dark background "
-            "and not on a white one. Written at twice screen resolution into a "
-            "dated 'figures' folder beside the data - one click, no dialog, and "
-            "they collect together."
+            "Open this graph in the export window: choose its size, shape, font "
+            "and format against a live preview, add counting error bars, and "
+            "drop the background for a slide.\n\n"
+            "Nothing chosen there changes the plot on screen - the panel is "
+            "sized for reading, a figure is sized for wherever it is going."
         )
         button.clicked.connect(
-            lambda _c=False: self._save_figure_png(figure_getter(), name_getter()))
+            lambda _c=False: self._open_figure_export(redraw, name_getter()))
         return button
+
+    def _open_figure_export(self, redraw, name):
+        dialog = FigureExportDialog(self, redraw, name, self._figure_save_dir())
+        if dialog.exec() and dialog.saved_path() is not None:
+            path = dialog.saved_path()
+            self.log(f"Saved {path.name} to {path.parent}")
 
     def _build_plot_size_row(self):
         """One size for every plot in the plugin.
@@ -8531,10 +8801,19 @@ class LocalizationTrackingWidget(QWidget):
         if hasattr(self, "loc_counts_figure"):
             self._draw_loc2d_counts()
 
-    def _draw_histogram(self, column):
+    def _draw_histogram(self, column, figure=None, opts=None):
+        """Draw one filter histogram.
+
+        With `figure` given it draws into that instead of the panel's canvas and
+        leaves the interactive state alone - which is what the export preview
+        uses, so that choosing a size for a slide cannot disturb the plot being
+        read on screen.
+        """
         state = self._hist_widgets.get(column)
         if not state or self.df is None:
             return
+        export = figure is not None
+        opts = opts or {}
         values = self.df[column].dropna().to_numpy(float)
         # Two distributions, not one: everything loaded, and what survives the
         # filters. Drawing only the first meant tightening a bound on sigma
@@ -8545,7 +8824,7 @@ class LocalizationTrackingWidget(QWidget):
             kept = self.df_filtered[column].dropna().to_numpy(float)
         else:
             kept = values if self.df_filtered is None else values[:0]
-        figure = state["figure"]
+        figure = figure if export else state["figure"]
         figure.clear()
         figure.patch.set_facecolor(FILTER_HIST_BG)
         ax = figure.add_subplot(111)
@@ -8575,12 +8854,26 @@ class LocalizationTrackingWidget(QWidget):
         if len(all_shown):
             ax.hist(all_shown, bins=bins, color=FILTER_HIST_BAR, alpha=0.28)
         if len(kept_shown):
-            ax.hist(kept_shown, bins=bins, color=FILTER_HIST_BAR, alpha=0.95)
+            counts, _edges, _patches = ax.hist(
+                kept_shown, bins=bins, color=FILTER_HIST_BAR, alpha=0.95)
+            if opts.get("errorbars"):
+                # Counting error on a histogram bin is sqrt(n) - the only error
+                # bar a histogram of independent samples honestly has.
+                centres = 0.5 * (bins[:-1] + bins[1:])
+                ax.errorbar(centres, counts, yerr=np.sqrt(np.maximum(counts, 0)),
+                            fmt="none", ecolor=FILTER_HIST_FG, elinewidth=0.9,
+                            capsize=2, alpha=0.7)
+        if opts.get("grid"):
+            ax.grid(color=FILTER_HIST_FG, alpha=0.18, linewidth=0.5)
+            ax.set_axisbelow(True)
+        if opts.get("ylabel", export):
+            ax.set_ylabel("Count", fontsize=plot_font(), color=FILTER_HIST_FG)
 
         title = column
         if len(kept) != len(values):
             title = f"{column}   {len(kept)} / {len(values)}"
-        ax.set_title(title, fontsize=plot_font(1), color=FILTER_HIST_FG)
+        if opts.get("title", True):
+            ax.set_title(title, fontsize=plot_font(1), color=FILTER_HIST_FG)
         ax.tick_params(labelsize=plot_font(-1), colors=FILTER_HIST_FG)
         for spine in ax.spines.values():
             spine.set_color(FILTER_HIST_FG)
@@ -8588,14 +8881,17 @@ class LocalizationTrackingWidget(QWidget):
         figure.tight_layout()
 
         lower_box, upper_box = self.filter_controls.get(column, (None, None))
-        state["lower_line"] = None
-        state["upper_line"] = None
-        state["span"] = None
-        if lower_box is not None and upper_box is not None:
+        show_bounds = opts.get("bounds", True)
+        if lower_box is not None and upper_box is not None and show_bounds:
             lower, upper = lower_box.value(), upper_box.value()
-            state["span"] = ax.axvspan(lower, upper, color=FILTER_HIST_LINE, alpha=0.18, zorder=0)
-            state["lower_line"] = ax.axvline(lower, color=FILTER_HIST_LINE, linewidth=1.5)
-            state["upper_line"] = ax.axvline(upper, color=FILTER_HIST_LINE, linewidth=1.5)
+            span = ax.axvspan(lower, upper, color=FILTER_HIST_LINE, alpha=0.18, zorder=0)
+            low_line = ax.axvline(lower, color=FILTER_HIST_LINE, linewidth=1.5)
+            high_line = ax.axvline(upper, color=FILTER_HIST_LINE, linewidth=1.5)
+        else:
+            span = low_line = high_line = None
+        if export:
+            return                      # the panel's drag handles stay as they were
+        state["span"], state["lower_line"], state["upper_line"] = span, low_line, high_line
         state["canvas"].draw_idle()
 
     def _sync_histogram_lines(self, column):
