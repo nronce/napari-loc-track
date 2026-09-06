@@ -3681,6 +3681,20 @@ class LocalizationTrackingWidget(QWidget):
 
     def _build_trajectory_section(self, layout):
 
+        # Above the plots it sizes rather than below them: it used to sit in the
+        # colouring group at the bottom of this tab, under eight histograms, and
+        # a control you have to scroll past everything it affects to reach is a
+        # control nobody finds.
+        size_group = QGroupBox("Plot size (every graph in the plugin)")
+        size_group.setToolTip(
+            "Sizes the histograms below, the filter histograms and the MSD "
+            "validation plot together, so a set of figures for a talk can be "
+            "made the right shape once rather than one at a time."
+        )
+        size_layout = QVBoxLayout(size_group)
+        size_layout.addLayout(self._build_plot_size_row())
+        layout.addWidget(size_group)
+
         # --- D (requires a linear MSD fit) ---
         d_group = QGroupBox("Diffusion coefficient D (needs a linear MSD fit)")
         d_layout = QVBoxLayout(d_group)
@@ -3921,9 +3935,6 @@ class LocalizationTrackingWidget(QWidget):
         apply_row.addWidget(self.apply_display_button)
         apply_row.addStretch(1)
         color_layout.addRow("", apply_row)
-        # Applies to every plot in the plugin, not only the ones on this tab -
-        # the filter histograms and the MSD validation follow it too.
-        color_layout.addRow("Plot size", self._build_plot_size_row())
         layout.addWidget(color_group)
 
         self.color_trajectories_box.stateChanged.connect(self._on_color_mode_changed)

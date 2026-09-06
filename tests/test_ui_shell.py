@@ -399,3 +399,26 @@ def test_the_size_is_saved_with_the_run():
     restored.apply_settings(metadata)
     assert restored.plot_width_box.value() == 1200
     assert restored.plot_height_box.value() == 400
+
+
+def test_the_plot_size_control_sits_above_the_plots_it_sizes():
+    """It used to be in the colouring group at the bottom of the Track tab,
+    under eight histograms - a control you have to scroll past everything it
+    affects to reach is a control nobody finds."""
+    widget = _loaded(200)
+    track = [i for i in range(widget.tabs.count())
+             if widget.tabs.tabText(i) == "Track"][0]
+    titles = [g.title() for g in
+              widget.tabs.widget(track).findChildren(widget_mod.QGroupBox)]
+    size_at = next(i for i, t in enumerate(titles) if t.startswith("Plot size"))
+    first_plot = next(i for i, t in enumerate(titles) if "Diffusion coefficient" in t)
+    assert size_at < first_plot
+
+
+def test_it_reaches_the_dynamics_histograms_and_the_msd_plot():
+    widget = _loaded(200)
+    widget._set_plot_size(900, 320)
+    for key in ("D", "motion", "pstatic", "dmin"):
+        canvas = widget._metric_hist_widgets[key]["canvas"]
+        assert (canvas.width(), canvas.height()) == (900, 320)
+    assert (widget.msd_canvas.width(), widget.msd_canvas.height()) == (900, 320)
