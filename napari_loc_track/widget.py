@@ -110,9 +110,29 @@ PLOT_WIDTH_FILL = 0
 # blurred rectangle once a projector has stretched it across a wall.
 FIGURE_SAVE_DPI = 200
 PLOT_SIZE_LIMITS = (240, 3000, 120, 1600)   # min/max width, min/max height
-HIST_HEIGHT_STEP = 50
-MIN_HIST_HEIGHT = 110
-MAX_HIST_HEIGHT = 600
+# Shapes offered, as width/height. Setting a ratio and a height beats setting
+# two pixel counts: the shape is what makes a set of figures look like a set,
+# and it is the thing you actually have an opinion about.
+PLOT_ASPECTS = (
+    ("Fill the panel", None),
+    ("16:9", 16 / 9), ("3:2", 3 / 2), ("4:3", 4 / 3), ("1:1", 1.0),
+    ("5:2 (wide)", 5 / 2), ("2:3 (tall)", 2 / 3),
+)
+# Point size of the body text in every plot. Ticks sit one point below it, axis
+# titles one above, a legend two below - the relationships the plots were drawn
+# with, kept so that changing one number rescales the lot without any of them
+# colliding.
+_PLOT_FONT_PT = 8.0
+
+
+def set_plot_font_size(points):
+    global _PLOT_FONT_PT
+    _PLOT_FONT_PT = float(points)
+
+
+def plot_font(delta=0.0):
+    """A point size relative to the current plot font."""
+    return max(_PLOT_FONT_PT + delta, 3.0)
 
 FILTER_HIST_BG = PANEL_BG
 FILTER_HIST_BAR = ACCENT
@@ -410,27 +430,27 @@ def style_axes(figure, axes, *, title=None):
     passed = list(np.atleast_1d(axes).ravel())
     extra = [ax for ax in figure.axes if ax not in passed]
     for ax in extra:
-        ax.tick_params(labelsize=7, colors=INK)
+        ax.tick_params(labelsize=plot_font(-1), colors=INK)
         for spine in ax.spines.values():
             spine.set_color(PANEL_LINE)
         for label in (ax.xaxis.label, ax.yaxis.label):
             label.set_color(INK)
-            label.set_fontsize(8)
+            label.set_fontsize(plot_font())
 
     for ax in np.atleast_1d(axes).ravel():
         ax.set_facecolor(PLOT_BG)
         # Light enough to read off a projected slide, where the dimmed grey that
         # suits a screen at arm's length disappears entirely.
-        ax.tick_params(labelsize=7, colors=INK)
+        ax.tick_params(labelsize=plot_font(-1), colors=INK)
         ax.grid(color=PANEL_LINE, linestyle="-", linewidth=0.5, alpha=0.6)
         ax.set_axisbelow(True)
         for spine in ax.spines.values():
             spine.set_color(PANEL_LINE)
         for label in (ax.xaxis.label, ax.yaxis.label):
             label.set_color(INK)
-            label.set_fontsize(8)
+            label.set_fontsize(plot_font())
         if title is not None:
-            ax.set_title(title, fontsize=9, color=INK)
+            ax.set_title(title, fontsize=plot_font(1), color=INK)
 
 
 _napari_colormap_cache = {}
@@ -561,8 +581,9 @@ SETTINGS_SPEC = (
     (("rendering", "active_track_line_width"), "line_width_box"),
     (("rendering", "static_track_line_width"), "all_tracks_line_width_box"),
     (("rendering", "persist_completed_tracks"), "persist_tracks_box"),
-    (("rendering", "plot_width_px"), "plot_width_box"),
+    (("rendering", "plot_aspect"), "plot_aspect_box"),
     (("rendering", "plot_height_px"), "plot_height_box"),
+    (("rendering", "plot_font_pt"), "plot_font_box"),
 )
 
 
@@ -7568,7 +7589,7 @@ class LocalizationTrackingWidget(QWidget):
         ax.set_ylabel("MSD (µm²)")
         style_axes(figure, ax,
                    title=f"MSD fit validation ({n_sample} example trajectories)")
-        legend = ax.legend(fontsize=6, loc="upper left", ncol=2,
+        legend = ax.legend(fontsize=plot_font(-2), loc="upper left", ncol=2,
                            facecolor=PLOT_BG, edgecolor=PANEL_LINE, labelcolor=INK)
         legend.get_frame().set_alpha(0.85)
         figure.tight_layout()
@@ -7918,8 +7939,9 @@ class LocalizationTrackingWidget(QWidget):
                 "active_track_line_width": self.line_width_box.value(),
                 "static_track_line_width": self.all_tracks_line_width_box.value(),
                 "persist_completed_tracks": self.persist_tracks_box.isChecked(),
-                "plot_width_px": self.plot_width_box.value(),
+                "plot_aspect": self.plot_aspect_box.currentText(),
                 "plot_height_px": self.plot_height_box.value(),
+                "plot_font_pt": self.plot_font_box.value(),
             },
             "filter_histogram_display": {
                 col: {
@@ -8251,15 +8273,6 @@ class LocalizationTrackingWidget(QWidget):
 
         toolbar = QHBoxLayout()
         toolbar.addWidget(QLabel("Size:"))
-        shrink_btn = QToolButton()
-        shrink_btn.setText("-")
-        grow_btn = QToolButton()
-        grow_btn.setText("+")
-        reset_btn = QToolButton()
-        reset_btn.setText("Reset")
-        toolbar.addWidget(shrink_btn)
-        toolbar.addWidget(grow_btn)
-        toolbar.addWidget(reset_btn)
         toolbar.addWidget(self._png_button(
             lambda c=column: self._hist_widgets[c]["figure"],
             lambda c=column: f"{c}_histogram"))
@@ -8315,9 +8328,6 @@ class LocalizationTrackingWidget(QWidget):
         }
         self._hist_widgets[column] = state
 
-        shrink_btn.clicked.connect(lambda checked=False, c=column: self._resize_histogram(c, -HIST_HEIGHT_STEP))
-        grow_btn.clicked.connect(lambda checked=False, c=column: self._resize_histogram(c, HIST_HEIGHT_STEP))
-        reset_btn.clicked.connect(lambda checked=False, c=column: self._resize_histogram(c, None))
         bins_box.valueChanged.connect(lambda _v, c=column: self._draw_histogram(c))
         view_min_box.valueChanged.connect(lambda _v, c=column: self._draw_histogram(c))
         view_max_box.valueChanged.connect(lambda _v, c=column: self._draw_histogram(c))
@@ -8397,21 +8407,18 @@ class LocalizationTrackingWidget(QWidget):
         saved with the run.
         """
         row = QHBoxLayout()
-        min_w, max_w, min_h, max_h = PLOT_SIZE_LIMITS
-        row.addWidget(QLabel("Width"))
-        self.plot_width_box = QSpinBox()
-        self.plot_width_box.setRange(0, max_w)
-        self.plot_width_box.setValue(PLOT_WIDTH_FILL)
-        self.plot_width_box.setSpecialValueText("fill")   # 0 reads as "fill"
-        self.plot_width_box.setSingleStep(20)
-        self.plot_width_box.setSuffix(" px")
-        self.plot_width_box.setToolTip(
-            f"Width of every plot. Leave at 'fill' and they stretch to the panel "
-            f"as they always have; set a width ({min_w}-{max_w} px) and they hold "
-            "it, so a screenshot has the aspect ratio you chose rather than the "
-            "one the window happened to have."
+        _min_w, _max_w, min_h, max_h = PLOT_SIZE_LIMITS
+        row.addWidget(QLabel("Shape"))
+        self.plot_aspect_box = QComboBox()
+        for label, ratio in PLOT_ASPECTS:
+            self.plot_aspect_box.addItem(label, ratio)
+        self.plot_aspect_box.setToolTip(
+            "The shape of every plot. 'Fill the panel' is the default and lets "
+            "them stretch as the window does; any ratio pins the width to the "
+            "height, so a graph saved for a slide is the shape you chose rather "
+            "than the one the window happened to have."
         )
-        row.addWidget(self.plot_width_box)
+        row.addWidget(self.plot_aspect_box)
         row.addWidget(QLabel("Height"))
         self.plot_height_box = QSpinBox()
         self.plot_height_box.setRange(min_h, max_h)
@@ -8419,29 +8426,48 @@ class LocalizationTrackingWidget(QWidget):
         self.plot_height_box.setSingleStep(20)
         self.plot_height_box.setSuffix(" px")
         row.addWidget(self.plot_height_box)
-        for preset, width, height in (("16:9", 960, 540), ("4:3", 800, 600),
-                                      ("Wide", 1200, 400)):
-            button = QPushButton(preset)
-            button.setProperty("secondary", True)
-            button.setToolTip(f"{width} x {height} px")
-            button.clicked.connect(
-                lambda _c, w=width, h=height: self._set_plot_size(w, h))
-            row.addWidget(button)
+        row.addWidget(QLabel("Font"))
+        self.plot_font_box = QSpinBox()
+        self.plot_font_box.setRange(4, 40)
+        self.plot_font_box.setValue(int(plot_font()))
+        self.plot_font_box.setSuffix(" pt")
+        self.plot_font_box.setToolTip(
+            "Body text in every plot. Ticks sit a point below it and titles a "
+            "point above, so one number rescales the lot.\n\n"
+            "The default suits a side panel; a graph going on a slide usually "
+            "wants 12-16."
+        )
+        row.addWidget(self.plot_font_box)
         row.addStretch(1)
-        self.plot_width_box.valueChanged.connect(lambda _v: self._apply_plot_size())
+        self.plot_aspect_box.currentIndexChanged.connect(lambda _i: self._apply_plot_size())
         self.plot_height_box.valueChanged.connect(lambda _v: self._apply_plot_size())
+        self.plot_font_box.valueChanged.connect(lambda _v: self._apply_plot_size())
         return row
 
+    def _plot_pixel_size(self):
+        """(width, height) in pixels; width 0 when the panel decides it."""
+        height = int(self.plot_height_box.value())
+        ratio = self.plot_aspect_box.currentData()
+        width = int(round(height * float(ratio))) if ratio else PLOT_WIDTH_FILL
+        return width, height
+
     def _set_plot_size(self, width, height):
-        self.plot_width_box.setValue(int(width))
+        """Set the height, and the nearest offered shape to width/height."""
         self.plot_height_box.setValue(int(height))
+        if not width:
+            self.plot_aspect_box.setCurrentIndex(0)
+            return
+        wanted = float(width) / max(int(height), 1)
+        best = min(range(1, self.plot_aspect_box.count()),
+                   key=lambda i: abs(self.plot_aspect_box.itemData(i) - wanted))
+        self.plot_aspect_box.setCurrentIndex(best)
 
     def _apply_plot_size(self):
-        """Push the chosen size onto every canvas, and redraw so labels re-fit."""
-        if not hasattr(self, "plot_width_box"):
+        """Push the chosen shape and font onto every canvas, and redraw."""
+        if not hasattr(self, "plot_aspect_box"):
             return  # a canvas built before the control that sizes them
-        width = int(self.plot_width_box.value())
-        height = int(self.plot_height_box.value())
+        set_plot_font_size(self.plot_font_box.value())
+        width, height = self._plot_pixel_size()
         for canvas in list(self._plot_canvases):
             try:
                 if width > PLOT_WIDTH_FILL:
@@ -8465,22 +8491,19 @@ class LocalizationTrackingWidget(QWidget):
             except RuntimeError:
                 # Its Qt object is gone - a filter panel rebuilt for new data.
                 self._plot_canvases.remove(canvas)
-        # The per-column height buttons work from this as their baseline, so a
-        # plot nudged by hand starts from the size everything else is now.
-        for state in self._hist_widgets.values():
-            state["height"] = height
+        # The font sizes are applied while the contents are drawn, so the
+        # artists already on a canvas keep the old ones until it is redrawn.
+        self._redraw_all_plots()
 
-    def _resize_histogram(self, column, delta):
-        state = self._hist_widgets.get(column)
-        if not state:
-            return
-        if delta is None:
-            state["height"] = DEFAULT_HIST_HEIGHT
-        else:
-            state["height"] = int(np.clip(state["height"] + delta, MIN_HIST_HEIGHT, MAX_HIST_HEIGHT))
-        state["canvas"].setMinimumHeight(state["height"])
-        state["canvas"].setMaximumHeight(state["height"])
-        state["canvas"].updateGeometry()
+    def _redraw_all_plots(self):
+        for column in list(self._hist_widgets):
+            self._draw_histogram(column)
+        for key in list(self._metric_hist_widgets):
+            self._draw_metric_histogram(key)
+        if hasattr(self, "msd_figure"):
+            self._draw_msd_validation()
+        if hasattr(self, "loc_counts_figure"):
+            self._draw_loc2d_counts()
 
     def _draw_histogram(self, column):
         state = self._hist_widgets.get(column)
@@ -8531,8 +8554,8 @@ class LocalizationTrackingWidget(QWidget):
         title = column
         if len(kept) != len(values):
             title = f"{column}   {len(kept)} / {len(values)}"
-        ax.set_title(title, fontsize=9, color=FILTER_HIST_FG)
-        ax.tick_params(labelsize=7, colors=FILTER_HIST_FG)
+        ax.set_title(title, fontsize=plot_font(1), color=FILTER_HIST_FG)
+        ax.tick_params(labelsize=plot_font(-1), colors=FILTER_HIST_FG)
         for spine in ax.spines.values():
             spine.set_color(FILTER_HIST_FG)
             spine.set_alpha(0.4)

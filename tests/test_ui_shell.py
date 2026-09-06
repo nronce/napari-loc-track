@@ -352,26 +352,35 @@ def _canvas_sizes(widget):
                    for c in widget._plot_canvases})
 
 
+def _expected(widget):
+    """The pixel size the current shape and height imply."""
+    return [widget._plot_pixel_size()]
+
+
 def test_one_control_sizes_every_plot():
     widget = _loaded(400)
     assert len(widget._plot_canvases) > 5      # filters, metrics, MSD, counts
-    widget._set_plot_size(960, 540)
-    assert _canvas_sizes(widget) == [(960, 540)]
+    widget.plot_height_box.setValue(540)
+    widget.plot_aspect_box.setCurrentText("16:9")
+    assert _canvas_sizes(widget) == _expected(widget)
 
 
 def test_the_default_leaves_them_filling_the_panel():
-    """Width 0 reads as 'fill' and is what these did before there was a control."""
+    """'Fill the panel' is the default and is what these did before there was a
+    control at all."""
     widget = _loaded(400)
-    assert widget.plot_width_box.value() == widget_mod.PLOT_WIDTH_FILL
+    assert widget.plot_aspect_box.currentData() is None
     assert all(width == 0 for width, _height in _canvas_sizes(widget))
 
 
 def test_going_back_to_fill_releases_the_pinned_width():
     widget = _loaded(400)
-    widget._set_plot_size(1200, 400)
-    assert _canvas_sizes(widget) == [(1200, 400)]
+    widget.plot_height_box.setValue(400)
+    widget.plot_aspect_box.setCurrentText("5:2 (wide)")
+    assert _canvas_sizes(widget) == _expected(widget)
+    assert _canvas_sizes(widget)[0][0] > 0             # actually pinned
 
-    widget.plot_width_box.setValue(widget_mod.PLOT_WIDTH_FILL)
+    widget.plot_aspect_box.setCurrentIndex(0)          # back to filling
     assert _canvas_sizes(widget) == [(0, 400)]
 
 
@@ -379,25 +388,29 @@ def test_the_size_survives_loading_new_data():
     """The filter histograms are rebuilt per table, so the size has to be
     re-applied or it silently reverts on the next load."""
     widget = _loaded(400)
-    widget._set_plot_size(1200, 400)
+    widget.plot_height_box.setValue(400)
+    widget.plot_aspect_box.setCurrentText("16:9")
+    expected = _expected(widget)
     before = len(widget._plot_canvases)
 
     widget._ingest_localization_dataframe(_locs(300), "reloaded", True)
-    assert _canvas_sizes(widget) == [(1200, 400)]
+    assert _canvas_sizes(widget) == expected
     # and the dead canvases went with the panel that held them
     assert len(widget._plot_canvases) == before
 
 
 def test_the_size_is_saved_with_the_run():
     widget = _loaded(200)
-    widget._set_plot_size(1200, 400)
+    widget.plot_height_box.setValue(400)
+    widget.plot_aspect_box.setCurrentText("16:9")
     metadata = widget._collect_metadata(None)
-    assert metadata["rendering"]["plot_width_px"] == 1200
+    assert metadata["rendering"]["plot_aspect"] == widget.plot_aspect_box.currentText()
     assert metadata["rendering"]["plot_height_px"] == 400
+    assert metadata["rendering"]["plot_font_pt"] == widget.plot_font_box.value()
 
     restored = make_widget()
     restored.apply_settings(metadata)
-    assert restored.plot_width_box.value() == 1200
+    assert restored.plot_aspect_box.currentText() == widget.plot_aspect_box.currentText()
     assert restored.plot_height_box.value() == 400
 
 
@@ -417,8 +430,53 @@ def test_the_plot_size_control_sits_above_the_plots_it_sizes():
 
 def test_it_reaches_the_dynamics_histograms_and_the_msd_plot():
     widget = _loaded(200)
-    widget._set_plot_size(900, 320)
+    widget.plot_height_box.setValue(320)
+    widget.plot_aspect_box.setCurrentText("3:2")
+    expected = widget._plot_pixel_size()
     for key in ("D", "motion", "pstatic", "dmin"):
         canvas = widget._metric_hist_widgets[key]["canvas"]
-        assert (canvas.width(), canvas.height()) == (900, 320)
-    assert (widget.msd_canvas.width(), widget.msd_canvas.height()) == (900, 320)
+        assert (canvas.width(), canvas.height()) == expected
+    assert (widget.msd_canvas.width(), widget.msd_canvas.height()) == expected
+
+
+def test_the_shape_is_a_ratio_not_two_pixel_counts():
+    """Setting a ratio and a height beats setting two pixel counts: the shape is
+    what makes a set of figures look like a set, and it is the thing you have an
+    opinion about."""
+    widget = _loaded(200)
+    widget.plot_height_box.setValue(360)
+    widget.plot_aspect_box.setCurrentText("16:9")
+    for width, height in _canvas_sizes(widget):
+        assert height == 360
+        assert width == round(360 * 16 / 9)
+
+
+def test_the_font_size_reaches_the_plots():
+    widget = _loaded(200)
+    before = widget._hist_widgets["sigma [nm]"]["figure"].axes[0].title.get_fontsize()
+
+    widget.plot_font_box.setValue(16)
+    axes = widget._hist_widgets["sigma [nm]"]["figure"].axes[0]
+    assert axes.title.get_fontsize() == 17          # titles sit a point above
+    assert before < 17
+
+
+def test_the_font_scales_every_family_of_plot_together():
+    """The filter histograms carry their column as a title, the metric ones
+    carry it as an axis label - both have to follow."""
+    widget = _loaded(200)
+    widget.tracks = pd.DataFrame({"particle": [0] * 4, "frame": [0, 1, 2, 3],
+                                  "x": [0.0, 1, 2, 3], "y": [0.0, 0, 0, 0]})
+    widget._track_distance_cache = {0: 1.0}
+    widget.plot_font_box.setValue(14)
+
+    assert widget._hist_widgets["sigma [nm]"]["figure"].axes[0].title.get_fontsize() == 15
+    assert widget._metric_hist_widgets["distance"]["figure"].axes[0]         .xaxis.label.get_fontsize() == 14
+
+
+def test_a_font_size_is_saved_with_the_run():
+    widget = _loaded(200)
+    widget.plot_font_box.setValue(13)
+    restored = make_widget()
+    restored.apply_settings(widget._collect_metadata(None))
+    assert restored.plot_font_box.value() == 13
