@@ -1666,6 +1666,8 @@ class LocalizationTrackingWidget(QWidget):
         self._session_restore = None
         self._session_save_worker_ref = None
         self._autosave_worker_ref = None
+        # Where this render session's files go; cleared by each new render.
+        self._render_save_folder = None
         # Every matplotlib canvas, so one size control can reach all of them
         # without each having to be found by name.
         self._plot_canvases = []
@@ -5145,6 +5147,9 @@ class LocalizationTrackingWidget(QWidget):
         info["output_shape"] = [int(v) for v in result.shape]
         info["total_signal"] = float(result.sum())
 
+        # A new render is a new run, so its outputs go somewhere new rather than
+        # joining the previous one's folder.
+        self._render_save_folder = None
         if kind == "image":
             self._render_image, self._render_image_info = result, info
             self.render_save_image_button.setEnabled(True)
@@ -5342,22 +5347,40 @@ class LocalizationTrackingWidget(QWidget):
             return
 
     # --- saving a render ------------------------------------------------
+    def _render_save_dir(self):
+        """A dated folder for this render session's outputs.
+
+        Renders used to default to whatever folder the loaded table sat in,
+        which scattered gigabyte TIFFs across analysis/ and analysis/data/ among
+        the tables and plots. They belong in a run folder like everything else.
+
+        The folder is remembered for the session so an image and a movie saved
+        from the same render land together, and a fresh render starts a new one.
+        """
+        folder = getattr(self, "_render_save_folder", None)
+        if folder is None or not folder.exists():
+            folder = self._make_analysis_folder(self._analysis_base_dir(), "render")
+            self._render_save_folder = folder
+        return folder
+
     def _default_render_path(self, kind, info, force_format=None):
-        csv_path = self.csv_edit.text().strip()
-        image_path = self.image_edit.text().strip()
-        if csv_path:
-            base = Path(csv_path)
-        elif image_path:
-            base = Path(image_path)
-        else:
-            base = Path.cwd() / "localizations"
-        suffix = "movie" if kind == "movie" else "render"
+        # Named for the layer it is, not for the table it came from: the mode,
+        # the oversampling and every other setting are in the metadata written
+        # beside it, and putting them in the filename produced things like
+        # localizations_filtered_movie_gaussian_global_os10_data.tif.
+        base = self._render_layer_name("image").strip() or RENDER_LAYER_NAME
+        parts = [base]
+        if kind == "movie":
+            parts.append("movie")
         box = self.render_movie_format_box if kind == "movie" else self.render_image_format_box
-        # The format is in the name so a composite and the data it came from
-        # never overwrite each other.
         save_format = force_format or box.currentData()
-        name = f"{base.stem}_{suffix}_{info['mode']}_os{info['oversampling']}_{save_format}.tif"
-        return str(base.parent / name)
+        # Named only when it is not the usual one for that kind - a still is
+        # normally the quantitative render and a movie the light one - so a
+        # composite or a data movie cannot overwrite what it came from, without
+        # every ordinary file carrying a redundant word.
+        if save_format and save_format != ("display" if kind == "movie" else "data"):
+            parts.append(save_format)
+        return str(self._render_save_dir() / ("_".join(parts) + ".tif"))
 
     def save_render_image(self):
         self._save_render("image", self._render_image, self._render_image_info)
@@ -5858,6 +5881,13 @@ class LocalizationTrackingWidget(QWidget):
             "TIFF files (*.tif *.tiff)",
         )
         if not path:
+            return
+        try:
+            # Created here rather than when the dialog opened, so cancelling out
+            # of it does not leave an empty run folder behind.
+            Path(path).parent.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            self.log(f"Could not create {Path(path).parent}: {exc}")
             return
         try:
             spec, extra = self._save_spec(kind, info, force_format)
@@ -7566,19 +7596,39 @@ class LocalizationTrackingWidget(QWidget):
             return
         self.log(f"Export complete: {result}")
 
-    def _analysis_base_dir(self):
-        """The folder results go beside: the data's, not the plugin's.
+    @staticmethod
+    def _dataset_dir(path):
+        """The dataset folder a file belongs to, climbing out of any analysis tree.
 
-        Prefer the localization CSV's folder, then the image's - an in-app fit
-        has no CSV - and only fall back to the working directory if neither is
-        known, so results never end up outside the dataset they describe.
+        A previous run's table lives at <dataset>/analysis/<run>/data/locs.csv,
+        and taking its parent as the place to put results is how
+        analysis/data/analysis/<run>/data/ came about: every reload of an
+        exported table nested one level deeper. Results belong beside the raw
+        data, wherever within the tree the file that was opened happens to sit.
+        """
+        folder = Path(path).parent
+        parts = folder.parts
+        lowered = [part.lower() for part in parts]
+        if ANALYSIS_ROOT in lowered:
+            # The outermost analysis/ - a nested one is itself the symptom.
+            cut = lowered.index(ANALYSIS_ROOT)
+            if cut > 0:
+                return Path(*parts[:cut])
+        return folder
+
+    def _analysis_base_dir(self):
+        """The folder results go beside: the dataset's, not the plugin's.
+
+        Prefer the localization CSV, then the image - an in-app fit has no CSV -
+        and only fall back to the working directory if neither is known, so
+        results never end up outside the dataset they describe.
         """
         csv_path = self.csv_edit.text().strip()
         image_path = self.image_edit.text().strip()
         if csv_path:
-            return Path(csv_path).parent
+            return self._dataset_dir(csv_path)
         if image_path:
-            return Path(image_path).parent
+            return self._dataset_dir(image_path)
         return Path.cwd()
 
     def _make_analysis_folder(self, base_dir, kind="export"):

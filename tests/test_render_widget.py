@@ -9,6 +9,7 @@ the settings that produced it and land on the same grid as the raw stack.
 """
 import json
 import os
+import pathlib
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
@@ -528,14 +529,22 @@ def test_a_saved_render_carries_the_settings_that_produced_it(tmp_path):
         assert embedded["smlm_rendering"]["mode"] == "histogram"
 
 
-def test_the_suggested_file_name_describes_the_render(tmp_path):
+def test_the_suggested_file_name_is_the_layer_in_a_dated_run_folder(tmp_path):
+    """Named for the layer it is, not for the table it came from. The mode and
+    oversampling are in the metadata written beside it - spelling them into the
+    filename produced things like
+    localizations_filtered_movie_gaussian_global_os10_data.tif, in whichever
+    folder the loaded table happened to sit."""
     widget = _loaded(1000, image_shape=(FRAMES, 48, 80))
     widget.csv_edit.setText(str(tmp_path / "locs.csv"))
     widget.render_oversampling_box.setValue(4)
     widget.render_mode_box.setCurrentIndex(widget.render_mode_box.findData("histogram"))
     _render_image(widget)
-    suggested = widget._default_render_path("image", widget._render_image_info)
-    assert os.path.basename(suggested) == "locs_render_histogram_os4_data.tif"
+    suggested = pathlib.Path(widget._default_render_path("image", widget._render_image_info))
+
+    assert suggested.name == "smlm_render.tif"
+    assert suggested.parent.name.endswith("_render")
+    assert suggested.parent.parent == tmp_path / widget_mod.ANALYSIS_ROOT
 
 
 def _saved(widget, kind, image, tmp_path, name="out.tif"):

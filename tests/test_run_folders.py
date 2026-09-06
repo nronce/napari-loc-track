@@ -257,3 +257,100 @@ def test_a_broken_analysis_folder_does_not_stop_the_search(tmp_path):
     assert widget._find_companion_file(
         tmp_path / "stack.tif", widget_mod.LOCS_FILENAME_PATTERNS,
         widget_mod.LOCS_ANALYSIS_SUBPATH) is None
+
+
+# --- where results go, and what they are called --------------------------------
+#
+# Left to itself this produced analysis/data/analysis/<run>/data/localizations.csv
+# and scattered gigabyte TIFFs called
+# localizations_filtered_movie_gaussian_global_os10_data.tif across two folders.
+# Both come from the same mistake: taking the folder of whatever file happened
+# to be open as the place to put things.
+
+
+@pytest.mark.parametrize("relative", [
+    "stack.ome.tif",
+    "analysis/data/localizations_filtered.csv",
+    "analysis/2026-09-05_190813_localization/data/localizations.csv",
+    "analysis/data/analysis/2026-09-05_222411_localization/data/localizations.csv",
+])
+def test_results_climb_back_out_to_the_dataset(tmp_path, relative):
+    """Reloading an exported table used to nest one analysis/ inside the last."""
+    widget = make_widget()
+    assert widget._dataset_dir(tmp_path / relative) == tmp_path
+
+
+def test_reloading_an_exported_table_does_not_nest(tmp_path):
+    widget = _widget_in(tmp_path)
+    widget.csv_edit.setText(str(
+        tmp_path / "analysis" / "2026-09-05_190813_localization"
+        / "data" / "localizations.csv"))
+    assert widget._analysis_base_dir() == tmp_path
+
+    folder = widget._make_analysis_folder(widget._analysis_base_dir(), "localization")
+    assert folder.parent == tmp_path / widget_mod.ANALYSIS_ROOT
+    assert "analysis" not in folder.relative_to(tmp_path).parts[1:]
+
+
+def test_a_dataset_folder_that_merely_contains_the_word_is_left_alone(tmp_path):
+    """Only a folder actually called analysis is climbed out of."""
+    widget = make_widget()
+    deep = tmp_path / "reanalysis_2026" / "stack.tif"
+    assert widget._dataset_dir(deep) == tmp_path / "reanalysis_2026"
+
+
+# --- renders --------------------------------------------------------------------
+
+
+def _render_ready(tmp_path):
+    widget = _widget_in(tmp_path)
+    widget.csv_edit.setText("")
+    return widget, {"mode": "gaussian_global", "oversampling": 10}
+
+
+def test_renders_go_to_a_dated_run_folder(tmp_path):
+    widget, info = _render_ready(tmp_path)
+    path = Path(widget._default_render_path("image", info))
+    assert path.parent.parent == tmp_path / widget_mod.ANALYSIS_ROOT
+    assert path.parent.name.endswith("_render")
+
+
+def test_a_render_is_named_for_the_layer_it_is(tmp_path):
+    widget, info = _render_ready(tmp_path)
+    assert Path(widget._default_render_path("image", info)).name == "smlm_render.tif"
+    assert Path(widget._default_render_path("movie", info)).name == "smlm_render_movie.tif"
+
+    widget.render_layer_name_edit.setText("smlm_render_immobile")
+    assert Path(widget._default_render_path("image", info)).name \
+        == "smlm_render_immobile.tif"
+
+
+def test_a_composite_cannot_overwrite_the_render_it_came_from(tmp_path):
+    widget, info = _render_ready(tmp_path)
+    plain = Path(widget._default_render_path("image", info)).name
+    composite = Path(widget._default_render_path("image", info, "composite")).name
+    assert plain != composite
+    assert composite == "smlm_render_composite.tif"
+
+
+def test_an_image_and_a_movie_from_one_render_land_together(tmp_path):
+    widget, info = _render_ready(tmp_path)
+    image = Path(widget._default_render_path("image", info))
+    movie = Path(widget._default_render_path("movie", info))
+    assert image.parent == movie.parent
+
+
+def test_a_new_render_starts_a_new_folder(tmp_path):
+    widget, info = _render_ready(tmp_path)
+    first = Path(widget._default_render_path("image", info)).parent
+    first.mkdir(parents=True, exist_ok=True)      # as saving would
+
+    widget._render_save_folder = None             # what finishing a render does
+    second = Path(widget._default_render_path("image", info)).parent
+    assert second != first
+
+
+def test_the_folder_is_not_created_until_something_is_saved(tmp_path):
+    widget, info = _render_ready(tmp_path)
+    Path(widget._default_render_path("image", info))
+    assert not (tmp_path / widget_mod.ANALYSIS_ROOT).exists()
