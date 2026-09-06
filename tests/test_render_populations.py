@@ -357,3 +357,110 @@ def test_the_stride_survives_a_round_trip():
     restored = _widget()
     restored.apply_settings(metadata)
     assert restored.movie_stride_box.value() == 7
+
+
+# --- turning the image on its way out ------------------------------------------
+#
+# napari's own layer.rotate turns a layer in the canvas but never the pixels, so
+# it cannot reach a saved file. This does the turning on the array itself, after
+# the crop and before the annotations - a rotated scale bar would be unreadable,
+# and rotating first would leave the crop box pointing at the wrong region.
+
+
+def _marked(shape=(6, 8)):
+    """An L with a distinct corner mark, so orientation is unambiguous."""
+    img = np.zeros(shape, np.float32)
+    img[1, 1:5] = 1.0
+    img[1:4, 1] = 1.0
+    img[0, shape[1] - 1] = 9.0          # top-right
+    return img
+
+
+def test_no_rotation_hands_back_the_same_array():
+    img = _marked()
+    assert widget_mod.rotate_save_array(img, 0, False) is img
+    assert widget_mod.rotate_save_array(img, 360, False) is img
+
+
+@pytest.mark.parametrize("degrees", [90, 180, 270])
+def test_a_quarter_turn_is_exact(degrees):
+    """Pixels permuted, never resampled - a float32 reconstruction still holds
+    the localization counts it held before."""
+    img = _marked()
+    turned = widget_mod.rotate_save_array(img, degrees, False)
+    assert turned.sum() == img.sum()
+    assert sorted(turned.ravel().tolist()) == sorted(img.ravel().tolist())
+
+
+def test_a_quarter_turn_swaps_the_axes():
+    img = _marked((6, 8))
+    assert widget_mod.rotate_save_array(img, 90, False).shape == (8, 6)
+    assert widget_mod.rotate_save_array(img, 180, False).shape == (6, 8)
+
+
+def test_turning_twice_by_ninety_is_turning_once_by_one_eighty():
+    img = _marked()
+    once = widget_mod.rotate_save_array(img, 180, False)
+    twice = widget_mod.rotate_save_array(
+        widget_mod.rotate_save_array(img, 90, False), 90, False)
+    assert np.array_equal(once, twice)
+
+
+def test_the_direction_is_counter_clockwise():
+    """Matching napari's own layer.rotate, so the two agree."""
+    img = _marked((6, 8))
+    turned = widget_mod.rotate_save_array(img, 90, False)
+    assert tuple(np.argwhere(turned == 9.0)[0]) == (0, 0)   # top-right -> top-left
+
+
+def test_a_movie_turns_every_frame_and_keeps_its_time_axis():
+    movie = np.stack([_marked()] * 3)
+    turned = widget_mod.rotate_save_array(movie, 90, True)
+    assert turned.shape == (3, 8, 6)
+
+
+def test_a_composite_keeps_its_colour_axis():
+    rgb = np.zeros((6, 8, 3), np.uint8)
+    rgb[1, 1:5] = 255
+    assert widget_mod.rotate_save_array(rgb, 90, False).shape == (8, 6, 3)
+
+
+def test_an_arbitrary_angle_resamples_and_says_so():
+    """Interpolation samples the rotated grid rather than redistributing what
+    was there, so the total is not conserved. The label has to admit it."""
+    img = _marked()
+    turned = widget_mod.rotate_save_array(img, 37.0, False)
+    assert turned.shape != img.shape          # reshaped to fit
+    assert turned.sum() != img.sum()          # and not count-preserving
+
+    widget = _widget()
+    widget.render_rotate_box.setValue(37.0)
+    assert "not conserved" in widget.render_rotate_label.text()
+    widget.render_rotate_box.setValue(90.0)
+    assert "exact" in widget.render_rotate_label.text()
+    widget.render_rotate_box.setValue(0.0)
+    assert "not rotated" in widget.render_rotate_label.text()
+
+
+def test_the_angle_is_recorded_with_the_saved_image():
+    widget = _widget()
+    widget._render_image = np.zeros((8, 8), np.float32)
+    widget._render_image_info = {"field_of_view_camera_px": [8, 8],
+                                 "origin_camera_px": [0.0, 0.0], "oversampling": 1,
+                                 "mode_label": "Gaussian"}
+    widget.render_rotate_box.setValue(90.0)
+    _spec, extra = widget._save_spec("image", widget._render_image_info)
+    assert extra["rotated_degrees"] == pytest.approx(90.0)
+    assert extra["rotation_is_exact"] is True
+
+    widget.render_rotate_box.setValue(37.0)
+    _spec, extra = widget._save_spec("image", widget._render_image_info)
+    assert extra["rotation_is_exact"] is False
+
+
+def test_the_angle_survives_a_round_trip():
+    widget = _widget()
+    widget.render_rotate_box.setValue(270.0)
+    restored = _widget()
+    restored.apply_settings(widget._collect_metadata(None))
+    assert restored.render_rotate_box.value() == pytest.approx(270.0)

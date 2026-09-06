@@ -523,6 +523,7 @@ SETTINGS_SPEC = (
     (("smlm_rendering", "image_save_format"), "render_image_format_box"),
     (("smlm_rendering", "movie_save_format"), "render_movie_format_box"),
     (("smlm_rendering", "movie_save_stride"), "movie_stride_box"),
+    (("smlm_rendering", "rotate_degrees"), "render_rotate_box"),
     (("smlm_rendering", "composite", "reconstruction"), "render_composite_base_box"),
     (("smlm_rendering", "composite", "localizations"), "render_composite_locs_box"),
     (("smlm_rendering", "composite", "localization_color"), "render_locs_color_box"),
@@ -1117,6 +1118,37 @@ def _render_worker(kind, options, cancel=None):
         yield 0.0  # restarting on the CPU; the progress bar starts over
 
 
+def rotate_save_array(image, degrees, is_movie):
+    """Turn the image before it is written. Returns it unchanged at 0.
+
+    Quarter turns go through np.rot90 and are exact: pixels are permuted, never
+    resampled, so a float32 reconstruction still holds the localization counts
+    it held before.
+
+    Any other angle resamples, and resampling does not conserve the total -
+    interpolation samples the rotated grid rather than redistributing what was
+    there, so a sparse reconstruction can lose a large fraction of its counts
+    (a one-pixel line loses about 40%). That is acceptable for a figure and
+    wrong for anything measured off the file afterwards, so which of the two
+    happened is written into the metadata beside the image.
+
+    Positive is counter-clockwise as the image is displayed, matching napari's
+    own `layer.rotate`.
+    """
+    degrees = float(degrees) % 360.0
+    if degrees == 0.0:
+        return image
+    # A movie carries frames on the first axis, and a composite carries colour
+    # on the last, so the image plane is the middle pair either way.
+    axes = (1, 2) if is_movie else (0, 1)
+    if degrees % 90.0 == 0.0:
+        return np.ascontiguousarray(np.rot90(image, k=int(degrees // 90), axes=axes))
+    from scipy.ndimage import rotate as _ndrotate
+
+    return _ndrotate(image, degrees, axes=axes, reshape=True, order=1,
+                     mode="constant", cval=0).astype(image.dtype, copy=False)
+
+
 def build_save_array(image, spec):
     """Turn a finished render into the array that gets written.
 
@@ -1143,6 +1175,11 @@ def build_save_array(image, spec):
             crop_box, shape=options["shape"], origin=options["origin"],
             oversampling=options["oversampling"])
         result = smlm_render.crop(result, rows, cols, is_movie=spec["is_movie"])
+
+    # Before the annotations and after the crop: a rotated scale bar or clock
+    # would be unreadable, and rotating first would leave the crop box pointing
+    # at the wrong part of the image.
+    result = rotate_save_array(result, spec.get("rotate_degrees", 0), spec["is_movie"])
 
     # Annotations are burned into the pixels, so they go on after the crop -
     # otherwise cropping could cut one in half or throw it away entirely. They
@@ -3377,6 +3414,49 @@ class LocalizationTrackingWidget(QWidget):
         range_row.addWidget(self.movie_stride_box)
         range_row.addStretch(1)
         buttons_layout.addLayout(range_row)
+
+        # Orienting a structure for a figure. napari's own layer.rotate turns a
+        # layer in the canvas but not the pixels, so it cannot reach a saved
+        # file; this does the turning on the array on its way out.
+        rotate_row = QHBoxLayout()
+        rotate_row.addWidget(QLabel("Rotate"))
+        self.render_rotate_box = QDoubleSpinBox()
+        self.render_rotate_box.setRange(0.0, 359.9)
+        self.render_rotate_box.setDecimals(1)
+        self.render_rotate_box.setValue(0.0)
+        self.render_rotate_box.setSuffix("°")
+        self.render_rotate_box.setSingleStep(90.0)
+        self.render_rotate_box.setToolTip(
+            "Turn the image counter-clockwise before writing it, for orienting "
+            "a structure in a figure.\n\n"
+            "Quarter turns are exact - the pixels are permuted, never resampled, "
+            "so a float32 reconstruction still holds the localization counts it "
+            "held before.\n\n"
+            "Any other angle resamples the image, which does not conserve the "
+            "total: a sparse reconstruction can lose a large fraction of its "
+            "counts, because interpolation samples the rotated grid rather than "
+            "redistributing what was there. Use it for a figure, never for "
+            "anything measured off the file afterwards. Which of the two "
+            "happened is recorded in the metadata beside the image.\n\n"
+            "The scale bar and clock are drawn after the turn, so they stay "
+            "upright and readable."
+        )
+        rotate_row.addWidget(self.render_rotate_box)
+        for label, angle in (("0°", 0.0), ("90°", 90.0), ("180°", 180.0), ("270°", 270.0)):
+            button = QPushButton(label)
+            button.setProperty("secondary", True)
+            button.setMaximumWidth(52)
+            button.setToolTip("Exact - no interpolation.")
+            button.clicked.connect(
+                lambda _c, a=angle: self.render_rotate_box.setValue(a))
+            rotate_row.addWidget(button)
+        self.render_rotate_label = QLabel()
+        self.render_rotate_label.setProperty("role", "note")
+        rotate_row.addWidget(self.render_rotate_label, 1)
+        buttons_layout.addLayout(rotate_row)
+        self.render_rotate_box.valueChanged.connect(
+            lambda _v: self._update_rotate_label())
+        self._update_rotate_label()
 
         self.movie_save_label = QLabel("Render a movie first.")
         self.movie_save_label.setWordWrap(True)
@@ -5925,6 +6005,10 @@ class LocalizationTrackingWidget(QWidget):
         save_format = force_format or box.currentData()
         label = RENDER_SAVE_FORMATS[save_format] if force_format else box.currentText()
         extra = {"save_format": save_format, "save_format_label": label}
+        rotation = float(self.render_rotate_box.value()) % 360.0
+        if rotation:
+            extra["rotated_degrees"] = rotation
+            extra["rotation_is_exact"] = rotation % 90.0 == 0.0
         is_movie = kind == "movie"
         spec = {
             "format": save_format,
@@ -5945,6 +6029,7 @@ class LocalizationTrackingWidget(QWidget):
             "crop": None,
             "timestamp": None,
             "scalebar": None,
+            "rotate_degrees": float(self.render_rotate_box.value()),
         }
 
         crop_box = self._render_crop_bounds()
@@ -6110,6 +6195,19 @@ class LocalizationTrackingWidget(QWidget):
                         (np.asarray(smlm_render.OVERLAY_COLORS[name]) - target) ** 2)),
                 )
         return "cyan"
+
+    def _update_rotate_label(self):
+        """Say whether this angle preserves the numbers or only the picture."""
+        if not hasattr(self, "render_rotate_label"):
+            return
+        degrees = float(self.render_rotate_box.value()) % 360.0
+        if degrees == 0.0:
+            self.render_rotate_label.setText("not rotated")
+        elif degrees % 90.0 == 0.0:
+            self.render_rotate_label.setText("exact — pixels permuted, counts preserved")
+        else:
+            self.render_rotate_label.setText(
+                "resampled — counts are not conserved, figures only")
 
     def _movie_save_slice(self, n_frames):
         """(first, last, stride) for saving, clamped to what was rendered."""
@@ -8123,6 +8221,7 @@ class LocalizationTrackingWidget(QWidget):
                 "image_save_format": self.render_image_format_box.currentData(),
                 "movie_save_format": self.render_movie_format_box.currentData(),
                 "movie_save_stride": self.movie_stride_box.value(),
+                "rotate_degrees": self.render_rotate_box.value(),
                 "composite": {
                     "reconstruction": self.render_composite_base_box.isChecked(),
                     "localizations": self.render_composite_locs_box.isChecked(),
