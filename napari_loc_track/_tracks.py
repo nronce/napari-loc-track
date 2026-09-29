@@ -70,6 +70,86 @@ def filter_tracks_by_length(tracks, min_length):
     return tracks[tracks["particle"].isin(counts.index[counts >= min_length])]
 
 
+# How many localizations a row of a merged table stands for: 1 for one left as
+# it was, N for a trajectory's N localizations merged into one.
+MERGED_COUNT_COLUMN = "n_merged"
+
+
+def merge_trajectories(table, particles, merge_ids, *, x_col, y_col, frame_col,
+                       sigma_col=None, sum_columns=(), fallback_sigma=None):
+    """Replace the localizations of each trajectory in `merge_ids` by one.
+
+    An emitter that never moved, seen N times, has been measured N times at the
+    same place: the precision-weighted mean of its positions is a single
+    localization N-fold better determined than any of them, and drawing it once
+    at that precision is what a static structure actually looks like, where
+    drawing all N scatters it over their error.
+
+    The merged precision is sqrt(1 / sum(1/sigma_i^2)), inflated by the square
+    root of the trajectory's reduced chi-square whenever that exceeds one (the
+    Birge ratio): if the positions scatter more than their stated precisions
+    allow - motion too small to have been detected, or precisions that are
+    optimistic - the merged point is drawn as wide as the scatter says, never
+    narrower than the data supports.
+
+    `particles` gives each row's trajectory (-1 for none). Photon counts and any
+    other `sum_columns` add up; the frame is the first the molecule was seen in,
+    with the last in `frame_last`; every other numeric column is averaged.
+    Returns a new table: the untouched rows first, then one row per merged
+    trajectory, with MERGED_COUNT_COLUMN and `particle` columns added.
+    """
+    import numpy as np
+
+    particles = np.asarray(particles)
+    ids = np.fromiter((int(p) for p in merge_ids), np.int64) if merge_ids else np.zeros(0, np.int64)
+    inside = np.isin(particles, ids) & (particles >= 0)
+
+    rest = table[~inside].copy()
+    rest[MERGED_COUNT_COLUMN] = 1
+    rest["particle"] = particles[~inside]
+    rest["frame_last"] = rest[frame_col]
+    if not inside.any():
+        return rest
+
+    sub = table[inside]
+    codes, uniques = pd.factorize(particles[inside])
+    count = np.bincount(codes)
+    x = sub[x_col].to_numpy(dtype=float)
+    y = sub[y_col].to_numpy(dtype=float)
+    if sigma_col and sigma_col in sub.columns:
+        sigma = sub[sigma_col].to_numpy(dtype=float)
+    else:
+        sigma = np.full(len(sub), np.nan)
+    valid = np.isfinite(sigma) & (sigma > 0)
+    stand_in = (fallback_sigma if fallback_sigma and fallback_sigma > 0
+                else (float(np.median(sigma[valid])) if valid.any() else 1.0))
+    sigma = np.where(valid, sigma, stand_in)
+
+    weight = 1.0 / sigma ** 2
+    total = np.bincount(codes, weight)
+    x_bar = np.bincount(codes, weight * x) / total
+    y_bar = np.bincount(codes, weight * y) / total
+    scatter = np.bincount(codes, weight * ((x - x_bar[codes]) ** 2 + (y - y_bar[codes]) ** 2))
+    dof = 2 * (count - 1)
+    ratio = np.divide(scatter, dof, out=np.ones_like(scatter), where=dof > 0)
+    merged_sigma = np.sqrt(1.0 / total) * np.sqrt(np.maximum(ratio, 1.0))
+
+    grouped = sub.groupby(codes, sort=True)
+    merged = grouped.mean(numeric_only=True)
+    merged[x_col] = x_bar
+    merged[y_col] = y_bar
+    merged[frame_col] = grouped[frame_col].min().to_numpy()
+    merged["frame_last"] = grouped[frame_col].max().to_numpy()
+    for column in sum_columns:
+        if column and column in sub.columns:
+            merged[column] = grouped[column].sum().to_numpy()
+    if sigma_col and sigma_col in sub.columns:
+        merged[sigma_col] = merged_sigma
+    merged[MERGED_COUNT_COLUMN] = count
+    merged["particle"] = uniques
+    return pd.concat([rest, merged.reset_index(drop=True)], ignore_index=True)
+
+
 def iter_particle_batches(tracks, batch_size):
     """Split a trajectory table into batches of whole trajectories.
 

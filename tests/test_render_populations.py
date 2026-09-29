@@ -113,6 +113,46 @@ def test_each_layer_holds_only_its_own_population():
         assert rendered == pytest.approx(expected, rel=0.05)
 
 
+@pytest.mark.parametrize("which", ["immobile", "mobile"])
+def test_a_population_renders_at_each_molecules_own_precision(which):
+    """The widths are read from the same rows as the positions.
+
+    They used to come from every filtered localization, so a population render
+    at per-localization precision was refused (one width per localization of
+    the whole table, for a subset of the positions) - and a movie, which sorts
+    by frame before it draws, quietly drew each molecule at another's width.
+    """
+    widget = _analysed()
+    widget.render_mode_box.setCurrentIndex(widget.render_mode_box.findData("gaussian_local"))
+    widget.render_sigma_column_box.setCurrentText("uncertainty [nm]")
+    widget._set_render_population(which)
+    shown = widget._displayed_localizations()
+    assert 0 < len(shown) < len(widget.df_filtered)
+
+    options, _info, _layer = widget._render_inputs()
+    assert len(options["sigma_px"]) == len(options["x_px"]) == len(shown)
+    low, high = widget.render_sigma_min_box.value(), widget.render_sigma_max_box.value()
+    np.testing.assert_allclose(
+        options["sigma_px"],
+        np.clip(shown["uncertainty [nm]"].to_numpy(), low, high) / PIXEL_NM)
+
+    _render(widget)
+    rendered = float(np.asarray(widget.viewer.layers[f"smlm_render_{which}"].data).sum())
+    assert rendered == pytest.approx(len(shown), rel=0.05)
+
+
+def test_a_population_weighted_by_photons_counts_only_its_own_photons():
+    widget = _analysed()
+    widget.render_photons_box.setChecked(True)
+    widget._set_render_population("immobile")
+    shown = widget._displayed_localizations()
+    options, _info, _layer = widget._render_inputs()
+    assert len(options["weights"]) == len(options["x_px"]) == len(shown)
+    _render(widget)
+    rendered = float(np.asarray(widget.viewer.layers["smlm_render_immobile"].data).sum())
+    assert rendered == pytest.approx(900.0 * len(shown), rel=0.05)
+
+
 def test_the_layers_blend_so_they_can_be_read_together():
     widget = _analysed()
     widget._set_render_population("immobile")
@@ -203,6 +243,97 @@ def test_a_preset_keeps_a_detection_floor_qualifier():
     widget._set_render_population("all")
     assert not widget.dmin_filter_box.isChecked()
     assert widget._passing_particles() is None
+
+
+def _classes(widget):
+    classes = {}
+    for which in ("immobile", "undetermined", "mobile"):
+        widget._set_render_population(which)
+        classes[which] = set(widget._displayed_tracks()["particle"])
+    return classes
+
+
+def test_the_three_classes_split_every_trajectory_once():
+    widget = _analysed()
+    classes = _classes(widget)
+    everything = set(widget.tracks["particle"])
+    assert set.union(*classes.values()) == everything
+    assert not (classes["immobile"] & classes["undetermined"])
+    assert not (classes["immobile"] & classes["mobile"])
+    assert not (classes["undetermined"] & classes["mobile"])
+
+
+def test_static_trajectories_that_could_not_have_failed_are_undetermined():
+    """Passing the static test is not the same as having been able to fail it:
+    asked to certify motion slower than these trajectories could ever show,
+    every static one is undetermined, and none is called immobile - or mobile."""
+    widget = _analysed()
+    static = _classes(widget)["immobile"]
+    widget.immobile_min_points_box.setValue(N_POINTS + 1)
+    classes = _classes(widget)
+    assert classes["immobile"] == set()
+    assert static <= classes["undetermined"]
+    assert not (static & classes["mobile"])
+
+
+def test_a_two_point_trajectory_is_undetermined():
+    widget = _analysed(n_static=4, n_mobile=4)
+    widget.tracks = widget.tracks[widget.tracks["frame"] < 2].reset_index(drop=True)
+    widget._track_pstatic_cache = None
+    widget._track_dmin_cache = None
+    widget._invalidate_track_filter()
+    widget._start_fit_free_metrics_worker()
+    assert _pump_until(lambda: widget._track_pstatic_cache is not None)
+    classes = widget._trajectory_classes()
+    assert "immobile" not in classes.values()
+    # a two-point static trajectory is static, and certifies nothing
+    assert all(classes[pid] == "undetermined" for pid in range(4)
+               if widget._track_pstatic_cache.get(pid, 0) >= 0.05)
+
+
+def test_the_undetermined_preset_renders_into_a_layer_of_its_own():
+    widget = _analysed()
+    widget.immobile_min_points_box.setValue(N_POINTS + 1)
+    widget._set_render_population("undetermined")
+    assert widget.render_layer_name_edit.text() == "smlm_render_undetermined"
+    assert widget._passing_particles() == widget._class_members("undetermined")
+    assert "Undetermined" in widget.render_population_label.text()
+
+
+def test_moving_the_line_moves_the_selection():
+    widget = _analysed()
+    widget._set_render_population("immobile")
+    before = len(widget._passing_particles())
+    widget.immobile_min_points_box.setValue(N_POINTS + 1)
+    widget._apply_track_filter()      # what the debounce timer runs
+    assert before > 0 and widget._passing_particles() == set()
+
+
+def test_ticking_a_range_by_hand_drops_the_class():
+    """A class chosen by a button would otherwise go on narrowing a selection
+    the user has since made for themselves."""
+    widget = _analysed()
+    widget._set_render_population("undetermined")
+    widget.distance_filter_box.setChecked(True)
+    assert widget._population_class is None
+
+
+def test_the_counts_of_the_three_classes_are_shown():
+    widget = _analysed()
+    widget._update_render_population_label()
+    text = widget.population_counts_label.text()
+    for name in ("Immobile", "Undetermined", "Mobile"):
+        assert name in text
+
+
+def test_the_class_survives_a_settings_round_trip():
+    widget = _analysed()
+    widget._set_render_population("undetermined")
+    metadata = widget._collect_metadata(None)
+    assert metadata["smlm_rendering"]["population"] == "undetermined"
+    other = _analysed()
+    other.apply_settings(metadata)
+    assert other._population_class == "undetermined"
 
 
 def test_the_panel_says_what_the_next_render_will_contain():

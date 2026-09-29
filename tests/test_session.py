@@ -395,3 +395,36 @@ def test_a_session_with_no_data_files_restores_the_settings_alone(tmp_path):
     restored = _restored(session_path)
     assert restored.pixel_size_box.value() == pytest.approx(108.3)
     assert restored.search_box.value() == pytest.approx(1234.0)
+
+
+def _render_into(widget, name, mode="histogram", kind="image"):
+    widget.render_layer_name_edit.setText(name)
+    widget.render_mode_box.setCurrentIndex(widget.render_mode_box.findData(mode))
+    (widget.render_smlm_movie if kind == "movie" else widget.render_smlm_image)()
+    assert _pump_until(lambda: widget._render_worker_ref is None), "the render never finished"
+
+
+def test_every_render_comes_back_as_it_was_made_and_as_it_looked(tmp_path):
+    widget = _analysed(tmp_path)
+    widget.render_oversampling_box.setValue(2)
+    _render_into(widget, "first")
+    _render_into(widget, "second", mode="scatter")
+    _render_into(widget, "third", kind="movie")
+    first = widget.viewer.layers["first"]
+    first.colormap = "green"
+    first.contrast_limits = (0.0, 3.0)
+    widget.viewer.layers["second"].visible = False
+    sums = {name: float(np.asarray(widget.viewer.layers[name].data).sum())
+            for name in ("first", "second", "third_movie")}
+    session_path = _saved(widget, tmp_path / "run1")
+
+    restored = _restored(session_path)
+    for name, total in sums.items():
+        assert name in restored.viewer.layers, f"{name} was not rendered again"
+        assert float(np.asarray(restored.viewer.layers[name].data).sum()) == pytest.approx(total)
+    back = restored.viewer.layers["first"]
+    assert back.colormap.name == "green"
+    assert tuple(back.contrast_limits) == pytest.approx((0.0, 3.0))
+    assert not restored.viewer.layers["second"].visible
+    # and the settings end as they were saved, not as the last replay left them
+    assert restored.render_layer_name_edit.text() == "third"

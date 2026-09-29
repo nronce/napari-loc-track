@@ -13,6 +13,8 @@
 !/tests/**
 !/benchmarks/
 !/benchmarks/**
+!/docs/
+!/docs/**
 !/napari_loc_track/
 !/napari_loc_track/**
 

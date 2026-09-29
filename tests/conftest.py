@@ -1,13 +1,21 @@
 """Shared helpers for the localization tests."""
 import importlib.util
+import os
 import sys
+import tempfile
 import types
 from pathlib import Path
+
+# The plugin keeps a person's saved defaults in their config folder. No test may
+# read someone's real defaults - they would change what a fresh widget starts
+# with - or overwrite them, so every run gets a folder of its own.
+os.environ["NAPARI_LOC_TRACK_CONFIG_DIR"] = tempfile.mkdtemp(prefix="loctrack-config-")
 
 PKG_DIR = Path(__file__).resolve().parents[1] / "napari_loc_track"
 _MODULE_NAME = "napari_loc_track._localize2d"
 _RENDER_MODULE_NAME = "napari_loc_track._render"
 _ACQMETA_MODULE_NAME = "napari_loc_track._acqmeta"
+_DRIFT_MODULE_NAME = "napari_loc_track._drift"
 
 
 def _load_standalone(dotted_name, filename):
@@ -54,3 +62,17 @@ def load_acqmeta():
     the one function that needs it, so the parsing can be tested anywhere.
     """
     return _load_standalone(_ACQMETA_MODULE_NAME, "_acqmeta.py")
+
+
+def load_deform():
+    """Load `_deform` (numpy/scipy only) without the napari/Qt stack."""
+    return _load_standalone("napari_loc_track._deform", "_deform.py")
+
+
+def load_drift():
+    """Load `_drift` without importing the napari/Qt/trackpy stack.
+
+    Reading the drift and frame-time records, smoothing and shifting are
+    numpy/pandas/scipy only, so the arithmetic is testable anywhere.
+    """
+    return _load_standalone(_DRIFT_MODULE_NAME, "_drift.py")

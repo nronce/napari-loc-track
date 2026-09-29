@@ -100,7 +100,7 @@ def test_the_header_names_the_loaded_image():
 def test_the_tabs_are_the_pipeline_and_nothing_else():
     widget = make_widget()
     assert [widget.tabs.tabText(i) for i in range(widget.tabs.count())] == [
-        "Load", "Localize", "Filter", "Track", "Render", "Save"]
+        "Load", "Localize", "Drift", "Filter", "Track", "Render", "Images", "Save"]
 
 
 def test_export_is_offered_once():
@@ -217,9 +217,10 @@ def test_the_render_save_buttons_live_on_the_save_tab_only():
     # be reopened rather than a render written out, so it sits beside Load data.
     saves = [b for b in widget.findChildren(widget_mod.QPushButton)
              if b.text().startswith("Save ") and "session" not in b.text()]
-    # image, movie, and a composite still - a composite *movie* is screen-
-    # recorded from the viewer now, not written frame by frame from here
-    assert len(saves) == 3
+    # image, movie, a composite still, and the view as displayed - a
+    # composite *movie* is screen-recorded from the viewer now, not written
+    # frame by frame from here
+    assert len(saves) == 4
     for button in saves:
         assert save_page.isAncestorOf(button)
 

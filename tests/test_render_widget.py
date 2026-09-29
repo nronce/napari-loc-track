@@ -96,10 +96,11 @@ def _in_field(table, shape):
 
 
 def test_the_tabs_follow_the_pipeline():
-    """Load, then detect, then filter, then the two things you can do with it."""
+    """Load, then detect, then correct the drift, then filter, then the two
+    things you can do with it."""
     widget = make_widget()
     titles = [widget.tabs.tabText(i) for i in range(widget.tabs.count())]
-    assert titles == ["Load", "Localize", "Filter", "Track", "Render", "Save"]
+    assert titles == ["Load", "Localize", "Drift", "Filter", "Track", "Render", "Images", "Save"]
     # the Localize tab is remembered by index, which a reshuffle must not break
     assert widget.tabs.tabText(widget._localize_tab_index) == "Localize"
     # the data table is a view, not a step: it opens on demand

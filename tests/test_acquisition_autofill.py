@@ -128,7 +128,7 @@ def test_a_value_the_control_cannot_hold_is_logged_as_what_was_actually_set():
     widget.pixel_size_box.setValue(161.0)
     _applied(widget, pixel_size_nm=99999.0)
     assert widget.pixel_size_box.value() == widget.pixel_size_box.maximum()
-    assert f"{widget.pixel_size_box.maximum():.1f} nm/px" in _log_of(widget)
+    assert f"{widget.pixel_size_box.maximum():.2f} nm/px" in _log_of(widget)
 
 
 def test_the_acquisition_context_is_reported_without_being_applied():

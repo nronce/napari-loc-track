@@ -331,7 +331,7 @@ def test_restoring_a_run_names_the_instrument_settings_it_changed():
     })
     joined = " | ".join(notes)
     assert "Camera gain 1.3" in joined and "1 ADU" in joined
-    assert "Pixel size 161.0 nm/px -> 108.0 nm/px" in joined
+    assert "Pixel size 161.00 nm/px -> 108.00 nm/px" in joined
 
 
 def test_settings_that_did_not_move_are_not_announced():
@@ -363,7 +363,7 @@ def test_opening_data_beside_a_previous_run_leaves_the_microscope_alone():
     # the analysis settings still come across - that is the point of restoring
     assert widget.loc_min_ng_box.value() == pytest.approx(750.0)
     joined = " | ".join(notes)
-    assert "yours is 161.0 nm/px and was left alone" in joined
+    assert "yours is 161.00 nm/px and was left alone" in joined
     assert "yours is 1.3 ADU" in joined
 
 

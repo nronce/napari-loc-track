@@ -345,3 +345,41 @@ def test_an_unrecognised_unit_is_refused_rather_than_assumed(tmp_path):
     collector = acqmeta._Collector()
     acqmeta._read_ome(collector, '<Pixels PhysicalSizeX="3" PhysicalSizeXUnit="furlong">', "x")
     assert "pixel_size_nm" not in collector.values
+
+
+# --- recFL, the acquisition software on this microscope -----------------------------
+
+
+def _recfl_acquisition(folder, prefix, calibration):
+    """An acquisition folder as recFL leaves it: <prefix>_metadata.json + stack."""
+    meta = {"status": "finished", "config": {"micromanager": {}, "OLS": "no"}}
+    if calibration is not None:
+        meta["config"]["pixel_calibration"] = calibration
+    (folder / f"{prefix}_metadata.json").write_text(json.dumps(meta), encoding="utf-8")
+    stack = folder / f"{prefix}_normal.tif"
+    stack.write_bytes(b"")
+    return stack
+
+
+def test_the_pixel_size_recfl_calibrated_is_read(tmp_path):
+    stack = _recfl_acquisition(tmp_path, "s_003_Normal_root1",
+                               {"kuro_nm_per_px": 161.87, "basler_nm_per_px": 81.28})
+    found = acqmeta.read_acquisition_metadata(stack)
+    assert found["values"]["pixel_size_nm"] == pytest.approx(161.87)
+    assert "pixel_calibration.kuro_nm_per_px" in found["sources"]["pixel_size_nm"]
+
+
+def test_a_recfl_acquisition_from_before_the_calibration_gives_no_pixel_size(tmp_path):
+    stack = _recfl_acquisition(tmp_path, "s_003_Normal_root1", None)
+    assert "pixel_size_nm" not in acqmeta.read_acquisition_metadata(stack)["values"]
+
+
+def test_the_recfl_metadata_of_this_acquisition_is_the_one_read(tmp_path):
+    """Two acquisitions in one folder: the stack's own prefix decides, not the
+    alphabet - and a prefix that merely starts the same does not count."""
+    _recfl_acquisition(tmp_path, "s_003_Normal", {"kuro_nm_per_px": 100.0})
+    stack = _recfl_acquisition(tmp_path, "s_003_Normal_root1", {"kuro_nm_per_px": 161.87})
+    assert acqmeta.recfl_metadata_path(stack).name == "s_003_Normal_root1_metadata.json"
+    other = tmp_path / "s_004_Normal_normal.tif"
+    other.write_bytes(b"")
+    assert acqmeta.recfl_metadata_path(other) is None

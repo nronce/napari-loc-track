@@ -43,6 +43,10 @@ _TIME_TO_MS = {"ms": 1.0, "s": 1000.0, "us": 1e-3, "µs": 1e-3,
 
 _TIFF_SUFFIXES = (".tif", ".tiff")
 
+# recFL, the acquisition software on this microscope, writes one of these beside
+# every acquisition, with the calibrated pixel size in it (from 2026-09-25 on).
+_RECFL_METADATA_SUFFIX = "_metadata.json"
+
 
 def _number(value):
     """A finite float, or None for anything that cannot stand in for one."""
@@ -406,6 +410,59 @@ def _read_tiff(collector, image_path):
         return
 
 
+def recfl_metadata_path(image_path):
+    """recFL's <prefix>_metadata.json for the acquisition a stack belongs to.
+
+    recFL names every file of an acquisition <prefix>_<what>, so the stack is
+    <prefix>_normal.tif (or another mode) beside <prefix>_metadata.json. The
+    file whose prefix the stack's name starts with is the one - the longest
+    such prefix, should an acquisition folder ever hold two.
+    """
+    path = Path(image_path)
+    try:
+        candidates = [p for p in path.parent.glob("*" + _RECFL_METADATA_SUFFIX)
+                      if p.is_file()]
+    except OSError:
+        return None
+    best = None
+    for candidate in candidates:
+        prefix = candidate.name[: -len(_RECFL_METADATA_SUFFIX)]
+        if path.name.startswith(prefix + "_") and (best is None or len(prefix) > len(best[0])):
+            best = (prefix, candidate)
+    return best[1] if best is not None else None
+
+
+def _read_recfl(collector, path):
+    """Fill from recFL's acquisition metadata: the pixel size it was calibrated to."""
+    try:
+        with open(path, encoding="utf-8") as handle:
+            data = json.load(handle)
+    except (OSError, ValueError):
+        return
+    config = data.get("config") if isinstance(data, dict) else None
+    if not isinstance(config, dict):
+        return
+    # How the white-light frames were turned to match this camera - what decides
+    # whether a camera map holds for them.
+    focus_lock = config.get("focus_lock")
+    if isinstance(focus_lock, dict):
+        collector.add_text("wl_orientation", focus_lock.get("wl_orientation"),
+                           f"{path.name}: focus_lock.wl_orientation")
+    calibration = config.get("pixel_calibration")
+    if isinstance(calibration, dict):
+        collector.add_number("pixel_size_nm", calibration.get("kuro_nm_per_px"),
+                             f"{path.name}: pixel_calibration.kuro_nm_per_px")
+    # Where the saved image sits on the sensor: a calibration made for the whole
+    # sensor needs it to place anything on a cropped image. 0 is a real origin.
+    roi = (config.get("acquisition_options") or {}).get("camera_sensor_roi")
+    if isinstance(roi, dict):
+        for key in ("x", "y"):
+            value = _number(roi.get(key))
+            if value is not None and value >= 0:
+                collector.add(f"sensor_roi_{key}", value,
+                              f"{path.name}: camera_sensor_roi.{key}")
+
+
 def read_acquisition_metadata(image_path, head_bytes=_SIDECAR_HEAD_BYTES):
     """Everything worth autofilling, read from a stack and its sidecar.
 
@@ -419,10 +476,13 @@ def read_acquisition_metadata(image_path, head_bytes=_SIDECAR_HEAD_BYTES):
     beats what the camera reports its interval to be - a free-running
     acquisition records a requested interval of zero, and a camera's reported
     interval is the one it was last configured for rather than the one it
-    achieved.
+    achieved. A pixel size recFL measured beats one Micro-Manager was told.
     """
     collector = _Collector()
 
+    recfl = recfl_metadata_path(image_path)
+    if recfl is not None:
+        _read_recfl(collector, recfl)
     sidecar = sidecar_path(image_path)
     if sidecar is not None:
         _read_sidecar(collector, sidecar, head_bytes)
